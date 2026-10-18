@@ -530,6 +530,7 @@ Surf* vk_rt_for_cpu(u64 cpu_addr, u32 w, u32 h) {
 /* render targets drawn this frame or the last, for a texture made of them (gpu/vk/texture.c) */
 static Surf** g_drawn;
 static int g_ndrawn, g_capdrawn;
+static u32 g_drawn_seq;
 /* Read backing memory directly: asking gmem_read to land pending output here could submit a draw mid-setup. A run of
    pages contiguous in host memory is hashed at once, eight bytes at a time (vk_hash) */
 static u64 rt_mem_hash(const Surf* s) {
@@ -559,6 +560,7 @@ void vk_rt_drawn(Surf* s) {
         s->draw_gw = gpu_mem_generation();
     }
     s->drawn_at = g_vk_present;
+    s->drawn_seq = ++g_drawn_seq;
     for (int i = 0; i < g_ndrawn; i++)
         if (g_drawn[i] == s) return;
     if (g_ndrawn == g_capdrawn) {
@@ -621,15 +623,29 @@ static void surf_free(Surf* s) {
     vk_defer_image(s->img, s->mem, s->att, s->att_linear);
     free(s);
 }
+/* a before b in when they were last drawn to */
+static int drawn_before(const void* a, const void* b) {
+    i32 d = (i32)((*(Surf* const*)a)->drawn_seq - (*(Surf* const*)b)->drawn_seq);
+    return d < 0 ? -1 : d > 0;
+}
+/* s's pixels to guest memory, as vk_surf_evict sends them: 1 when they went */
+static int evict_flush(Surf* s) {
+    if (!s->is_rt || (s->gva >> 63) || s->mem_wgen == s->wgen || !vk_rt_drawn_fresh(s)) return 0;
+    vk_surf_flush(s, NULL);
+    return s->mem_wgen == s->wgen;
+}
 void vk_surf_evict(u32 before) {
-    u32 kept = 0;
+    static Surf** gone;
+    static u32 cap;
+    u32 n = 0, kept = 0;
     u64 kept_bytes = 0, t0 = plat_ns();
     /* A storage image keeps a Surf pointer until its result reaches guest memory. */
     vk_gfx_image_land();
     /* render targets too, parked or not: one not drawn, sampled or presented for as long goes. What it drew since
        memory last had it goes to memory first, as the console's GPU draws into memory: a texture made there later
        reads it (Mario Kart 8 Deluxe draws its Mii icons at boot and shows them a minute later). Not a parked one,
-       whose address is another target's now, nor one whose memory was written after its draw */
+       whose address is another target's now, nor one whose memory was written after its draw. Oldest draw first:
+       where two overlap, the later one's pixels are what memory keeps */
     for (int k = 0; k < SURFH; k++)
         for (Surf** pp = &g_surfh[k]; *pp;) {
             Surf* s = *pp;
@@ -637,20 +653,34 @@ void vk_surf_evict(u32 before) {
                 pp = &s->next;
                 continue;
             }
-            if (s->is_rt && !(s->gva >> 63) && s->mem_wgen != s->wgen && vk_rt_drawn_fresh(s)) {
-                vk_surf_flush(s, NULL);
-                if (s->mem_wgen == s->wgen) {
-                    kept++;
-                    kept_bytes += rt_bytes(s);
-                }
-            }
             *pp = s->next;
-            for (Surf *c = s->crop, *n; c; c = n) { /* its copies (gpu/vk/texture.c rt_crop) */
-                n = c->next;
-                surf_free(c);
+            if (n == cap) {
+                u32 c = cap ? cap * 2 : 256;
+                Surf** g = realloc(gone, (size_t)c * sizeof *g);
+                if (!g) { /* no room to order them: this one goes to memory now */
+                    if (evict_flush(s)) kept++, kept_bytes += rt_bytes(s);
+                    for (Surf *c2 = s->crop, *x; c2; c2 = x) {
+                        x = c2->next;
+                        surf_free(c2);
+                    }
+                    surf_free(s);
+                    continue;
+                }
+                gone = g;
+                cap = c;
             }
-            surf_free(s);
+            gone[n++] = s;
         }
+    if (n > 1) qsort(gone, n, sizeof *gone, drawn_before);
+    for (u32 i = 0; i < n; i++)
+        if (evict_flush(gone[i])) kept++, kept_bytes += rt_bytes(gone[i]);
+    for (u32 i = 0; i < n; i++) {
+        for (Surf *c = gone[i]->crop, *x; c; c = x) { /* its copies (gpu/vk/texture.c rt_crop) */
+            x = c->next;
+            surf_free(c);
+        }
+        surf_free(gone[i]);
+    }
     if (kept)
         LOG_LIMIT(20,
                   "vulkan: %u render target%s unused for ten seconds went to guest memory before they went (%llu KB, "

@@ -207,6 +207,7 @@ typedef struct Surf {
     u64 last_used;
     u32 wgen;       /* render targets: bumped when drawn to */
     u32 drawn_at;   /* render targets: g_vk_present when last drawn to */
+    u32 drawn_seq;  /* render targets: when last drawn to, in draws: which of two overlapping drew last */
     u64 draw_gw;    /* guest-memory generation at the first draw this present or since a full replacement */
     u64 draw_hash;  /* fallback guest-memory hash at that baseline */
     u32 draw_wseen; /* CPU write-tracking clock at that baseline, zero after a reload */

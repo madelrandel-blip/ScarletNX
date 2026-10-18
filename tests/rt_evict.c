@@ -3,8 +3,9 @@
 /* vk_surf_evict (vk/surface.c): a render target unused for ten seconds goes, and what it drew goes to guest memory
    first, as on the console, where draws land in memory: Mario Kart 8 Deluxe draws its Mii icons at boot and makes
    textures of that memory at its Mii selection, a minute later. Not a target already written back, one whose memory
-   the game wrote after the draw, nor a parked one (its address is the newer target's), and not one never drawn. The
-   GPU side is stubbed: an image's pixels read back as the low byte of its handle */
+   the game wrote after the draw, nor a parked one (its address is the newer target's), and not one never drawn; of two
+   that overlap, the one drawn last is what memory keeps. The GPU side is stubbed: an image's pixels read back as the
+   low byte of its handle */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -248,6 +249,15 @@ int main(void) {
     CHECK(old != now && (old->gva >> 63) && vk_rt_find(GVA + 0x40000) == now);
     ten_seconds();
     CHECK(filled(GVA + 0x40000, W * H * 4, (u8)(uintptr_t)now->img) && g_readbacks == 3 && g_went == 1);
+    /* two that overlap, the one at the lower address drawn last: its pixels are what memory keeps where they meet,
+       whichever the table holds first (its bucket comes first here, so the sweep meets it first) */
+    g_vk_present = 0;
+    Surf* upper = drawn(GVA + 0x50200, W, H);
+    Surf* lower = drawn(GVA + 0x50000, W, H);
+    CHECK(hkey(lower->gva) < hkey(upper->gva));
+    ten_seconds();
+    CHECK(filled(GVA + 0x50000, W * H * 4, (u8)(uintptr_t)lower->img));
+    CHECK(filled(GVA + 0x50400, 0x200, (u8)(uintptr_t)upper->img) && g_went == 2);
     free(g_mem);
     printf("rt_evict: %u checks passed\n", checks);
     return 0;
