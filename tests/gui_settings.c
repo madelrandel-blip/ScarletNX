@@ -9,6 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 /* as scarletnx --settings prints them, and a line of something else, an older runtime's of seven fields, values with
    one missing its word, a Windows line end and no last one */
@@ -257,6 +261,38 @@ int main(int argc, char** argv) {
     }
     assert(!gui_settings_read(&s, "") && s.count == GUI_SETTINGS_OWN); /* no runtime: the launcher's alone */
     assert(gui_settings_options(&s, 1, 0, options) == 0 && !gui_settings_set(&s, "touch", "1"));
+    /* and a pick of theirs kept then: the runtime's picks in the file, which no row has, stay as they were */
+    {
+        char *dir = snx_temp_dir(NULL), *path = snx_path_join(dir, "settings.ini"), *text;
+        const char* picks = "; picks\n[Launch]\ngdbstub=on\n[Display]\nfullscreen = 1\nlanguage=3\n"
+                            "[On-screen controls/Buttons]\ncontrols_b_shown=0\n";
+        const char* theirs = "[Display]\nfullscreen=1\nlanguage=3\n[On-screen controls/Buttons]\ncontrols_b_shown=0\n";
+        size_t size;
+        assert(!snx_write_file(path, picks, strlen(picks)));
+        gui_settings_mark(&s);
+        gui_settings_load(&s, path);
+        assert(!strcmp(gui_settings_value(&s, "gdbstub"), "on") && gui_settings_set(&s, "gdbstub", "off"));
+        assert(!gui_settings_save(&s, path));
+        text = (char*)snx_read_file(path, &size);
+        assert(text && strstr(text, theirs) && !strstr(text, "gdbstub") && !strstr(text, "[Launch]"));
+        free(text);
+        /* the launcher's own again: first, by their section, the runtime's after them */
+        assert(gui_settings_set(&s, "gdbstub", "on") && !gui_settings_save(&s, path));
+        text = (char*)snx_read_file(path, &size);
+        assert(text && strstr(text, "\n[Launch]\ngdbstub=on\n[Display]\nfullscreen=1\n") && strstr(text, theirs));
+        free(text);
+#ifndef _WIN32
+        if (geteuid()) { /* one it cannot read is not written over, which would lose them */
+            assert(!chmod(path, 0) && gui_settings_save(&s, path) && !chmod(path, 0600));
+            text = (char*)snx_read_file(path, &size);
+            assert(text && strstr(text, theirs) && strstr(text, "gdbstub=on"));
+            free(text);
+        }
+#endif
+        assert(!snx_remove_tree(dir));
+        free(path);
+        free(dir);
+    }
     gui_settings_free(&s);
 
     /* the runtime's own list: every line a row, and a page's two; the game's menu's settings named and worded as it

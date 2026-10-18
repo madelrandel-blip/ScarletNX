@@ -152,11 +152,27 @@ void gui_settings_load(GuiSettings* s, const char* path) {
     free(text);
     gui_settings_sync(s);
 }
+static int find(const GuiSettings* s, const char* key) {
+    int i;
+    for (i = 0; i < s->count && (s->values[i].kind || strcmp(s->values[i].key, key)); ++i) {}
+    return i;
+}
 int gui_settings_save(const GuiSettings* s, const char* path) {
-    size_t room = 256 + (size_t)s->count * 200, at = 0; /* a row's section, key and value take less than 200 */
-    char *text = (char*)malloc(room), *folder = snx_dirname(path), *staged = snx_format("%s.new", path);
+    size_t room = 256 + (size_t)s->count * 200, at = 0, size = 0, lines = 1; /* a row's section, key, value: < 200 */
+    /* the launcher's rows alone (the runtime listed none): the file's other keys are no row's to leave out */
+    char *old = s->count > GUI_SETTINGS_OWN ? NULL : (char*)snx_read_file(path, &size), *c, *key, *value;
+    char *text, *folder, *staged;
     const char* section = "";
     int i, failed;
+    SnxIni ini;
+    char now[sizeof ini.section]; /* the section the text is in */
+    /* one it cannot read: written over, they would be lost */
+    if (!old && s->count <= GUI_SETTINGS_OWN && snx_is_file(path)) return 1;
+    for (c = old; c && *c; ++c) lines += *c == '\n';
+    room += old ? size + lines * (sizeof ini.section + 4) : 0; /* each line a key's, under a section of its own */
+    text = (char*)malloc(room);
+    folder = snx_dirname(path);
+    staged = snx_format("%s.new", path);
     if (text)
         at = (size_t)snprintf(text, room,
                               "; what the launcher's Settings changed, for every game it runs: over each "
@@ -168,6 +184,15 @@ int gui_settings_save(const GuiSettings* s, const char* path) {
             at += (size_t)snprintf(text + at, room - at, "[%s]\n", section = s->keys[i].section);
         at += (size_t)snprintf(text + at, room - at, "%s=%s\n", s->values[i].key, value);
     }
+    snprintf(now, sizeof now, "%s", section);
+    if (old) snx_ini_start(&ini, old);
+    while (text && old && snx_ini_next(&ini, &key, &value)) { /* a key names one row whatever its section */
+        if (find(s, key) < s->count) continue;
+        if (ini.section[0] && strcmp(now, ini.section))
+            at += (size_t)snprintf(text + at, room - at, "[%s]\n", strcpy(now, ini.section));
+        at += (size_t)snprintf(text + at, room - at, "%s=%s\n", key, value);
+    }
+    free(old);
     /* staged beside it, then put in place: a crash mid-write leaves the old picks */
     failed = !text || snx_mkdirs(folder) || snx_write_file(staged, text, at) || snx_replace(staged, path);
     if (failed) remove(staged);
@@ -184,11 +209,6 @@ void gui_settings_reset(GuiSettings* s, int row) {
     }
     for (i = first; i < end && i < s->count; ++i) set(s, i, s->values[i].start);
     gui_settings_sync(s);
-}
-static int find(const GuiSettings* s, const char* key) {
-    int i;
-    for (i = 0; i < s->count && (s->values[i].kind || strcmp(s->values[i].key, key)); ++i) {}
-    return i;
 }
 /* row i's pick, NULL for the .ini's (the launcher's: off) */
 static const char* picked(const GuiSettings* s, int i) {
