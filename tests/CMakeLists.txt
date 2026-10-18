@@ -411,6 +411,13 @@ target_link_libraries(snx-test-network-service PRIVATE scarletnx-net)
 add_test(NAME network_service COMMAND snx-test-network-service)
 set_tests_properties(network_service PROPERTIES TIMEOUT 60)
 
+# local wireless over the LAN (common/network/net_ldn.c): the frames, and two consoles on the loopback
+add_executable(snx-test-ldn-lan ldn_lan.c)
+snx_test_target(snx-test-ldn-lan 23)
+target_link_libraries(snx-test-ldn-lan PRIVATE scarletnx-net)
+add_test(NAME ldn_lan COMMAND snx-test-ldn-lan)
+set_tests_properties(ldn_lan PROPERTIES TIMEOUT 60)
+
 # ssl (ssl.c) against a TLS server in the test, on the game's bsd sockets (bsd.c, built beside). OpenSSL comes with
 # the NX, 3DS and hactool builds (cmake/dependencies.cmake), not with a GNU ABI-only one
 if(TARGET OpenSSL::SSL)

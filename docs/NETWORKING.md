@@ -40,8 +40,10 @@ serialized records have their own wire encoding.
 Host sockets stay nonblocking. Guest blocking is implemented by waiting for
 readiness with receive/send deadlines. The cancellation API wakes blocked waits;
 callers retaining a socket reference can safely finish I/O after a descriptor is
-closed. This library does not provide an Ethernet/IP virtual machine, virtual
-LAN, or Eden multiplayer proxy.
+closed. This library does not provide an Ethernet/IP virtual machine or Eden's
+multiplayer proxy. Local wireless (`net_ldn.c`) is the one virtual LAN: the
+protocol of the ldn_mitm sysmodule, which Ryujinx's LdnMitm client speaks,
+over UDP and TCP 11452 on the console's interface.
 
 ## Runtime behavior
 
