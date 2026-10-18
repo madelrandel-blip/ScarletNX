@@ -298,6 +298,14 @@ int main(int argc, char** argv) {
         free(text);
         text = NULL;
     }
+    { /* the help names the level a recompile takes without -O */
+        const char* help[] = {argv[1], "--repo", argv[2], "-r", "--help", NULL};
+        check(!snx_run(help, root, NULL, &text) &&
+                  strstr(text, "-O LEVEL               Optimization: 0,1,2,3,s,z (default: 2)\n"),
+              "-O's default in the help");
+        free(text);
+        text = NULL;
+    }
     { /* no name given: the name the NRO's control.nacp gives it, shown as it is recompiled and in its settings' head,
          its control.nacp in its data for the launcher; its files by the file's name, as an NRO has no title ID */
         static unsigned char named[0x200 + 0x40 + 0x300];

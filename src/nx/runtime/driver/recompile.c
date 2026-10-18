@@ -15,12 +15,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* -O's level when none is given, which the help names */
+#define SNX_RECOMPILE_OPT "2"
 static void usage(void) {
     puts("Usage: scarletnx -r INPUT [NAME] [OPTIONS]\n"
          "  INPUT                  Game/ExeFS directory or .nro\n"
          "  -o, --name, --out NAME  Output name (default: the title ID, else the NPDM's or input name)\n"
          "  --outdir DIR           Where the game's folder goes (default: games/ in the data folder)\n"
-         "  -O LEVEL               Optimization: 0,1,2,3,s,z (default: 3)\n"
+         "  -O LEVEL               Optimization: 0,1,2,3,s,z (default: " SNX_RECOMPILE_OPT ")\n"
          "  --jobs N               Parallel compiles (default: CPU count)");
     puts("  --backend NAME         Code generator: llvm (LLVM-C, the default and the recommended one),\n"
          "                         gcc (libgccjit, optional: for DEC Alpha EV67 hosts; elsewhere use llvm)");
@@ -229,7 +231,7 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
     memset(&gen, 0, sizeof(gen));
     memset(&program, 0, sizeof(program));
     memset(&llvm, 0, sizeof(llvm));
-    compile.opt = "2";
+    compile.opt = SNX_RECOMPILE_OPT;
     compile.jobs = snx_cpu_count();
     gen.chunk_instrs = SNX_CHUNK_INSTRUCTIONS;
 #ifdef _WIN32
