@@ -4,8 +4,8 @@
    first, as on the console, where draws land in memory: Mario Kart 8 Deluxe draws its Mii icons at boot and makes
    textures of that memory at its Mii selection, a minute later. Not a target already written back, one whose memory
    the game wrote after the draw, nor a parked one (its address is the newer target's), and not one never drawn; of two
-   that overlap, the one drawn last is what memory keeps. The GPU side is stubbed: an image's pixels read back as the
-   low byte of its handle */
+   that overlap, the one drawn last is what memory keeps; those of one sweep wait for the GPU once. The GPU side is
+   stubbed: an image's pixels read back as the low byte of its handle */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,7 +132,8 @@ void vk_barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkPi
 }
 VkCommandBuffer vk_cmd(void) { return (VkCommandBuffer)(uintptr_t)0xCB; }
 void vk_render_end(void) {}
-void vk_finish(void) {}
+static u32 g_finishes; /* waits for the GPU */
+void vk_finish(void) { g_finishes++; }
 void vk_lock(void) {}
 void vk_unlock(void) {}
 void vk_result_begin(void) {}
@@ -258,6 +259,14 @@ int main(void) {
     ten_seconds();
     CHECK(filled(GVA + 0x50000, W * H * 4, (u8)(uintptr_t)lower->img));
     CHECK(filled(GVA + 0x50400, 0x200, (u8)(uintptr_t)upper->img) && g_went == 2);
+    /* three that go in one sweep: read back behind one wait for the GPU, each into its own memory */
+    g_vk_present = 0;
+    Surf* three[3];
+    for (int i = 0; i < 3; i++) three[i] = drawn(GVA + 0x60000 + (u64)i * 0x1000, W, H);
+    u32 finishes = g_finishes, readbacks = g_readbacks;
+    ten_seconds();
+    CHECK(g_finishes == finishes + 1 && g_readbacks == readbacks + 3 && g_went == 3);
+    for (int i = 0; i < 3; i++) CHECK(filled(GVA + 0x60000 + (u64)i * 0x1000, W * H * 4, (u8)(uintptr_t)three[i]->img));
     free(g_mem);
     printf("rt_evict: %u checks passed\n", checks);
     return 0;
