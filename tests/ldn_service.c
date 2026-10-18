@@ -351,6 +351,51 @@ int main(void) {
         CHECK(name[4] == 127 && name[5] == 0 && name[6] == 0 && name[7] == 2);
         err = reply32(&r, 4);
         CHECK(err == 0);
+        /* and it hears both a datagram to its address and one to the subnet's broadcast address, which Linux
+           delivers to no socket bound to a unicast address: the companion on 127.255.255.255 takes those */
+        {
+            SnxSocket* peer;
+            SnxSockAddr to;
+            u8 port[2] = {name[2], name[3]};
+            int one = 1, k;
+            CHECK(snx_socket_open(&peer, SNX_AF_INET, SNX_SOCK_DGRAM, 0) == 0);
+            snx_socket_setsockopt(peer, SNX_SOL_SOCKET, SNX_SO_BROADCAST, &one, sizeof one);
+            memset(&to, 0, sizeof to);
+            to.family = SNX_AF_INET;
+            memcpy(&to.port, port, 2);
+            to.addr[0] = 127;
+            to.addr[3] = 2;
+            CHECK(snx_socket_send(peer, "unicast", 7, 0, &to) == 7);
+            memset(to.addr + 1, 255, 3);
+            CHECK(snx_socket_send(peer, "broadcast", 9, 0, &to) == 9);
+            for (k = 0; k < 2; k++) {
+                request(&r, 9); /* RecvFrom(fd, flags) -> (ret, errno, addrlen), the message and the sender */
+                memcpy(r.raw, &fd, 4);
+                out_auto(&r, BUF1, 64);
+                out_auto(&r, BUF2, 16);
+                CHECK(call(bsd, &r) == 0);
+                CHECK(reply32(&r, 0) == (k == 0 ? 7 : 9) && reply32(&r, 4) == 0 && reply32(&r, 8) == 16);
+                CHECK(!memcmp(GP(BUF1), k == 0 ? "unicast" : "broadcast", k == 0 ? 7 : 9));
+                CHECK(((u8*)GP(BUF2))[4] == 127); /* from the peer, on the loopback */
+            }
+            request(&r, 6); /* Poll(nfds, timeout) with the fd for POLLIN: nothing left to read */
+            r.raw[0] = 1;
+            memcpy(GP(BUF1), &fd, 4);
+            ((u8*)GP(BUF1))[4] = 1; /* POLLIN */
+            ((u8*)GP(BUF1))[5] = 0;
+            in_auto(&r, BUF1, 8);
+            out_auto(&r, BUF2, 8);
+            CHECK(call(bsd, &r) == 0 && reply32(&r, 0) == 0);
+            memset(to.addr + 1, 255, 3);
+            CHECK(snx_socket_send(peer, "again", 5, 0, &to) == 5); /* a broadcast makes Poll see it readable */
+            request(&r, 6);
+            r.raw[0] = 1;
+            r.raw[4] = 100; /* 100 ms */
+            in_auto(&r, BUF1, 8);
+            out_auto(&r, BUF2, 8);
+            CHECK(call(bsd, &r) == 0 && reply32(&r, 0) == 1 && (((u8*)GP(BUF2))[6] & 1));
+            snx_socket_unref(peer);
+        }
     }
 
     /* the host: OpenAccessPoint, CreateNetwork, SetAdvertiseData; each state change signals the event */

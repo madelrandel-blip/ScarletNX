@@ -20,8 +20,9 @@ int network_reachable(const SnxSockAddr* addr);
 /* the socket behind descriptor fd in the table of the bsd session process pid registered (RegisterClient), with a
    reference for the caller, or NULL: what ssl duplicates, as the console's does with bsd:s's DuplicateSocket */
 SnxSocket* bsd_client_socket(u64 pid, i32 fd);
-/* the address a game's bind to INADDR_ANY binds instead, while ldn gives this console one; NULL clears it */
-void bsd_set_bind_address(const u8* ip);
+/* the address a game's bind to INADDR_ANY binds instead, while ldn gives this console one, and its subnet's broadcast
+   address, which a datagram socket bound there keeps hearing; NULL clears it */
+void bsd_set_bind_address(const u8* ip, const u8* bcast);
 
 /* dns.c */
 SvcObj* new_sfdnsres(void);

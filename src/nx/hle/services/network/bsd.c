@@ -35,8 +35,10 @@ enum {
 
 typedef struct BsdFd {
     SnxSocket* s;
-    int flags;  /* F_SETFL's as the guest sent them */
-    int exempt; /* SocketExempt: ShutdownAllSockets leaves it alone */
+    SnxSocket* bcast; /* a datagram socket bound to the console's address also hears its subnet's broadcasts through
+                         this one, bound to the broadcast address (Linux delivers them to no other); NULL otherwise */
+    int flags;        /* F_SETFL's as the guest sent them */
+    int exempt;       /* SocketExempt: ShutdownAllSockets leaves it alone */
 } BsdFd;
 /* one per session (and its clones): Horizon's descriptors belong to the client that registered */
 typedef struct Bsd {
@@ -71,23 +73,52 @@ int network_reachable(const SnxSockAddr* a) {
     static const uint8_t lo6[16] = {[15] = 1};
     return a->family == SNX_AF_INET6 && !memcmp(a->addr, lo6, 16);
 }
-/* the address a bind to INADDR_ANY binds instead, while ldn gives this console one of its own on the LAN (ldn.c):
-   two consoles on one host then keep their ports apart. NULL clears it */
+/* the address a bind to INADDR_ANY binds instead, while ldn gives this console one of its own on the LAN (ldn.c),
+   and its subnet's broadcast address: two consoles on one host then keep their ports apart, and each still hears
+   the broadcasts a game sends to the subnet (a Pia session's first messages). NULL clears it */
 static PMutex g_bind_lk = PMUTEX_INIT;
 static int g_bind_set;
-static u8 g_bind_ip[4];
-void bsd_set_bind_address(const u8* ip) {
+static u8 g_bind_ip[4], g_bind_bcast[4];
+void bsd_set_bind_address(const u8* ip, const u8* bcast) {
     pm_lock(&g_bind_lk);
     g_bind_set = ip != NULL;
     if (ip) memcpy(g_bind_ip, ip, 4);
+    if (ip) memcpy(g_bind_bcast, bcast, 4);
     pm_unlock(&g_bind_lk);
 }
-static void bind_address(SnxSockAddr* a) {
+/* 1 and the broadcast address when a was INADDR_ANY and became the console's address */
+static int bind_address(SnxSockAddr* a, u8 bcast[4]) {
     static const u8 any[4];
-    if (a->family != SNX_AF_INET || memcmp(a->addr, any, 4)) return;
+    int r;
+    if (a->family != SNX_AF_INET || memcmp(a->addr, any, 4)) return 0;
     pm_lock(&g_bind_lk);
-    if (g_bind_set) memcpy(a->addr, g_bind_ip, 4);
+    r = g_bind_set;
+    if (r) memcpy(a->addr, g_bind_ip, 4);
+    if (r) memcpy(bcast, g_bind_bcast, 4);
     pm_unlock(&g_bind_lk);
+    return r;
+}
+/* the broadcast companion of a datagram socket bound to the console's address: the same port on the broadcast
+   address, shared with the other consoles on this host (SO_REUSEADDR), read only when the socket itself has nothing */
+static SnxSocket* bcast_companion(SnxSocket* s, const u8 bcast[4]) {
+    SnxSocket* c;
+    SnxSockAddr a;
+    int one = 1, r = snx_socket_name(s, &a);
+    if (r) return NULL;
+    r = snx_socket_open(&c, SNX_AF_INET, SNX_SOCK_DGRAM, 0);
+    if (r) return NULL;
+    snx_socket_setsockopt(c, SNX_SOL_SOCKET, SNX_SO_REUSEADDR, &one, sizeof one);
+    snx_socket_setsockopt(c, SNX_SOL_SOCKET, SNX_SO_BROADCAST, &one, sizeof one);
+    memcpy(a.addr, bcast, 4);
+    r = snx_socket_bind(c, &a);
+    if (r) {
+        WARN("bsd: the broadcast companion of a socket on %u.%u.%u.%u couldn't bind %u.%u.%u.%u: errno %d\n",
+             g_bind_ip[0], g_bind_ip[1], g_bind_ip[2], g_bind_ip[3], bcast[0], bcast[1], bcast[2], bcast[3], -r);
+        snx_socket_unref(c);
+        return NULL;
+    }
+    snx_socket_set_nonblocking(c, 1);
+    return c;
 }
 static void net_log(const char* m) { LOG("%s", m); }
 void network_init(void) {
@@ -247,7 +278,19 @@ static void bsd_destroy(SvcObj* o) {
     pm_lock(&g_client_lk);
     if (g_client == o) g_client = NULL;
     pm_unlock(&g_client_lk);
-    for (int i = 0; i < BSD_MAX_FD; i++) snx_socket_unref(b->fd[i].s);
+    for (int i = 0; i < BSD_MAX_FD; i++) {
+        snx_socket_unref(b->fd[i].s);
+        snx_socket_unref(b->fd[i].bcast);
+    }
+}
+/* the broadcast companion of descriptor fd, with a reference for the caller, or NULL */
+static SnxSocket* fd_get_bcast(Bsd* b, i32 fd) {
+    SnxSocket* c = NULL;
+    if (fd < 0 || fd >= BSD_MAX_FD) return NULL;
+    pm_lock(&b->lk);
+    if (b->fd[fd].s && b->fd[fd].bcast) c = snx_socket_ref(b->fd[fd].bcast);
+    pm_unlock(&b->lk);
+    return c;
 }
 
 /* ============================================================ replies */
@@ -329,8 +372,8 @@ static int nn_socket_sf_IClient_Select(SvcObj* self, i32 nfds, const nn_socket_s
     Bsd* b = self->data;
     IpcBuf in[3] = {readfds_in, writefds_in, errorfds_in}, out[3] = {readfds_out, writefds_out, errorfds_out};
     if (nfds < 0 || nfds > BSD_MAX_FD) return reply(-SNX_EINVAL, ret, bsd_errno);
-    SnxPollEntry e[BSD_MAX_FD];
-    int which[BSD_MAX_FD], n = 0;
+    SnxPollEntry e[BSD_MAX_FD * 2];
+    int which[BSD_MAX_FD], owner[BSD_MAX_FD], n = 0, extra = 0;
     int64_t r = 0;
     for (i32 fd = 0; fd < nfds; fd++) {
         uint16_t ev = 0;
@@ -348,13 +391,26 @@ static int nn_socket_sf_IClient_Select(SvcObj* self, i32 nfds, const nn_socket_s
         e[n].events = ev;
         which[n++] = fd;
     }
+    /* the broadcast companions, after the descriptors' entries; a ready companion makes its descriptor readable */
+    for (int i = 0; !r && i < n; i++) {
+        SnxSocket* c = (e[i].events & SNX_POLLIN) ? fd_get_bcast(b, which[i]) : NULL;
+        if (!c) continue;
+        e[n + extra].socket = c;
+        e[n + extra].host_fd = -1;
+        e[n + extra].events = SNX_POLLIN;
+        owner[extra++] = i;
+    }
     if (!r) {
         int ms = -1;
         if (!timeout->is_null) {
             u64 t = (u64)timeout->sec * 1000 + ((u64)timeout->usec + 999) / 1000;
             ms = t > 0x7FFFFFFF ? 0x7FFFFFFF : (int)t;
         }
-        r = snx_net_poll(e, (size_t)n, ms);
+        r = snx_net_poll(e, (size_t)(n + extra), ms);
+    }
+    for (int k = 0; k < extra; k++) {
+        if (r > 0 && (e[n + k].revents & SNX_POLLIN)) e[owner[k]].revents |= SNX_POLLIN;
+        snx_socket_unref(e[n + k].socket);
     }
     if (r >= 0) {
         u8 sets[3][BSD_MAX_FD / 8];
@@ -399,10 +455,17 @@ static int nn_socket_sf_IClient_Poll(SvcObj* self, i32 nfds, i32 timeout, IpcBuf
     if (nfds < 0) return reply(-SNX_EINVAL, ret, bsd_errno);
     if (nfds > 4096 || !ia || is < (u64)nfds * 8 || (oa && os < (u64)nfds * 8))
         return reply(-SNX_EINVAL, ret, bsd_errno);
-    SnxPollEntry* e = calloc((size_t)nfds, sizeof *e);
-    if (!e) return reply(-SNX_ENOMEM, ret, bsd_errno);
+    /* an entry per descriptor, then one per broadcast companion, whose readiness its descriptor's entry takes */
+    SnxPollEntry* e = calloc((size_t)nfds * 2, sizeof *e);
+    i32* owner = calloc((size_t)nfds, sizeof *owner);
+    if (!e || !owner) {
+        free(e);
+        free(owner);
+        return reply(-SNX_ENOMEM, ret, bsd_errno);
+    }
     const u8* in = GP(ia);
     int bad = 0;
+    i32 extra = nfds;
     for (i32 i = 0; i < nfds; i++) {
         i32 fd;
         u16 ev;
@@ -413,10 +476,27 @@ static int nn_socket_sf_IClient_Poll(SvcObj* self, i32 nfds, i32 timeout, IpcBuf
         if (fd < 0) continue; /* ignored, as POSIX says */
         e[i].socket = fd_get(b, fd, NULL);
         if (!e[i].socket) bad++;
+        if (e[i].socket && (e[i].events & SNX_POLLIN)) {
+            SnxSocket* c = fd_get_bcast(b, fd);
+            if (c) {
+                e[extra].socket = c;
+                e[extra].host_fd = -1;
+                e[extra].events = SNX_POLLIN;
+                owner[extra - nfds] = i;
+                extra++;
+            }
+        }
     }
-    int64_t r = snx_net_poll(e, (size_t)nfds, bad ? 0 : timeout);
+    int64_t r = snx_net_poll(e, (size_t)extra, bad ? 0 : timeout);
     u8* out = oa ? GP(oa) : NULL;
     if (r >= 0) r += bad;
+    for (i32 k = nfds; k < extra; k++) { /* a companion's hit is its descriptor's, counted once */
+        if (r > 0 && (e[k].revents & SNX_POLLIN)) {
+            if (e[owner[k - nfds]].revents) r--;
+            e[owner[k - nfds]].revents |= SNX_POLLIN;
+        }
+        snx_socket_unref(e[k].socket);
+    }
     for (i32 i = 0; i < nfds; i++) {
         i32 fd;
         memcpy(&fd, in + i * 8, 4);
@@ -429,20 +509,50 @@ static int nn_socket_sf_IClient_Poll(SvcObj* self, i32 nfds, i32 timeout, IpcBuf
         snx_socket_unref(e[i].socket);
     }
     free(e);
+    free(owner);
     return reply(r, ret, bsd_errno);
+}
+/* a receive on a socket with a broadcast companion: whichever has a datagram, the socket first; a blocking one
+   waits for either within the socket's SO_RCVTIMEO */
+static int64_t recv_either(SnxSocket* s, SnxSocket* c, void* data, size_t n, int flags, SnxSockAddr* from) {
+    int64_t r;
+    if (!snx_socket_nonblocking(s) && !(flags & SNX_MSG_DONTWAIT)) {
+        SnxPollEntry e[2];
+        SnxTimeval tv = {0, 0};
+        size_t size = sizeof tv;
+        int ms = -1;
+        if (!snx_socket_getsockopt(s, SNX_SOL_SOCKET, SNX_SO_RCVTIMEO, &tv, &size) && (tv.sec || tv.usec))
+            ms = (int)(tv.sec * 1000 + tv.usec / 1000);
+        e[0].socket = s;
+        e[1].socket = c;
+        e[0].host_fd = e[1].host_fd = -1;
+        e[0].events = e[1].events = SNX_POLLIN;
+        e[0].revents = e[1].revents = 0;
+        r = snx_net_poll(e, 2, ms);
+        if (r < 0) return r;
+        if (r == 0) return -SNX_EAGAIN;
+        if (!e[0].revents) return snx_socket_recv(c, data, n, flags | SNX_MSG_DONTWAIT, from, NULL);
+    }
+    r = snx_socket_recv(s, data, n, flags | SNX_MSG_DONTWAIT, from, NULL);
+    if (r == -SNX_EAGAIN) r = snx_socket_recv(c, data, n, flags | SNX_MSG_DONTWAIT, from, NULL);
+    return r;
 }
 static int64_t do_recv(Bsd* b, IpcBuf message, i32 fd, u32 gflags, IpcBuf addr, u32* addrlen) {
     u64 a = message.addr, n = message.size;
     SnxSocket* s = fd_get(b, fd, NULL);
     if (!s) return -SNX_EBADF;
+    SnxSocket* c = fd_get_bcast(b, fd);
     SnxSockAddr from = {0};
     int64_t r;
     if (!n)
         r = 0; /* Eden: nothing to receive into, and a datagram stays queued */
     else if (!a)
         r = -SNX_EFAULT;
+    else if (c)
+        r = recv_either(s, c, GP(a), n, msg_in(gflags), &from);
     else
         r = snx_socket_recv(s, GP(a), n, msg_in(gflags), addrlen ? &from : NULL, NULL);
+    snx_socket_unref(c);
     if (r > 0 && from.family && g_verbose >= 2) {
         char t[64];
         LOGV("bsd: RecvFrom(%d) %lld bytes from %s\n", fd, (long long)r, addr_text(&from, t, sizeof t));
@@ -523,11 +633,22 @@ static int bind_connect(Bsd* b, i32 fd, IpcBuf addr, int connect, i32* ret, u32*
     WITH_SOCKET(fd);
     (void)d;
     if (!connect) {
-        bind_address(&sa);
+        u8 bcast[4];
+        int pinned = bind_address(&sa, bcast);
         r = snx_socket_bind(s, &sa);
         if (g_verbose >= 2) {
             char t[64];
             LOGV("bsd: Bind(%d) %s = %d\n", fd, addr_text(&sa, t, sizeof t), r);
+        }
+        if (!r && pinned && snx_socket_type(s) == SNX_SOCK_DGRAM) {
+            SnxSocket* c = bcast_companion(s, bcast);
+            pm_lock(&b->lk);
+            if (c && b->fd[fd].s == s && !b->fd[fd].bcast) {
+                b->fd[fd].bcast = c;
+                c = NULL;
+            }
+            pm_unlock(&b->lk);
+            snx_socket_unref(c);
         }
     } else if (!network_reachable(&sa))
         r = -SNX_ENETUNREACH;
@@ -681,14 +802,16 @@ static int nn_socket_sf_IClient_ShutdownAllSockets(SvcObj* self, i32 how, i32* r
 }
 static int nn_socket_sf_IClient_Close(SvcObj* self, i32 fd, i32* ret, u32* bsd_errno) {
     Bsd* b = self->data;
-    SnxSocket* s = NULL;
+    SnxSocket *s = NULL, *c = NULL;
     if (fd >= 0 && fd < BSD_MAX_FD) {
         pm_lock(&b->lk);
         s = b->fd[fd].s;
+        c = b->fd[fd].bcast;
         memset(&b->fd[fd], 0, sizeof b->fd[fd]);
         pm_unlock(&b->lk);
     }
     if (!s) return reply(-SNX_EBADF, ret, bsd_errno);
+    snx_socket_unref(c);
     snx_socket_unref(s);
     LOGV("bsd: Close(%d)\n", fd);
     return reply(0, ret, bsd_errno);

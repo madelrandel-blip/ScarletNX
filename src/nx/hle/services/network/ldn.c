@@ -90,7 +90,7 @@ static void ldn_teardown(Ldn* d) {
     pm_unlock(&d->lk);
     if (lan) {
         snx_ldn_close(lan);
-        bsd_set_bind_address(NULL);
+        bsd_set_bind_address(NULL, NULL);
     }
 }
 static void ldn_destroy(SvcObj* o) {
@@ -165,7 +165,12 @@ static int nn_ldn_detail_IUserLocalCommunicationService_Initialize(SvcObj* self,
         } else {
             LOG("ldn: this console is %u.%u.%u.%u/%u.%u.%u.%u, the game's sockets bind there\n", d->ip[0], d->ip[1],
                 d->ip[2], d->ip[3], d->mask[0], d->mask[1], d->mask[2], d->mask[3]);
-            bsd_set_bind_address(d->ip);
+            {
+                u8 bcast[4];
+                int i;
+                for (i = 0; i < 4; i++) bcast[i] = (u8)(d->ip[i] | ~d->mask[i]);
+                bsd_set_bind_address(d->ip, bcast);
+            }
             d->state = LDN_INITIALIZED;
             d->reason = 0;
         }
