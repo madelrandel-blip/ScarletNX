@@ -1160,7 +1160,8 @@ static size_t wrap_at(const char* s, int width, int path) {
     return !*p ? strlen(s) : space ? (size_t)(space - s) : gui_wrap(s, width);
 }
 /* s from pixel x, y wrapped to the right edge of r (path: at its slashes), a row under the other while they fit above
-   its bottom, or on one row that slides with the theme's [body] text = slide: the rows it took */
+   its bottom, the last that fits sliding what is left, or on one row that slides with the theme's [body] text =
+   slide: the rows it took */
 static int wrap_in(App* app, GuiRect r, int x, int y, const char* s, int path, SDL_Color color) {
     char row[1100];
     int width = (r.x + r.w - x) / cell_w(app), rows = 0;
@@ -1171,7 +1172,12 @@ static int wrap_in(App* app, GuiRect r, int x, int y, const char* s, int path, S
         return 1;
     }
     while (*s && y + (rows + 1) * cell_h(app) <= r.y + r.h) {
-        size_t n = wrap_at(s, width, path);
+        size_t n = wrap_at(s, width, path), next = n;
+        while (s[next] == ' ') ++next;
+        if (s[next] && y + (rows + 2) * cell_h(app) > r.y + r.h) { /* no row for the rest: cut, it would be lost */
+            text_in(app, r, x, y + rows * cell_h(app), s, color);
+            return rows + 1;
+        }
         snprintf(row, sizeof row, "%.*s", (int)n, s);
         text_in(app, r, x, y + rows * cell_h(app), row, color);
         for (s += n; *s == ' ';) ++s; /* a row starts at a word */

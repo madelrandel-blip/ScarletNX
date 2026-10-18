@@ -4175,6 +4175,29 @@ int main(int argc, char** argv) {
         app.theme.tips_wrap = true;
         render(&app);
         shows_foot(&app, "its rows.", page);
+        /* longer than the foot's rows: its last row slides what is left, which nothing else would show */
+        {
+            int fs = foot_scale(&app), cols = r.w / (8 * fs), n = 0, x, y, found, scale = app.scale, over;
+            const char* rest = app.message;
+            while (n < 6 * cols) n += snprintf(app.message + n, sizeof app.message - (size_t)n, "a row of words ");
+            snprintf(app.message + n, sizeof app.message - (size_t)n, "and its end.");
+            render(&app);
+            menu_boxes(&app, &m);
+            r = foot_room(&app, m.place.tips, app.theme.tips_box);
+            hides_foot(&app, "its end.", page);
+            for (int row = 1; row < r.h / (16 * fs); ++row) /* the rows over the last, as they wrap */
+                for (rest += wrap_at(rest, cols, 0); *rest == ' ';) ++rest;
+            over = (int)SDL_utf8strlen(rest) - cols;
+            assert(r.h >= 2 * 16 * fs && over > 0);
+            for (app.clock = 1; gui_slide(over, app.clock, app.theme.scroll_ms) != over;)
+                app.clock += app.theme.scroll_ms;
+            render(&app);
+            app.scale = fs;
+            found = find_text(&app, "and its end.", page, 1, &x, &y);
+            app.scale = scale;
+            assert(found && x + 12 * 8 * fs == r.x + cols * 8 * fs && y == r.y + r.h / (16 * fs) * 16 * fs - 16 * fs);
+            app.clock = 1;
+        }
         app.theme.tips_wrap = false;
         app.message[0] = 0;
         app.clock = 0;
