@@ -135,15 +135,17 @@ static void label(int i, char* text, size_t size, char* value, size_t vsize) {
 static SnxPadScreen map;
 static SnxPadDrawing map_drawing; /* as last drawn: what a tap lands on */
 static int map_swallow;           /* the press the page took: no menu key */
-/* the first pad's name, its labels and what it holds */
+/* the pad the page is for: the player's, or with every player's the first one; its name, its labels and what it
+   holds (with every player's, what any holds) */
 static void map_pad(void) {
-    const char* name = gamepad_name(0);
+    int i = pad_player ? gamepad_of_player(pad_player - 1) : 0;
+    const char* name = i >= 0 ? gamepad_name(i) : NULL;
     snprintf(map.pad, sizeof map.pad, "%s", name ? name : "");
-    if (!gamepad_layout(0, map.labels, &map.symmetric)) {
+    if (i < 0 || !gamepad_layout(i, map.labels, &map.symmetric)) {
         memset(map.labels, 0, sizeof map.labels);
         map.symmetric = 0;
     }
-    map.held = gamepad_held();
+    map.held = i < 0 ? 0 : gamepad_held(pad_player ? i : -1);
 }
 static void map_open(void) {
     SnxGamepadConfig* g = gamepad_config();

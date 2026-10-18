@@ -16,7 +16,7 @@
 static SDL_Gamepad* g_pads[SNX_GAMEPADS];
 static char g_names[SNX_GAMEPADS][64]; /* theirs, for the game's menu, which the renderer draws on its thread */
 static int g_labels[SNX_GAMEPADS][4], g_symmetric[SNX_GAMEPADS]; /* and how its button map screen draws them */
-static unsigned g_held;                                          /* the controls held, a bit each, as last polled */
+static unsigned g_held[SNX_GAMEPADS]; /* the controls each holds, a bit each, as last polled */
 #define UNSET SNX_PAD_UNSET
 static SnxGamepadConfig g_cfg = {
     0,
@@ -215,12 +215,27 @@ int gamepad_layout(int i, int labels[4], int* symmetric) {
         }
     return 0;
 }
-unsigned gamepad_held(void) { return __atomic_load_n(&g_held, __ATOMIC_RELAXED); }
+unsigned gamepad_held(int i) {
+    unsigned held = 0;
+    int k;
+    for (k = 0; k < SNX_GAMEPADS; k++)
+        if (i < 0)
+            held |= __atomic_load_n(&g_held[k], __ATOMIC_RELAXED);
+        else if (g_names[k][0] && !i--)
+            return __atomic_load_n(&g_held[k], __ATOMIC_RELAXED);
+    return held;
+}
 const char* gamepad_name(int i) {
     int k;
     for (k = 0; k < SNX_GAMEPADS; k++)
         if (g_names[k][0] && !i--) return g_names[k];
     return NULL;
+}
+int gamepad_of_player(int slot) {
+    int k, i = 0;
+    if (slot < 0 || slot >= SNX_GAMEPADS || !g_names[slot][0]) return -1;
+    for (k = 0; k < slot; k++) i += g_names[k][0] != 0;
+    return i;
 }
 
 static int is_open(SDL_JoystickID id) {
@@ -504,19 +519,21 @@ void gamepad_motion(int slot, PadMotion out[2]) {
 
 void gamepad_state(u64* buttons, i32 sticks[4]) {
     u64 b = 0;
-    unsigned held = 0;
     int i;
     sticks[0] = sticks[1] = sticks[2] = sticks[3] = 0;
     for (i = 0; i < SNX_GAMEPADS; i++) {
         SDL_Gamepad* g = g_pads[i];
         u64 one;
         i32 axes[4];
+        unsigned held = 0;
         int c;
+        if (g)
+            for (c = 0; c < SNX_PAD_CONTROLS; c++)
+                if (snx_pad_held(g, c)) held |= 1u << c;
+        __atomic_store_n(&g_held[i], held, __ATOMIC_RELAXED); /* the renderer's thread draws them */
         if (!g) continue;
         gamepad_state_slot(i, &one, axes);
         b |= one;
-        for (c = 0; c < SNX_PAD_CONTROLS; c++)
-            if (snx_pad_held(g, c)) held |= 1u << c;
         if (!sticks[0] && !sticks[1]) {
             sticks[0] = axes[0];
             sticks[1] = axes[1];
@@ -527,7 +544,6 @@ void gamepad_state(u64* buttons, i32 sticks[4]) {
         }
     }
     *buttons = b;
-    __atomic_store_n(&g_held, held, __ATOMIC_RELAXED); /* the renderer's thread draws them */
 }
 
 void gamepad_rumble(u32 left, u32 right) {

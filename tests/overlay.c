@@ -33,16 +33,20 @@ static const char* pad_names[3];
 SnxGamepadConfig* gamepad_config(void) { return &pads; }
 void gamepad_store(const int* setting) { pad_stored = setting; }
 static int maps_stored;
-static unsigned pads_held;
+static unsigned pads_held[3];               /* what each holds */
+static int pad_of_player[3] = {-1, -1, -1}; /* each player's pad, as gamepad_name counts them */
 void gamepad_store_map(void) { ++maps_stored; }
 int gamepad_layout(int i, int labels[4], int* symmetric) {
-    (void)i;
-    (void)labels;
-    (void)symmetric;
-    return 0; /* no labels known: an Xbox pad's */
+    static const int sony[4] = {SNX_PAD_LABEL_CROSS, SNX_PAD_LABEL_CIRCLE, SNX_PAD_LABEL_SQUARE,
+                                SNX_PAD_LABEL_TRIANGLE};
+    if (i != 1 || !pad_names[1]) return 0; /* no labels known: an Xbox pad's; the second a PlayStation one */
+    memcpy(labels, sony, sizeof sony);
+    *symmetric = 1;
+    return 1;
 }
-unsigned gamepad_held(void) { return pads_held; }
+unsigned gamepad_held(int i) { return i < 0 ? pads_held[0] | pads_held[1] | pads_held[2] : i < 3 ? pads_held[i] : 0; }
 const char* gamepad_name(int i) { return i >= 0 && i < 3 ? pad_names[i] : NULL; }
+int gamepad_of_player(int slot) { return slot >= 0 && slot < 3 ? pad_of_player[slot] : -1; }
 const IniOpt g_backend_ini[] = {
     {"touch", "2", NULL, INI_INT, 0, &touch, 0, 2, NULL, "Touch screen", "Off|Fingers|Mouse too", 0, 0},
     {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0}};
@@ -395,10 +399,11 @@ int main(void) {
        to its item */
     pad_names[0] = "Xbox Wireless Controller";
     pad_names[1] = pad_names[2] = NULL;
+    pad_of_player[0] = 0;
     draw();
     assert(text_at(1, 8, "\xFE Button map") && text_at(C - 2, 8, ">"));
     assert(tap(5, 3) == OVERLAY_NONE);
-    pads_held = 1u << SNX_PAD_RT;
+    pads_held[0] = 1u << SNX_PAD_RT;
     draw();
     assert(shows("SCARLETNX  /  BUTTON MAP") && !shows("By label") && shows("Xbox Wireless Controller"));
     assert(shows("LT sends ZL") && quads_of(FAILURE) > 0); /* RT held: lit */
@@ -419,7 +424,7 @@ int main(void) {
     assert(overlay_back() == OVERLAY_NONE); /* no presets to go back to: up to its item at once */
     draw();
     assert(text_at(1, 0, "SCARLETNX  /  CONTROLLERS") && text_at(1, 8, "\xFE Button map"));
-    pads_held = 0;
+    pads_held[0] = 0;
     /* the Player row steps to player 1: its Swap A/B and Vibration its own, As All until picked; its Button map
        its own map, kept as its key; round the eight back to All */
     tap(0, 3);
@@ -434,7 +439,35 @@ int main(void) {
     assert(players[0].has_map && players[0].own.bit[SNX_PAD_LT] == 2 && pads.own.bit[SNX_PAD_LT] == 1 &&
            player_maps_stored == 1 && maps_stored == 2);
     assert(overlay_back() == OVERLAY_NONE);
-    for (x = 0; x < 8; ++x) tap(0, 3);
+    /* a player's map draws that player's pad, its labels and what it holds, not the first pad; one whose pad is not
+       there, none */
+    pad_names[1] = "DualSense Wireless Controller";
+    pad_of_player[1] = 1;
+    pads_held[0] = 1u << SNX_PAD_RT;
+    tap(0, 3);
+    tap(5, 3);
+    draw();
+    assert(shows("SCARLETNX  /  PLAYER 2  /  BUTTON MAP") && shows("DualSense Wireless Controller"));
+    assert(!shows("Xbox Wireless Controller") && shows("Cross") && !quads_of(FAILURE));
+    pads_held[1] = 1u << SNX_PAD_RT;
+    draw();
+    assert(quads_of(FAILURE) > 0);
+    assert(overlay_back() == OVERLAY_NONE);
+    tap(0, 3);
+    tap(5, 3);
+    draw();
+    assert(shows("SCARLETNX  /  PLAYER 3  /  BUTTON MAP") && shows("No controller"));
+    assert(!shows("Xbox Wireless Controller") && !shows("DualSense Wireless Controller") && !quads_of(FAILURE));
+    assert(overlay_back() == OVERLAY_NONE);
+    /* every player's: the first pad, lit by any */
+    for (x = 0; x < 6; ++x) tap(0, 3);
+    tap(5, 3);
+    pads_held[0] = 0;
+    draw();
+    assert(shows("SCARLETNX  /  BUTTON MAP") && shows("Xbox Wireless Controller") && quads_of(FAILURE) > 0);
+    assert(overlay_back() == OVERLAY_NONE);
+    pads_held[1] = 0;
+    pad_names[1] = NULL;
     draw();
     assert(shows("< All >"));
     /* Back, on its item or the key, comes up to the controllers' item */
