@@ -190,6 +190,18 @@ static u32 addr_out(const SnxSockAddr* a, u64 dst, u64 cap) {
     return n;
 }
 
+/* an address for the log, at level 2: "127.0.0.1:1234", "[v6]:1234" or "?" */
+static const char* addr_text(const SnxSockAddr* a, char* buf, size_t n) {
+    u16 port = (u16)((a->port >> 8) | (a->port << 8));
+    if (a->family == SNX_AF_INET)
+        snprintf(buf, n, "%u.%u.%u.%u:%u", a->addr[0], a->addr[1], a->addr[2], a->addr[3], port);
+    else if (a->family == SNX_AF_INET6)
+        snprintf(buf, n, "[v6]:%u", port);
+    else
+        snprintf(buf, n, "?");
+    return buf;
+}
+
 /* ============================================================ descriptors */
 static SnxSocket* fd_get(Bsd* b, i32 fd, BsdFd* copy) {
     SnxSocket* s = NULL;
@@ -431,6 +443,10 @@ static int64_t do_recv(Bsd* b, IpcBuf message, i32 fd, u32 gflags, IpcBuf addr, 
         r = -SNX_EFAULT;
     else
         r = snx_socket_recv(s, GP(a), n, msg_in(gflags), addrlen ? &from : NULL, NULL);
+    if (r > 0 && from.family && g_verbose >= 2) {
+        char t[64];
+        LOGV("bsd: RecvFrom(%d) %lld bytes from %s\n", fd, (long long)r, addr_text(&from, t, sizeof t));
+    }
     /* a connected stream socket names no sender (Eden clears the address for connection based sockets) */
     if (r >= 0 && addrlen) {
         if (from.family && snx_socket_type(s) != SNX_SOCK_STREAM)
@@ -452,6 +468,11 @@ static int64_t do_send(Bsd* b, IpcBuf message, i32 fd, u32 gflags, const SnxSock
         r = -SNX_EFAULT;
     else
         r = snx_socket_send(s, a ? GP(a) : NULL, n, msg_in(gflags), to);
+    if (to && g_verbose >= 2) {
+        char t[64];
+        LOGV("bsd: SendTo(%d) %llu bytes to %s = %lld\n", fd, (unsigned long long)n, addr_text(to, t, sizeof t),
+             (long long)r);
+    }
     snx_socket_unref(s);
     return r;
 }
@@ -504,6 +525,10 @@ static int bind_connect(Bsd* b, i32 fd, IpcBuf addr, int connect, i32* ret, u32*
     if (!connect) {
         bind_address(&sa);
         r = snx_socket_bind(s, &sa);
+        if (g_verbose >= 2) {
+            char t[64];
+            LOGV("bsd: Bind(%d) %s = %d\n", fd, addr_text(&sa, t, sizeof t), r);
+        }
     } else if (!network_reachable(&sa))
         r = -SNX_ENETUNREACH;
     else {
