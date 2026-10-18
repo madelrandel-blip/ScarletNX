@@ -10,7 +10,7 @@
    and the default Miis from Eden's src/core/hle/service/mii/types/raw_data.cpp:
    SPDX-FileCopyrightText: Ryujinx Team and Contributors (MIT) */
 /* The smaller services: apm, lm, pctl, friend, ns, prepo, caps, ectx, psm, fatal, csrng, spl, mm, nfp, nfc, bcat,
-   aoc, irs, mii, ldn, btm and audin, each as a console offline, with no NFC device or microphone, and the add-on
+   aoc, irs, mii, btm and audin, each as a console offline, with no NFC device or microphone, and the add-on
    content the data folder holds */
 #include "nx/hle/services/services_int.h"
 #include "nx/hle/filesystem/fs.h"
@@ -936,40 +936,6 @@ static int nn_mii_detail_IDatabaseService_SetInterfaceVersion(SvcObj* self, u32 
     R_SUCCEED();
 }
 
-/* ============================================================ ldn */
-static int nn_ldn_detail_IUserServiceCreator_CreateUserLocalCommunicationService(SvcObj* self, SvcObj** service) {
-    (void)self;
-    *service = nn_ldn_detail_IUserLocalCommunicationService_new(sizeof(u32));
-    R_SUCCEED();
-}
-static int nn_ldn_detail_IUserServiceCreator_CreateClientProcessMonitor(SvcObj* self, SvcObj** monitor) {
-    (void)self;
-    *monitor = nn_ldn_detail_IClientProcessMonitor_new(0);
-    R_SUCCEED();
-}
-/* nn::ldn::State: 0 none, 1 initialized */
-static int nn_ldn_detail_IUserLocalCommunicationService_GetState(SvcObj* self, u32* state) {
-    *state = __atomic_load_n((u32*)self->data, __ATOMIC_ACQUIRE);
-    R_SUCCEED();
-}
-static int nn_ldn_detail_IUserLocalCommunicationService_AttachStateChangeEvent(SvcObj* self, u32* event) {
-    (void)self;
-    return new_event(event, "ldn state change", 0);
-}
-static int nn_ldn_detail_IUserLocalCommunicationService_Initialize(SvcObj* self, u64 pid) {
-    (void)pid;
-    __atomic_store_n((u32*)self->data, 1u, __ATOMIC_RELEASE);
-    R_SUCCEED();
-}
-static int nn_ldn_detail_IUserLocalCommunicationService_Finalize(SvcObj* self) {
-    __atomic_store_n((u32*)self->data, 0u, __ATOMIC_RELEASE);
-    R_SUCCEED();
-}
-static int nn_ldn_detail_IUserLocalCommunicationService_InitializeWithVersion(SvcObj* self, i32 version, u64 pid) {
-    (void)version;
-    return nn_ldn_detail_IUserLocalCommunicationService_Initialize(self, pid);
-}
-
 /* ============================================================ btm */
 static int nn_btm_IBtmUser_GetCore(SvcObj* self, SvcObj** core) {
     (void)self;
@@ -1045,7 +1011,6 @@ SvcObj* new_bcat(void) { return nn_bcat_detail_ipc_IServiceCreator_new(0); }
 SvcObj* new_aoc(void) { return nn_aocsrv_detail_IAddOnContentManager_new(0); }
 SvcObj* new_irs(void) { return nn_irsensor_IIrSensorServer_new(0); }
 SvcObj* new_mii(void) { return nn_mii_detail_IStaticService_new(0); }
-SvcObj* new_ldn(void) { return nn_ldn_detail_IUserServiceCreator_new(0); }
 SvcObj* new_ectx(void) { return nn_err_context_IWriterForApplication_new(0); }
 SvcObj* new_spl(void) { return nn_spl_detail_IGeneralInterface_new(0); }
 SvcObj* new_btmu(void) { return nn_btm_IBtmUser_new(0); }

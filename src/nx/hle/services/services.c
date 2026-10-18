@@ -11,6 +11,7 @@
 #include "hle/services/audio.swipc.h"
 #include "hle/services/misc.swipc.h"
 #include "hle/services/network/bsd.swipc.h"
+#include "hle/services/network/ldn.swipc.h"
 #include "hle/services/network/dns.swipc.h"
 #include "hle/services/network/nifm.swipc.h"
 #include "hle/services/network/ssl.swipc.h"

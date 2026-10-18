@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 the ScarletNX contributors
 # The smaller services (misc.c): apm, lm, pctl, friend, ns, prepo, psm, fatal, csrng, mm, nfp, caps, bcat, aoc,
-# irs, mii, ldn, ectx, spl, btm, audin. Names and argument types from Switchbrew, libnx and the SDK's own symbols
+# irs, mii, ectx, spl, btm, audin. Names and argument types from Switchbrew, libnx and the SDK's own symbols
 
 # ================================================================ apm
 type nn::apm::PerformanceMode = i32;
@@ -363,24 +363,6 @@ interface nn::mii::detail::IDatabaseService {
     @stub [3] Get(i32 source_flag, array<nn::mii::CharInfoElement, 6> elements) -> i32 count;
     [7] BuildDefault(u32 index) -> nn::mii::CharInfo info;
     [22] SetInterfaceVersion(u32 version);
-}
-
-# ================================================================ ldn:u: local wireless. Opening an access point or a
-# station, scanning and connecting are not implemented and log
-interface nn::ldn::detail::IUserServiceCreator is ldn:u {
-    [0] CreateUserLocalCommunicationService() -> object<nn::ldn::detail::IUserLocalCommunicationService> service;
-    # 18.0.0+: libnx's ldnInitialize asks for it and registers its process before anything else
-    [1] CreateClientProcessMonitor() -> object<nn::ldn::detail::IClientProcessMonitor> monitor;
-}
-interface nn::ldn::detail::IClientProcessMonitor {
-    @stub [0] RegisterClient(pid);
-}
-interface nn::ldn::detail::IUserLocalCommunicationService {
-    [0] GetState() -> u32 state;
-    [100] AttachStateChangeEvent() -> handle<copy, event> event;
-    [400] Initialize(pid);
-    [401] Finalize();
-    [402] InitializeWithVersion(i32 version, pid);
 }
 
 # ================================================================ btm:u: BLE is not emulated, its events never signal

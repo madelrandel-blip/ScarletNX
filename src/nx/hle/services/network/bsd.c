@@ -71,6 +71,24 @@ int network_reachable(const SnxSockAddr* a) {
     static const uint8_t lo6[16] = {[15] = 1};
     return a->family == SNX_AF_INET6 && !memcmp(a->addr, lo6, 16);
 }
+/* the address a bind to INADDR_ANY binds instead, while ldn gives this console one of its own on the LAN (ldn.c):
+   two consoles on one host then keep their ports apart. NULL clears it */
+static PMutex g_bind_lk = PMUTEX_INIT;
+static int g_bind_set;
+static u8 g_bind_ip[4];
+void bsd_set_bind_address(const u8* ip) {
+    pm_lock(&g_bind_lk);
+    g_bind_set = ip != NULL;
+    if (ip) memcpy(g_bind_ip, ip, 4);
+    pm_unlock(&g_bind_lk);
+}
+static void bind_address(SnxSockAddr* a) {
+    static const u8 any[4];
+    if (a->family != SNX_AF_INET || memcmp(a->addr, any, 4)) return;
+    pm_lock(&g_bind_lk);
+    if (g_bind_set) memcpy(a->addr, g_bind_ip, 4);
+    pm_unlock(&g_bind_lk);
+}
 static void net_log(const char* m) { LOG("%s", m); }
 void network_init(void) {
     snx_net_set_log(net_log);
@@ -483,9 +501,10 @@ static int bind_connect(Bsd* b, i32 fd, IpcBuf addr, int connect, i32* ret, u32*
     if (r) return reply(r, ret, bsd_errno);
     WITH_SOCKET(fd);
     (void)d;
-    if (!connect)
+    if (!connect) {
+        bind_address(&sa);
         r = snx_socket_bind(s, &sa);
-    else if (!network_reachable(&sa))
+    } else if (!network_reachable(&sa))
         r = -SNX_ENETUNREACH;
     else {
         r = snx_socket_connect(s, &sa);

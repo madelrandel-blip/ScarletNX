@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 the ScarletNX contributors
+# ldn:u, local wireless (ldn.c): the networks a game creates, finds and joins, over the LAN (common/network/net_ldn).
+# Names, numbers and types from Switchbrew, libnx and Eden's ldn_types.h
+
+type nn::ldn::State = u32;
+type nn::ldn::DisconnectReason = i16;
+type nn::ldn::WifiChannel = i16;
+type nn::ldn::Ipv4Address = u32;
+type nn::ldn::MacAddress = bytes<6>;
+type nn::ldn::NetworkInfo = bytes<0x480, 8>;
+type nn::ldn::NodeLatestUpdate = bytes<8>;
+type nn::ldn::ScanFilter = bytes<0x60, 8>;
+type nn::ldn::SecurityParameter = bytes<0x20, 8>;
+type nn::ldn::NetworkConfig = bytes<0x20, 8>;
+type nn::ldn::CreateNetworkConfig = bytes<0x98, 8>;
+type nn::ldn::CreateNetworkConfigPrivate = bytes<0xb8, 8>;
+type nn::ldn::ConnectNetworkData = bytes<0x7c, 4>;
+type nn::ldn::AddressEntry = bytes<0xc, 4>;
+
+interface nn::ldn::detail::IUserServiceCreator is ldn:u {
+    [0] CreateUserLocalCommunicationService() -> object<nn::ldn::detail::IUserLocalCommunicationService> service;
+    # 18.0.0+: libnx's ldnInitialize asks for it and registers its process before anything else
+    [1] CreateClientProcessMonitor() -> object<nn::ldn::detail::IClientProcessMonitor> monitor;
+}
+interface nn::ldn::detail::IClientProcessMonitor {
+    @stub [0] RegisterClient(pid);
+}
+interface nn::ldn::detail::IUserLocalCommunicationService {
+    [0] GetState() -> nn::ldn::State state;
+    [1] GetNetworkInfo(buffer<nn::ldn::NetworkInfo, 0x1a> info);
+    [2] GetIpv4Address() -> (nn::ldn::Ipv4Address address, nn::ldn::Ipv4Address subnet_mask);
+    [3] GetDisconnectReason() -> nn::ldn::DisconnectReason reason;
+    [4] GetSecurityParameter() -> nn::ldn::SecurityParameter parameter;
+    [5] GetNetworkConfig() -> nn::ldn::NetworkConfig config;
+    [100] AttachStateChangeEvent() -> handle<copy, event> event;
+    [101] GetNetworkInfoLatestUpdate(buffer<nn::ldn::NetworkInfo, 0x1a> info,
+                                     array<nn::ldn::NodeLatestUpdate, 0xa> updates);
+    [102] Scan(nn::ldn::WifiChannel channel, nn::ldn::ScanFilter filter,
+               array<nn::ldn::NetworkInfo, 0x22> networks) -> i16 count;
+    [103] ScanPrivate(nn::ldn::WifiChannel channel, nn::ldn::ScanFilter filter,
+                      array<nn::ldn::NetworkInfo, 0x22> networks) -> i16 count;
+    @stub [104] SetWirelessControllerRestriction(u32 restriction);
+    @stub [106] SetProtocol(u32 protocol);
+    [200] OpenAccessPoint();
+    [201] CloseAccessPoint();
+    [202] CreateNetwork(nn::ldn::CreateNetworkConfig config);
+    [203] CreateNetworkPrivate(nn::ldn::CreateNetworkConfigPrivate config, array<nn::ldn::AddressEntry, 9> addresses);
+    [204] DestroyNetwork();
+    [206] SetAdvertiseData(buffer<u8, 0x21> data);
+    @stub [207] SetStationAcceptPolicy(u8 policy);
+    @stub [208] AddAcceptFilterEntry(nn::ldn::MacAddress mac);
+    [300] OpenStation();
+    [301] CloseStation();
+    [302] Connect(nn::ldn::ConnectNetworkData data, buffer<nn::ldn::NetworkInfo, 0x19> info);
+    [304] Disconnect();
+    [400] Initialize(pid);
+    [401] Finalize();
+    [402] InitializeWithVersion(i32 version, pid);
+}

@@ -71,7 +71,6 @@ SvcObj* new_bcat(void);
 SvcObj* new_aoc(void);
 SvcObj* new_irs(void);
 SvcObj* new_mii(void);
-SvcObj* new_ldn(void);
 SvcObj* new_ectx(void);
 SvcObj* new_spl(void);
 SvcObj* new_btmu(void);
