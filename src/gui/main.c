@@ -179,6 +179,7 @@ typedef struct {
     bool clean_armed;   /* App's Clean old settings selected once, saying what it would do: again does it */
     GuiCleaned cleaned; /* what it did, in a box over the screen while cleaned_shown, until a key closes it */
     bool cleaned_shown;
+    int files_top, files_shown; /* the box of files over the screen (render_files): its first file, and how many */
     char* folders[GUI_FOLDERS_MAX];     /* the player's game folders, listed after games/ */
     bool folders_deep[GUI_FOLDERS_MAX]; /* each with its subfolders' games too */
     int folder_count;
@@ -1193,9 +1194,10 @@ static int wrap_rows(const App* app, const char* s, int width, int path) {
         for (s += wrap_at(s, width, path); *s == ' ';) ++s;
     return SDL_max(rows, 1);
 }
-/* a box of files over the screen, two lines each, as many as fit, how many more, then OK, focused: the folders and
-   files an older version left (report 0), each where it is (-) and the space it takes; or what Clean old settings did
-   (1), each file and what was done to it or why not. Any key closes it */
+/* a box of files over the screen, two lines each, as many as fit from app->files_top, how many more, then OK,
+   focused: the folders and files an older version left (report 0), each where it is (-) and the space it takes; or
+   what Clean old settings did (1), each file and what was done to it or why not. Up/Down go over them, another key
+   closes it */
 /* the space the older version's i-th folder, old, takes, or that it is still counted */
 static void left_size(const App* app, int i, const char* old, char* out, size_t size) {
     const GuiSpace* space = app->left_space;
@@ -1229,23 +1231,28 @@ static void render_files(App* app, int report) {
     char a[4400], b[4400], label[96];
     const char *first = report ? app->cleaned.text : app->left, *at = first;
     int width, height, cols, room, used = 0, shown, i, y, path, s = app->scale, item = item_h(app), hint;
-    int count = report ? app->cleaned.count : app->lefts, done = app->cleaned.done;
+    int count = report ? app->cleaned.count : app->lefts, done = app->cleaned.done, top;
     SDL_Color ca, cb;
     GuiRect r, text;
     GuiList ok;
     area(app, &width, &height);
     cols = width / cell_w(app) - 6;
     hint = !report && app->left_clear ? wrap_rows(app, SAY_LEFT_CLEAR, cols, 0) : 0; /* under them, before OK */
+    /* the first shown, kept among them when there are fewer since */
+    top = app->files_top = SDL_clamp(app->files_top, 0, SDL_max(count - 1, 0));
+    for (i = 0; at && i < top; ++i) at = files_entry(app, report, i, at, a, b, sizeof a, &ca, &cb, &path);
+    first = at;
     /* the files' rows, and one for how many more */
     room = (height - head_h(app) - item - 24 * s) / cell_h(app) - 2 - hint;
-    for (shown = 0; at && shown < count; ++shown) {
+    for (shown = 0; at && top + shown < count; ++shown) {
         int need;
-        at = files_entry(app, report, shown, at, a, b, sizeof a, &ca, &cb, &path);
+        at = files_entry(app, report, top + shown, at, a, b, sizeof a, &ca, &cb, &path);
         need = wrap_rows(app, a, cols - 2, 1) + wrap_rows(app, b, cols - 2, path);
         if (shown && used + need > room) break;
         used += need;
     }
-    r = over_rect(app, cols, head_h(app) + (used + (shown < count) + hint) * cell_h(app) + item + 16 * s);
+    app->files_shown = shown;
+    r = over_rect(app, cols, head_h(app) + (used + (top + shown < count) + hint) * cell_h(app) + item + 16 * s);
     if (!report)
         snprintf(label, sizeof label, "%s", SAY_LEFT_TITLE);
     else if (count > done)
@@ -1255,13 +1262,14 @@ static void render_files(App* app, int report) {
     y = over_box(app, r, label) + 2 * s;
     text = inner(app, r);
     for (i = 0, at = first; at && i < shown; ++i) {
-        at = files_entry(app, report, i, at, a, b, sizeof a, &ca, &cb, &path);
+        at = files_entry(app, report, top + i, at, a, b, sizeof a, &ca, &cb, &path);
         text_in(app, text, text.x, y, "-", ca);
+        if (top && !i) text_in(app, r, text.x + text.w, y, "\x1e", rgb(app->theme.soft)); /* more above: its margin */
         y += wrap_in(app, text, text.x + 2 * cell_w(app), y, a, 1, ca) * cell_h(app);
         y += wrap_in(app, text, text.x + 2 * cell_w(app), y, b, path, cb) * cell_h(app);
     }
-    if (shown < count) {
-        snprintf(label, sizeof label, "and %d more, which Share log lists", count - shown);
+    if (top + shown < count) {
+        snprintf(label, sizeof label, "and %d more, which Share log lists", count - top - shown);
         text_in(app, text, text.x, y, label, rgb(app->theme.soft));
         y += cell_h(app);
     }
@@ -4246,6 +4254,7 @@ static void clean_old(App* app) {
     if (app_read(app, false, unread, sizeof unread)) /* the picks as the menu has them, nothing else */
         clean_keys(app, app->app_file, unread, app_save(app));
     app->cleaned_shown = app->cleaned.count > 0;
+    app->files_top = 0;
 }
 /* App's row: the first Enter says what it would do, the second does it */
 static void clean_row(App* app) {
@@ -5271,19 +5280,41 @@ static bool menu_key_of(const SDL_KeyboardEvent* k, GuiKey* key) {
         default: return false;
     }
 }
+/* the box of files over the screen step files on (back for a negative one), down only while some are under them */
+static void files_step(App* app, int step) {
+    int count = app->cleaned_shown ? app->cleaned.count : app->lefts;
+    if (step > 0 && app->files_top + app->files_shown >= count) return; /* the last one shows already */
+    app->files_top = SDL_max(0, app->files_top + step);
+}
+/* a key that goes over its files, Up/Down a file and PgUp/PgDn as many as show: true for those, another closing it */
+static bool files_key(App* app, SDL_Keycode code) {
+    int shown = SDL_max(1, app->files_shown);
+    switch (code) {
+        case SDLK_UP: files_step(app, -1); return true;
+        case SDLK_DOWN: files_step(app, 1); return true;
+        case SDLK_PAGEUP: files_step(app, -shown); return true;
+        case SDLK_PAGEDOWN: files_step(app, shown); return true;
+        default: return false;
+    }
+}
 static void event(App* app, const SDL_Event* e) {
     GuiKey key;
     if (e->type == SDL_EVENT_QUIT || e->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
         app->menu.quit = true;
         return;
     }
-    /* what Clean old settings did takes the first key, button or finger, which closes it */
+    /* what Clean old settings did, and the box of an older version's files: Up/Down and the wheel go over their files,
+       the first other key, button or finger closes it */
+    if ((app->cleaned_shown || (app->left_shown && !app->splash)) &&
+        ((e->type == SDL_EVENT_KEY_DOWN && files_key(app, e->key.key)) || e->type == SDL_EVENT_MOUSE_WHEEL)) {
+        if (e->type == SDL_EVENT_MOUSE_WHEEL) files_step(app, -e->wheel.integer_y); /* a notch a file, as a row */
+        return;
+    }
     if (app->cleaned_shown &&
         (e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_FINGER_DOWN)) {
         app->cleaned_shown = false;
         return;
     }
-    /* the box of an older version's files takes the first key, button or finger, which closes it */
     if (app->left_shown && !app->splash &&
         (e->type == SDL_EVENT_KEY_DOWN || e->type == SDL_EVENT_MOUSE_BUTTON_DOWN || e->type == SDL_EVENT_FINGER_DOWN)) {
         app->left_shown = false;

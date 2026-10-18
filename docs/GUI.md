@@ -119,7 +119,8 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   gives a game's `.ini` for the keys it no longer uses (in the config folder's `games/`, in `games/`
   and in the player's folders), the keys of `settings.ini` that no setting of the runtime's takes
   (only while the runtime lists its settings) and those of `app.ini` the menu does not know. A box
-  over the screen then lists each file and what was done to it, or why not, until a key closes it;
+  over the screen then lists each file and what was done to it, or why not, Up/Down and the wheel going over those
+  that do not fit, until another key closes it;
   Share log lists them too. A group of settings shows
   a row each, its help above, Left/Right going round its values, Enter typing one. A setting not picked shows the runtime's default and `[default]` (*Off [default]*):
   the run takes the game's `.ini`'s, which starts as that; one picked goes to every
@@ -170,8 +171,9 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   under it the space it takes, counted as the box shows (*counting* until then). They are the menu's `gui/`, `work/`, each game laid out
   beside the others in `games/` or a Library folder (`games/<id>/` now), a portable copy's `games/`
   beside the program, and a build tree's `games/`, `work/` and keys in its checkout
-  ([USAGE](USAGE.md#folders)). Any key, click or tap closes it; nothing is moved, and it shows again at the next
-  start for as long as they are there.
+  ([USAGE](USAGE.md#folders)). Up/Down, PgUp/PgDn and the wheel go over those that do not fit (an arrow at the
+  right of the first says some are above it, *and N more* the ones under), any other key, click or tap closes it;
+  nothing is moved, and it shows again at the next start for as long as they are there.
   **Share log** lists them all, each with where it goes now. On Android the menu's own files an older version kept
   in the app's own files, out of the Files app's reach, are listed a file at a time, and under them the box says how
   they go while the app is in testing: Android's Settings > Apps > ScarletNX > Storage > Clear storage, which takes
