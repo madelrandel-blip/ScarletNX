@@ -54,10 +54,9 @@ static const char* const PADS[P_COUNT] = {SNX_GAMEPAD_PLAYERS,
                                           "Back"};
 static int shown, page, focus, top; /* top: the first item showing */
 static int pad_player;              /* the player the gamepads' page shows: 0 every player's, 1 to SNX_GAMEPADS */
-/* the YoRHa menu's colours, from its theme.ini (gui_theme_colors.h), as R G B A bytes; the page lets the game show
-   through a little */
+/* the YoRHa menu's colours, from its theme.ini (gui_theme_colors.h), as R G B A bytes; the page hides the game under
+   it, whose text would show through its letters */
 #define SNX_OVERLAY_RGBA(rgb, a) ((u32)(a) << 24 | ((rgb) & 0xFFu) << 16 | ((rgb) & 0xFF00u) | ((rgb) >> 16 & 0xFFu))
-#define PAGE_RGBA                SNX_OVERLAY_RGBA(SNX_GUI_THEME_YORHA_PAGE, 0xF2u)
 #define INK                      SNX_OVERLAY_RGBA(SNX_GUI_THEME_YORHA_INK, 0xFFu)
 #define SOFT                     SNX_OVERLAY_RGBA(SNX_GUI_THEME_YORHA_SOFT, 0xFFu)
 #define LIGHT                    SNX_OVERLAY_RGBA(SNX_GUI_THEME_YORHA_PAGE, 0xFFu)
@@ -203,7 +202,7 @@ static void map_draw(SnxUiList* l, int sw, int sh) {
     w = (float)sw - 2 * cw;
     h = (float)sh - 2 * ch;
     map_pad();
-    ui_fill(l, x, y, w, h, LIGHT); /* the whole picture: the game no longer shows through, as on the small pages */
+    ui_fill(l, x, y, w, h, LIGHT); /* the whole picture */
     ui_fill(l, x, y, w, ch, INK);
     if (pad_player) { /* the player's own */
         char title[48];
@@ -369,7 +368,7 @@ static void dialog_draw(SnxUiList* l, int sw, int sh, const Dialog* d, DialogRow
     out->cols = cols;
     out->scale = s;
     if (l) {
-        ui_fill(l, x, y, w, ch * (float)total, PAGE_RGBA);
+        ui_fill(l, x, y, w, ch * (float)total, LIGHT);
         ui_fill(l, x, y, w, ch, INK);
         ui_text(l, x + cw, y, s, d->title, LIGHT);
     }

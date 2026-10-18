@@ -174,9 +174,11 @@ int main(void) {
     overlay_place(3840, 2160, &x, &y, &sc);
     assert(sc == 4);
 
-    /* the first page: the title on a band of ink, the items under it, the focused one on a band */
+    /* the first page: the title on a band of ink, the items under it, the focused one on a band; the page hides the
+       game, whose text would show through it */
     draw();
     assert(list.q[0].w == (float)(C * 16) && list.q[0].h == 7 * 32 && list.q[1].rgba == ink && list.q[1].h == 32);
+    assert(list.q[0].rgba >> 24 == 0xFFu);
     assert(text_at(C - 2, 3, ">") && text_at(C - 2, 4, ">")); /* a page under each */
     assert(text_at(1, 0, "SCARLETNX  /  MENU") && text_at(1, 3, "\xFE On-screen controls") &&
            text_at(1, 4, "\xFE Controllers") && text_at(1, 5, "\xFE Exit"));
@@ -494,7 +496,8 @@ int main(void) {
         top = list.q[0].y;
         total = (int)(list.q[0].h / row_h);
         C = overlay_cols(SW, s);
-        assert(list.n > 4 && list.q[0].x == (float)px && list.q[0].w == (float)(C * 8 * s));
+        assert(list.n > 4 && list.q[0].x == (float)px && list.q[0].w == (float)(C * 8 * s) &&
+               list.q[0].rgba >> 24 == 0xFFu);
         assert(top >= 0 && top + list.q[0].h <= (float)SH && list.q[1].y == top && list.q[1].h == row_h);
         py = (int)top;
         assert(text_at(1, 0, "SCARLETNX  /  STOPPED") && text_at(1, 1, "ENDER MAGNOLIA"));
