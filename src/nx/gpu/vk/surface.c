@@ -11,6 +11,7 @@
 #include "nx/hle/services/nvdrv.h"
 #include "nx/memory/mem.h"
 #include "nx/runtime/platform/log.h"
+#include "nx/runtime/platform/plat.h"
 #include "nx/gpu/vk/vk.h"
 
 #define SURFH 4096
@@ -621,16 +622,27 @@ static void surf_free(Surf* s) {
     free(s);
 }
 void vk_surf_evict(u32 before) {
+    u32 kept = 0;
+    u64 kept_bytes = 0, t0 = plat_ns();
     /* A storage image keeps a Surf pointer until its result reaches guest memory. */
     vk_gfx_image_land();
-    /* render targets too, parked or not: one not drawn, sampled or presented for as long goes with its contents
-       (guest memory has them as of its last write-back) */
+    /* render targets too, parked or not: one not drawn, sampled or presented for as long goes. What it drew since
+       memory last had it goes to memory first, as the console's GPU draws into memory: a texture made there later
+       reads it (Mario Kart 8 Deluxe draws its Mii icons at boot and shows them a minute later). Not a parked one,
+       whose address is another target's now, nor one whose memory was written after its draw */
     for (int k = 0; k < SURFH; k++)
         for (Surf** pp = &g_surfh[k]; *pp;) {
             Surf* s = *pp;
             if ((i32)((u32)s->last_used - before) >= 0) {
                 pp = &s->next;
                 continue;
+            }
+            if (s->is_rt && !(s->gva >> 63) && s->mem_wgen != s->wgen && vk_rt_drawn_fresh(s)) {
+                vk_surf_flush(s, NULL);
+                if (s->mem_wgen == s->wgen) {
+                    kept++;
+                    kept_bytes += rt_bytes(s);
+                }
             }
             *pp = s->next;
             for (Surf *c = s->crop, *n; c; c = n) { /* its copies (gpu/vk/texture.c rt_crop) */
@@ -639,6 +651,12 @@ void vk_surf_evict(u32 before) {
             }
             surf_free(s);
         }
+    if (kept)
+        LOG_LIMIT(20,
+                  "vulkan: %u render target%s unused for ten seconds went to guest memory before they went (%llu KB, "
+                  "%llu ms)\n",
+                  kept, kept == 1 ? "" : "s", (unsigned long long)(kept_bytes >> 10),
+                  (unsigned long long)((plat_ns() - t0) / 1000000));
 }
 
 /* the 2D engine's blit between render targets, on the GPU. The surfaces are gpu/gpu.h's

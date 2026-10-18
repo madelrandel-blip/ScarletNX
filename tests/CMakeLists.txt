@@ -740,6 +740,12 @@ if(NOT SNX_TOOLS_ONLY)
     snx_test_target(snx-test-tex-upload-rows 23)
     target_link_libraries(snx-test-tex-upload-rows PRIVATE snx_nx_flags)
     add_test(NAME tex_upload_rows COMMAND snx-test-tex-upload-rows)
+    # vk_surf_evict (gpu/vk/surface.c): what a render target drew goes to guest memory before it goes, unless memory
+    # has it or is newer, or the target is parked
+    add_executable(snx-test-rt-evict rt_evict.c)
+    snx_test_target(snx-test-rt-evict 23)
+    target_link_libraries(snx-test-rt-evict PRIVATE snx_nx_flags)
+    add_test(NAME rt_evict COMMAND snx-test-rt-evict)
 endif()
 
 add_executable(snx_recompiler_test recompiler_native.c)
