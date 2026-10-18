@@ -105,7 +105,7 @@ int main(void) {
     c.in[0] = 0xbeef0000;
     calls = 0;
     test_ctr_dispatch(&c);
-    assert(!calls && !owned && c.state == SNX_CTR_IPC_UNSUPPORTED && !c.out[0]);
+    assert(!calls && !owned && c.state == SNX_CTR_IPC_UNKNOWN && !c.out[0]); /* no such command */
     puts("CTR generated wire ordering, 32-bit caller PID, replies and owned-output rollback passed (C90 fixture)");
     return 0;
 }

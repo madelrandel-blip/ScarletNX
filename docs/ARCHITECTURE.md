@@ -24,7 +24,7 @@ Source map: [CLAUDE.md](../CLAUDE.md).
 
 The experimental `src/3ds/` / `scarletnx-3ds` target supplies board profiles,
 decrypted CIA/NCCH/ExeFS/RomFS extraction and an independent checked page-memory
-controller. `SNX_3DS_AOT=ON` adds a native Linux static-AOT pipeline:
+controller, and a static-AOT pipeline for Linux and Windows hosts:
 extraction -> the driver's offline LLVM compiler/host linker (only when the module is missing or stale) ->
 native ELF -> checked process/ARM/Thumb dispatch. `snx_ctr_process` maps raw
 ExHeader segments/BSS/stack/TLS; `snx_ctr_native` validates/loads module ABI 1.

@@ -9,20 +9,21 @@
 * [Observed startup](#observed-startup)
 * [Validation boundaries and next work](#validation-boundaries-and-next-work)
 
-The supplied SuperTux CIA now **reaches and executes `main`**, at `0x00167d88`
-after **50,489 native blocks**. Its SelfNCCH RomFS open succeeds using NX's
-shared indexed host filesystem. It executes scalar VFPv2 in `gettimeofday`
-and opens a genuine SelfNCCH archive binding. Last probed it stopped at
-**50,629 blocks** on FS `ControlArchive`'s timestamp request; real timestamp
-semantics and the GSP/GPU display path now exist, so the next probe advances.
-**No first frame, audio or gameplay is claimed.**
+The supplied SuperTux CIA **reaches and executes `main`**, at `0x00167d88`
+after **50,569 native blocks**. It reads its RomFS through NX's shared indexed
+host filesystem. As of 2026-10-16 it also draws its title and loading screens
+with the software PICA pipeline and plays its title music through the HLE DSP.
+It is **not playable**: it has no input, only the top screen is shown, and the
+music gaps after each rendered frame (see the [parity roadmap](3DS.md#parity-roadmap-azahar)).
 There are no title-specific runtime hooks, patched instructions, interpreter,
 runtime target discovery or runtime compilation.
 
 ## Pinned input (not distributed)
 
 The supplied `d6nm2s3.zip` contains `Supertux.cia`, `Supertux/Supertux.3dsx`
-and `Supertux/Supertux.smdh`. This uses the CIA, not a new 3DSX loader.
+and `Supertux/Supertux.smdh`. It is nop90's SuperTux Milestone 1 port, release v0.1
+(`Supertux_M1_v0.1a.zip` at github.com/nop90/Supertux-Milestone1-3ds), byte for byte.
+This uses the CIA, not a new 3DSX loader.
 Keep binaries, extracted assets and derived native modules outside git.
 
 ```text
@@ -42,39 +43,51 @@ expanded page-packed code is 1,630,208 bytes.
 
 ## Reproduce
 
-Native 64-bit Linux, a supported Clang and an LLVM SDK are required.
-LLVM 19.1.7 was tested; use `SNX_LLVM_CONFIG` for a non-system SDK.
+A 64-bit Linux or Windows host, a supported Clang and an LLVM SDK are required.
+LLVM 19.1.7 and 23 were tested; use `SNX_LLVM_CONFIG` for a non-system SDK.
 
 ```sh
 cmake -S . -B build/ctr-aot \
   -DSNX_BUILD_NX=OFF -DSNX_BUILD_GNUABI=OFF -DSNX_BUILD_GUI=OFF \
-  -DSNX_3DS_AOT=ON -DSNX_TEST_ARM_AOT=ON \
+  -DSNX_TEST_ARM_AOT=ON \
   -DSNX_TEST_3DS_SUPERTUX=/absolute/path/to/Supertux.cia
 cmake --build build/ctr-aot -j4
 ctest --test-dir build/ctr-aot -R 3ds_supertux_bootstrap -V
 ```
 
-Choose a **new** output tree for a manual run:
+A manual run (a finished extraction and module in the output folder are used again):
 
 ```sh
 build/ctr-aot/scarletnx-3ds --output work/supertux-001 /path/to/Supertux.cia
 ```
 
-Expected host status is **3**, at unsupported archive timestamp control, not
-completed emulation. Coverage is **70,683 blocks / 554 objects**, statically compiled and
-linked before guest execution. The driver reports:
+A plain launch runs until the game exits or its window closes; `--max-blocks N`
+stops after N blocks with host status **3**, which `3ds_supertux_bootstrap` uses
+(100,000 blocks for the driver, 500,000 for its probe). Coverage is **73,783 blocks /
+578 objects**, statically compiled and linked before guest execution. Where a budgeted
+run stops depends on host-paced vblank and DSP time, so its pc and SVC count vary.
 
-```text
-unsupported guest operation or missing static entry: pc=0x001def50 exit=4 syndrome=0x00000032 blocks=50629 svcs=61 last_svc=0x32 ipc_service=2 ipc_header=0x080d0144 wait_service=
-```
+Baseline, 2026-10-17, Windows 11 (MSYS2 CLANG64, LLVM 23.1.3), `--max-blocks 300000000`,
+two runs on the same module:
+
+- The run takes **151 s** for 300 million blocks and about 97,000 SVCs. Compiling the
+  module first takes about 470 s more.
+- It shows the title screen, with its menu, from about 22 s. The eight PPM snapshots
+  are seven of the top screen and one of the bottom screen, which is black then.
+- Music starts at about 22 s. Over the following 97 s, `audio.wav` has 574 gaps of 5 ms
+  or more, 36.5 to 38.1 s of silence in all. The median gap is 54 ms and a gap comes
+  every 161 to 164 ms (median), one per rendered frame. That puts a rendered frame at
+  about 160 ms, roughly 6 frames per second, with the software renderer on the guest thread.
 
 The external test independently observes the CRT load of main's address from
 `0x10008c`, its `BX r3` at `0x100054`, entry at `0x167d88`, and CRT return
 address `0x1626c4`. It then executes main through the real FS request. This
 observation exists only in the test, not the runtime. Block counts are not cycles.
 
-Existing output is refused; there is no validated cache/resume. Native modules
-are trusted host code, not sandboxed or signature-authenticated by ABI/hash checks.
+A finished extraction and module are reused as the Switch driver reuses its own; the
+module's identity is checked against the image, but its cache key does not yet cover the
+compiler's version or configuration (parity roadmap F8). Native modules are trusted host
+code, not sandboxed or signature-authenticated by ABI/hash checks.
 
 ## Observed startup
 

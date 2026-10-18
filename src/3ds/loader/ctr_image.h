@@ -12,6 +12,7 @@ typedef struct {
     SnxCtrSegment segment[3]; /* text, read-only, data; file offsets are page-packed */
     uint32_t bss_size, stack_size;
     uint64_t title_id;
+    char name[8]; /* the codeset's name (ExHeader 0x0), not terminated when all eight are used */
     /* the ARM11 kernel capability descriptors (ExHeader 0x370): the address mappings live here */
     uint32_t kernel_caps[28];
     unsigned char identity[32]; /* SHA-256(domain || full ExHeader || expanded .code) */

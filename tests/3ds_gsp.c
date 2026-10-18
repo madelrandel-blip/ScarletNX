@@ -57,6 +57,34 @@ static void ppm_pixel(const unsigned char* ppm, size_t size, unsigned width, uns
     assert(at + 3 <= size);
     memcpy(out, ppm + at, 3);
 }
+/* one pixel of a saved top-screen snapshot, frame-0-<index>.ppm */
+static void frame_pixel(const char* dir, unsigned index, unsigned x, unsigned y, unsigned char out[3]) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/frame-0-%02u.ppm", dir, index);
+    FILE* f = fopen(path, "rb");
+    assert(f);
+    fseek(f, 0, SEEK_END);
+    long length = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char* ppm = malloc((size_t)length);
+    assert(ppm && length > 0 && fread(ppm, 1, (size_t)length, f) == (size_t)length);
+    fclose(f);
+    ppm_pixel(ppm, (size_t)length, 240, 400, x, y, out);
+    free(ppm);
+}
+/* a whole RGBA8 (A, B, G, R) top framebuffer of one colour */
+static void fill_rgba8(SnxCtrProcess* p, uint32_t address, unsigned char r, unsigned char g, unsigned char b) {
+    unsigned char* pixels = malloc(240u * 400 * 4);
+    assert(pixels);
+    for (unsigned i = 0; i < 240u * 400; ++i) {
+        pixels[i * 4 + 0] = 255;
+        pixels[i * 4 + 1] = b;
+        pixels[i * 4 + 2] = g;
+        pixels[i * 4 + 3] = r;
+    }
+    assert(snx_ctr_write_ram(p->space, address, pixels, 240u * 400 * 4) == SNX_CTR_MEM_OK);
+    free(pixels);
+}
 int main(int argc, char** argv) {
     assert(argc == 2);
 
@@ -356,6 +384,32 @@ int main(int argc, char** argv) {
             ppm_pixel(ppm, (size_t)length, 240, 400, 100, 100, rgb);
             assert(rgb[0] == 0x21 && rgb[1] == 0x43 && rgb[2] == 0x65);
             free(ppm);
+            /* The LCD shows the left eye of the register pair shown_fb selects, whatever pair a swap writes:
+               active_fb 1 writes pair 2 (left fb2, right fb, 3D off) and shows it; a later swap into pair 1 with
+               shown_fb still 1 changes nothing on screen (Azahar video_core/gpu.cpp, LoadFBToScreenInfo). */
+            uint32_t fb2 = 0;
+            assert(!snx_ctr_kernel_memory(p, 0x10003, 0, 0, 0x60000, 3, &fb2) && fb2);
+            fill_rgba8(p, fb, 0x10, 0x20, 0x30);
+            fill_rgba8(p, fb2, 0x40, 0x50, 0x60);
+            uint32_t pair2[] = {0x00050200, 0, 1, fb2, fb, 960, 0, 1, 0};
+            request(p, gsp, pair2, 9, SNX_CTR_SVC_RETURN, 0);
+            assert(!get(p, 1));
+            snx_ctr_gsp_vblank(p);
+            frame_pixel(argv[1], 2, 200, 120, rgb);
+            assert(rgb[0] == 0x40 && rgb[1] == 0x50 && rgb[2] == 0x60);
+            uint32_t pair1[] = {0x00050200, 0, 0, fb, fb, 960, 0, 1, 0};
+            request(p, gsp, pair1, 9, SNX_CTR_SVC_RETURN, 0);
+            assert(!get(p, 1));
+            snx_ctr_gsp_vblank(p);
+            frame_pixel(argv[1], 3, 200, 120, rgb);
+            assert(rgb[0] == 0x40 && rgb[1] == 0x50 && rgb[2] == 0x60);
+            /* RGB5A1 and RGBA4 framebuffers are accepted, and an invalid screen is ignored with success */
+            uint32_t rgba4_swap[] = {0x00050200, 0, 0, fb, fb, 480, 4, 0, 0};
+            request(p, gsp, rgba4_swap, 9, SNX_CTR_SVC_RETURN, 0);
+            assert(!get(p, 1));
+            uint32_t bad_screen[] = {0x00050200, 2, 0, fb, fb, 960, 0, 0, 0};
+            request(p, gsp, bad_screen, 9, SNX_CTR_SVC_RETURN, 0);
+            assert(!get(p, 1));
             /* Presenter contract: RGB565 converts to RGBA8 on the device and
                the hash covers exactly the converted pixels. */
             unsigned short low[2] = {0xffffu, 0xf800u};

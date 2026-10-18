@@ -39,6 +39,7 @@ bool snx_ctr_image_load(const char* directory, SnxCtrImage* image, char* error, 
     image->stack_size = le32(ex + 0x1c);
     image->bss_size = le32(ex + 0x3c);
     image->title_id = (uint64_t)le32(ex + 0x200) | (uint64_t)le32(ex + 0x204) << 32;
+    memcpy(image->name, ex, sizeof image->name);
     for (unsigned i = 0; i < 28; ++i) image->kernel_caps[i] = le32(ex + 0x370 + i * 4);
     const unsigned offsets[] = {0x10, 0x20, 0x30};
     uint64_t sizes[3], total = 0;

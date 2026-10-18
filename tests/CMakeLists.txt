@@ -151,33 +151,35 @@ if(TARGET snx_ctr_board)
         target_link_libraries(snx-test-3ds-blz PRIVATE snx_ctr_loader)
     add_test(NAME 3ds_blz COMMAND snx-test-3ds-blz)
 
+    # The GPU, presentation and DSP tests need neither Python nor POSIX, and Windows is a 3DS target too
+    add_executable(snx-test-3ds-gsp 3ds_gsp.c)
+    snx_test_target(snx-test-3ds-gsp 11)
+    target_link_libraries(snx-test-3ds-gsp PRIVATE snx_ctr_process)
+    add_test(NAME 3ds_gsp_gpu COMMAND snx-test-3ds-gsp "${CMAKE_CURRENT_BINARY_DIR}/gsp-frames")
+    # No Vulkan loader/ICD: presentation cannot run here; the probe skips, never fakes a frame.
+    set_tests_properties(3ds_gsp_gpu PROPERTIES SKIP_RETURN_CODE 77)
+    # the transfer engine alone: fills, display transfers, texture copies against hand-written goldens
+    add_executable(snx-test-3ds-transfer 3ds_transfer.c)
+    snx_test_target(snx-test-3ds-transfer 11)
+    target_link_libraries(snx-test-3ds-transfer PRIVATE snx_ctr_gpu)
+    add_test(NAME 3ds_transfer COMMAND snx-test-3ds-transfer)
+    # the PICA command processor: lists in FCRAM, uploads, interrupts, jumps, draw and immediate hooks
+    add_executable(snx-test-3ds-pica 3ds_pica.c)
+    snx_test_target(snx-test-3ds-pica 11)
+    target_link_libraries(snx-test-3ds-pica PRIVATE snx_ctr_gpu m)
+    add_test(NAME 3ds_pica COMMAND snx-test-3ds-pica)
+    # the HLE DSP and dsp::DSP: pipes, regions, sources, mixing, decoding, the service as ndsp drives it
+    add_executable(snx-test-3ds-dsp 3ds_dsp.c)
+    snx_test_target(snx-test-3ds-dsp 11)
+    target_link_libraries(snx-test-3ds-dsp PRIVATE snx_ctr_process)
+    add_test(NAME 3ds_dsp COMMAND snx-test-3ds-dsp)
+
     if(NOT WIN32)
         if(Python3_Interpreter_FOUND)
             add_executable(snx-test-3ds-fs 3ds_fs.c)
             snx_test_target(snx-test-3ds-fs 11)
             target_link_libraries(snx-test-3ds-fs PRIVATE snx_ctr_process)
             add_test(NAME 3ds_filesystem COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_fs.py" $<TARGET_FILE:snx-test-3ds-fs>)
-            add_executable(snx-test-3ds-gsp 3ds_gsp.c)
-            snx_test_target(snx-test-3ds-gsp 11)
-            target_link_libraries(snx-test-3ds-gsp PRIVATE snx_ctr_process)
-            add_test(NAME 3ds_gsp_gpu COMMAND snx-test-3ds-gsp "${CMAKE_CURRENT_BINARY_DIR}/gsp-frames")
-            # the transfer engine alone: fills, display transfers, texture copies against hand-written goldens
-            add_executable(snx-test-3ds-transfer 3ds_transfer.c)
-            snx_test_target(snx-test-3ds-transfer 11)
-            target_link_libraries(snx-test-3ds-transfer PRIVATE snx_ctr_gpu)
-            add_test(NAME 3ds_transfer COMMAND snx-test-3ds-transfer)
-            # the PICA command processor: lists in FCRAM, uploads, interrupts, jumps, draw and immediate hooks
-            add_executable(snx-test-3ds-pica 3ds_pica.c)
-            snx_test_target(snx-test-3ds-pica 11)
-            target_link_libraries(snx-test-3ds-pica PRIVATE snx_ctr_gpu m)
-            add_test(NAME 3ds_pica COMMAND snx-test-3ds-pica)
-            # the HLE DSP and dsp::DSP: pipes, regions, sources, mixing, decoding, the service as ndsp drives it
-            add_executable(snx-test-3ds-dsp 3ds_dsp.c)
-            snx_test_target(snx-test-3ds-dsp 11)
-            target_link_libraries(snx-test-3ds-dsp PRIVATE snx_ctr_process)
-            add_test(NAME 3ds_dsp COMMAND snx-test-3ds-dsp)
-    # No Vulkan loader/ICD: presentation cannot run here; the probe skips, never fakes a frame.
-    set_tests_properties(3ds_gsp_gpu PROPERTIES SKIP_RETURN_CODE 77)
             add_test(NAME ctr_swipc_validation COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/ctr_swipc.py"
                 $<TARGET_FILE:snx-swipc>)
             add_test(NAME 3ds_driver COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_driver.py"
@@ -191,21 +193,21 @@ if(TARGET snx_ctr_board)
                     $<TARGET_FILE:scarletnx-3ds> $<TARGET_FILE:snx-test-3ds-native>)
                 set_tests_properties(3ds_static_pipeline PROPERTIES TIMEOUT 180)
             endif()
-            if(SNX_TEST_3DS_SUPERTUX)
-                get_filename_component(snx_supertux_cia "${SNX_TEST_3DS_SUPERTUX}" ABSOLUTE)
-                set(snx_supertux_oracle_args "")
-                if(SNX_TEST_ARM_DIFF)
-                    set(snx_supertux_oracle_args --oracle)
-                endif()
-                add_test(NAME 3ds_supertux_bootstrap COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_supertux.py"
-                    $<TARGET_FILE:scarletnx-3ds> "${snx_supertux_cia}" $<TARGET_FILE:snx-test-3ds-native> ${snx_supertux_oracle_args})
-                set_tests_properties(3ds_supertux_bootstrap PROPERTIES TIMEOUT 1800 LABELS "external;bootstrap")
-            endif()
-            
             add_test(NAME 3ds_extract COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_extract.py"
                 $<TARGET_FILE:scarletnx-3ds> ${snx_ctr_extract_test_args})
             set_tests_properties(3ds_extract PROPERTIES TIMEOUT 120)
         endif()
+    endif()
+    # The pinned SuperTux gate runs on Windows too (checked there 2026-10-17); the other Python tests are not yet
+    if(SNX_TEST_3DS_SUPERTUX AND Python3_Interpreter_FOUND AND TARGET snx-test-3ds-native)
+        get_filename_component(snx_supertux_cia "${SNX_TEST_3DS_SUPERTUX}" ABSOLUTE)
+        set(snx_supertux_oracle_args "")
+        if(SNX_TEST_ARM_DIFF)
+            set(snx_supertux_oracle_args --oracle)
+        endif()
+        add_test(NAME 3ds_supertux_bootstrap COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/3ds_supertux.py"
+            $<TARGET_FILE:scarletnx-3ds> "${snx_supertux_cia}" $<TARGET_FILE:snx-test-3ds-native> ${snx_supertux_oracle_args})
+        set_tests_properties(3ds_supertux_bootstrap PROPERTIES TIMEOUT 1800 LABELS "external;bootstrap")
     endif()
 endif()
 

@@ -13,6 +13,7 @@
 #include "3ds/services/gsp.h"
 #include "3ds/services/dsp.h"
 #include "3ds/services/cfg.h"
+#include <stdio.h>
 #include <string.h>
 
 static uint32_t load32(const unsigned char* b) {
@@ -93,79 +94,65 @@ uint32_t snx_ctr_named_connect(SnxCtrProcess* p, uint32_t address, uint32_t* out
     }
     return 0xe0e0181eu;
 }
-enum { WIRE_OK, WIRE_BAD, WIRE_UNSUPPORTED };
+enum { WIRE_OK, WIRE_BAD, WIRE_ADDRESS };
+/* The request's translation descriptors, any well-formed one (Azahar kernel/hle_ipc.cpp, ipc.h): handles copied or
+   moved (up to SNX_CTR_IPC_HANDLES, captured for the handler), the caller's PID, static and PXI buffers the service
+   reads, and mapped buffers it reads, writes or both. Every buffer is checked against the caller's memory for the
+   access it grants before any handler runs. Handlers still check the exact form each command takes. */
 static unsigned translation(SnxCtrIpc* c, uint32_t normal, uint32_t translated) {
     uint32_t position = 1 + normal, end = position + translated;
-    bool unsupported = false;
     while (position < end) {
-        uint32_t d = c->in[position++], payload;
+        uint32_t d = c->in[position++], payload = 1, size = 0;
+        unsigned access = 0;
         /* Buffer forms must be classified before copy/move handle forms. */
         if (d & 8) {
             if ((d & 15) != 10 && (d & 15) != 12 && (d & 15) != 14) return WIRE_BAD;
-            payload = 1;
-            /* Only the checked mapped buffers below are supported: FSFILE
-               Read's writable result buffer and ControlArchive GET_TIMESTAMP's
-               path input and datetime output. Handlers validate exact sizes. */
-            uint32_t mapped_service = c->process->objects[c->object].type == CTR_OBJ_SESSION
-                                          ? c->process->objects[c->object].data.session.service
-                                          : SNX_CTR_SERVICE_FILE;
-            bool mapped_supported =
-                (mapped_service == SNX_CTR_SERVICE_FILE && c->in[0] == 0x080200c2 && (d & 15) == 12) ||
-                (mapped_service == SNX_CTR_SERVICE_FILE && c->in[0] == 0x08030102 && (d & 15) == 10) ||
-                (mapped_service == SNX_CTR_SERVICE_FS && c->in[0] == 0x080d0144 &&
-                 ((d & 15) == 10 || (d & 15) == 12)) ||
-                (mapped_service == SNX_CTR_SERVICE_DSP && c->in[0] == 0x001100c2 && (d & 15) == 10) ||
-                (mapped_service == SNX_CTR_SERVICE_CFG && c->in[0] == 0x00010082 && (d & 15) == 12);
-            unsupported = unsupported || !mapped_supported;
-        } else if ((d & 1023) == 2 || (d & 15) == 4 || (d & 15) == 6) {
-            payload = 1;
-            /* Only the explicitly checked APT utility / narrow FS commands
-               accept incoming static buffers. Handlers preflight ID, length
-               and whole RAM ranges. Other static/PXI/mapped transfers stop. */
-            uint32_t service = c->process->objects[c->object].type == CTR_OBJ_SESSION
-                                   ? c->process->objects[c->object].data.session.service
-                                   : SNX_CTR_SERVICE_FILE;
-            bool supported = (service == SNX_CTR_SERVICE_APT && c->in[0] == 0x004b00c2 && (d & 0x3fff) == 0x402) ||
-                             (service == SNX_CTR_SERVICE_FS && c->in[0] == 0x080c00c2 && d == 0x4002) ||
-                             (service == SNX_CTR_SERVICE_FS && c->in[0] == 0x080201c2 &&
-                              ((d & 0x3fff) == 2 || (d & 0x3fff) == 0x802)) ||
-                             (service == SNX_CTR_SERVICE_FS &&
-                              (c->in[0] == 0x08040142 || c->in[0] == 0x08050244 || c->in[0] == 0x08060142 ||
-                               c->in[0] == 0x08080202 || c->in[0] == 0x08090182 || c->in[0] == 0x080a0244 ||
-                               c->in[0] == 0x080b0102) &&
-                              ((d & 0x3fff) == 2 || (d & 0x3fff) == 0x802)) ||
-                             (service == SNX_CTR_SERVICE_GSP && (c->in[0] == 0x00010082 || c->in[0] == 0x00020084)) ||
-                             (service == SNX_CTR_SERVICE_DSP && c->in[0] == 0x000d0082 && (d & 0x3fff) == 0x402) ||
-                             (service == SNX_CTR_SERVICE_FS && c->in[0] == 0x08030204 &&
-                              ((d & 0x3fff) == 2 || (d & 0x3fff) == 0x802));
-            unsupported = unsupported || !supported;
+            size = d >> 4; /* mapped: 10 the service reads, 12 writes, 14 both */
+            access = (d & 2 ? SNX_CTR_READ : 0) | (d & 4 ? SNX_CTR_WRITE : 0);
+        } else if ((d & 15) == 2) {
+            size = d >> 14; /* static buffer, id in bits 10..13 */
+            access = SNX_CTR_READ;
+        } else if ((d & 15) == 4 || (d & 15) == 6) {
+            size = d >> 8; /* PXI buffer: 4 read-only, 6 read-write */
+            access = (d & 15) == 6 ? SNX_CTR_READ | SNX_CTR_WRITE : SNX_CTR_READ;
         } else if (d == 0x20) {
-            payload = 1;
-        } else if (!(d & 0x03ffffffu) || (d & 0x03ffffffu) == 0x10) {
+            /* the calling process's ID, written by the kernel */
+        } else if (!(d & 0x03ffffefu)) { /* copied (0x00) or moved (0x10) handles, count - 1 in bits 26..31 */
             payload = (d >> 26) + 1;
-            /* Incoming handles: only the checked GSP forms (one shared-handle
-               descriptor) are captured. The handler resolves and type-checks
-               every word; other services stop. */
-            uint32_t service = c->process->objects[c->object].type == CTR_OBJ_SESSION
-                                   ? c->process->objects[c->object].data.session.service
-                                   : SNX_CTR_SERVICE_FILE;
-            bool supported = !(d & 0x03ffffffu) && payload == 1 &&
-                             ((service == SNX_CTR_SERVICE_GSP &&
-                               (c->in[0] == 0x00130042 || c->in[0] == 0x00150042 || c->in[0] == 0x00160042 ||
-                                c->in[0] == 0x00080082 || c->in[0] == 0x00090082)) ||
-                              (service == SNX_CTR_SERVICE_DSP &&
-                               (c->in[0] == 0x00130082 || c->in[0] == 0x00140082 || c->in[0] == 0x00150082)));
-            if (supported && c->in[position] && !c->handle_in[0])
-                c->handle_in[0] = c->in[position];
-            else if (supported && c->in[position])
-                supported = false;
-            unsupported = unsupported || !supported;
+            if (payload > end - position || c->handle_count + payload > SNX_CTR_IPC_HANDLES) return WIRE_BAD;
+            for (uint32_t i = 0; i < payload; ++i) {
+                if (d & 0x10) c->handle_moved |= 1u << c->handle_count;
+                c->handle_in[c->handle_count++] = c->in[position + i];
+            }
         } else
             return WIRE_BAD;
         if (payload > end - position) return WIRE_BAD;
+        if (size && snx_ctr_check_ram(c->process->space, c->in[position], size, access) != SNX_CTR_MEM_OK)
+            return WIRE_ADDRESS;
         position += payload;
     }
-    return unsupported ? WIRE_UNSUPPORTED : WIRE_OK;
+    return WIRE_OK;
+}
+static const char* const families[] = {"", "srv", "fs", "apt", "ptm", "hid", "fs", "gsp", "cfg", "dsp"};
+int snx_ctr_ipc_stub_mask(const char* list, uint32_t* mask) {
+    *mask = 0;
+    if (!list) return 1;
+    if (!strcmp(list, "all")) {
+        *mask = UINT32_MAX;
+        return 1;
+    }
+    while (*list) {
+        size_t length = strcspn(list, ",");
+        bool known = false;
+        for (unsigned i = 1; i < sizeof families / sizeof *families; ++i)
+            if (strlen(families[i]) == length && !strncmp(families[i], list, length)) {
+                *mask |= 1u << i;
+                known = true;
+            }
+        if (!known) return 0;
+        list += length + (list[length] == ',');
+    }
+    return 1;
 }
 SnxCtrSvcResult snx_ctr_ipc_send(SnxCtrProcess* p, uint32_t handle, uint32_t* result) {
     *result = 0;
@@ -198,9 +185,8 @@ SnxCtrSvcResult snx_ctr_ipc_send(SnxCtrProcess* p, uint32_t handle, uint32_t* re
         return SNX_CTR_SVC_RETURN;
     }
     unsigned wire = translation(&c, normal, translated);
-    if (wire == WIRE_UNSUPPORTED) return SNX_CTR_SVC_UNSUPPORTED;
-    if (wire == WIRE_BAD) {
-        *result = SNX_CTR_IPC_BAD_DESCRIPTOR;
+    if (wire != WIRE_OK) {
+        *result = wire == WIRE_BAD ? SNX_CTR_IPC_BAD_DESCRIPTOR : 0xe0e01bf5u; /* ResultInvalidAddress */
         return SNX_CTR_SVC_RETURN;
     }
     switch (p->last_ipc_service) {
@@ -215,6 +201,20 @@ SnxCtrSvcResult snx_ctr_ipc_send(SnxCtrProcess* p, uint32_t handle, uint32_t* re
         case SNX_CTR_SERVICE_CFG: snx_ctr_cfg_dispatch(&c); break;
         default: return SNX_CTR_SVC_UNSUPPORTED;
     }
+    if (c.state == SNX_CTR_IPC_UNKNOWN) {
+        const char* family =
+            p->last_ipc_service < sizeof families / sizeof *families ? families[p->last_ipc_service] : "?";
+        if (!(p->ipc_stubs & (1u << p->last_ipc_service))) {
+            fprintf(stderr, "3ds ipc: %s has no command 0x%04x (header 0x%08x); --ipc-stubs=%s answers it\n", family,
+                    c.in[0] >> 16, c.in[0], family);
+            return SNX_CTR_SVC_UNSUPPORTED;
+        }
+        /* Azahar's ReportUnimplementedFunction: one normal word, success */
+        fprintf(stderr, "3ds ipc: stub answered %s command 0x%04x (header 0x%08x)\n", family, c.in[0] >> 16, c.in[0]);
+        memset(c.out, 0, sizeof c.out);
+        c.out[0] = (c.in[0] & 0xffff0000u) | 0x40;
+        c.state = SNX_CTR_IPC_RETURN;
+    }
     if (c.state == SNX_CTR_IPC_UNSUPPORTED) return SNX_CTR_SVC_UNSUPPORTED;
     if (c.state == SNX_CTR_IPC_BLOCKED) return SNX_CTR_SVC_BLOCKED;
     if (c.state == SNX_CTR_IPC_FAULT) return SNX_CTR_SVC_UNSUPPORTED;
@@ -222,5 +222,8 @@ SnxCtrSvcResult snx_ctr_ipc_send(SnxCtrProcess* p, uint32_t handle, uint32_t* re
     if (*result) return SNX_CTR_SVC_RETURN;
     for (unsigned i = 0; i < SNX_CTR_IPC_WORDS; ++i) store32(bytes + i * 4, c.out[i]);
     if (snx_ctr_write_ram(p->space, address, bytes, sizeof bytes) != SNX_CTR_MEM_OK) return SNX_CTR_SVC_UNSUPPORTED;
+    /* the handles the request moved leave the caller's table now that it is answered */
+    for (uint32_t i = 0; i < c.handle_count; ++i)
+        if ((c.handle_moved >> i & 1) && c.handle_in[i]) (void)snx_ctr_handle_close(p, c.handle_in[i]);
     return SNX_CTR_SVC_RETURN;
 }

@@ -156,7 +156,7 @@ static void ctr_inc(int fi, const char* out) {
         emit("void %s_dispatch(SnxCtrIpc* c) {\n    switch (c->in[0] >> 16) {\n", name);
         for (j = f->cmd0; j < f->cmd0 + f->ncmds; ++j)
             emit("        case %lu: %s__%lu(c); return;\n", cmds[j].id, name, cmds[j].id);
-        emit("        default: c->state = SNX_CTR_IPC_UNSUPPORTED; return;\n    }\n}\n");
+        emit("        default: c->state = SNX_CTR_IPC_UNKNOWN; return;\n    }\n}\n");
     }
     sprintf(path, "%s/%s.inc", out, files[fi].path);
     flush(path);

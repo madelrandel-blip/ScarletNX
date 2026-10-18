@@ -23,10 +23,13 @@
 #define INVALID_SIZE        0xe0e01bfdu
 #define INVALID_PERMISSION  0xe0e01beeu
 #define INVALID_COMBINATION 0xe0e01beeu
-#define INVALID_ENUM        0xd8e093edu
+#define INVALID_ENUM        0xd8e093edu /* ResultInvalidEnumValueFnd */
+#define INVALID_ENUM_KERNEL 0xd8e007edu /* ResultInvalidEnumValue */
 #define INVALID_STATE       0xe0a01bf5u
 #define NOT_IMPLEMENTED     0xe0e01bf4u
-#define TIMED_OUT           0x09401bfeu
+#define OUT_OF_RANGE        0xd8e007fdu
+#define TIMED_OUT           CTR_TIMED_OUT
+#define DONT_CARE           0x10000000u /* MemoryPermission::DontCare */
 
 uint32_t snx_ctr_handle_object(SnxCtrProcess* p, uint32_t handle) {
     if (handle == CTR_PROCESS_HANDLE) return 1;
@@ -108,24 +111,169 @@ static void query_class(SnxCtrProcess* p, uint32_t page, uint32_t* state, uint32
     }
     *state = pa >= CTR_PHYS_BASE ? (perms & 4 ? 4u : perms & 2 ? 5u : 3u) : 2u;
 }
-/* Heap/linear commit, free and protect. MAP/UNMAP aliases are deliberately not
-   implemented; no mappings, ownership or accounting change on rejected calls. */
+/* the application's memory in use: every page of its pool it owns (code, stack, TLS, heap, linear heap) */
+static uint64_t memory_used(SnxCtrProcess* p) {
+    uint64_t used = 0;
+    for (uint32_t i = 0; i < p->app_limit / 4096; ++i)
+        if (p->physical_owner[i]) used += 4096;
+    return used;
+}
+static uint32_t live_objects(SnxCtrProcess* p, uint32_t type) {
+    uint32_t count = 0;
+    for (uint32_t i = 1; i < CTR_OBJECTS; ++i)
+        count += p->objects[i].type == type && (type != CTR_OBJ_THREAD || !p->objects[i].data.thread.dead);
+    return count;
+}
+/* The APPLICATION resource limit (Azahar kernel/resource_limit.cpp), in ResourceLimitType order: priority, commit,
+   thread, event, mutex, semaphore, timer, shared memory, address arbiter, CPU time. The CPU time limit is 0: no
+   share of the syscore has been granted (APT's SetApplicationCpuTimeLimit is not modelled). */
+static uint32_t limit_value(SnxCtrProcess* p, uint32_t name, uint64_t* value) {
+    static const uint32_t limits[10] = {CTR_PRIORITY_LIMIT, 0, 0x20, 0x20, 0x20, 0x8, 0x8, 0x10, 0x2, 0};
+    *value = name == 1 ? p->app_limit : limits[name];
+    return OK;
+}
+static uint32_t current_value(SnxCtrProcess* p, uint32_t name, uint64_t* value) {
+    static const uint32_t types[10] = {0,
+                                       0,
+                                       CTR_OBJ_THREAD,
+                                       CTR_OBJ_EVENT,
+                                       CTR_OBJ_MUTEX,
+                                       CTR_OBJ_SEMAPHORE,
+                                       CTR_OBJ_TIMER,
+                                       CTR_OBJ_SHARED,
+                                       CTR_OBJ_ARBITER,
+                                       0};
+    *value = name == 1 ? memory_used(p) : name < 10 && types[name] ? live_objects(p, types[name]) : 0;
+    return OK;
+}
+static bool overlaps(uint32_t a, uint32_t a_size, uint32_t b, uint32_t b_size) {
+    return (uint64_t)a < (uint64_t)b + b_size && (uint64_t)b < (uint64_t)a + a_size;
+}
+/* A range ControlMemory may not free or reprotect: part of a MAP pair, or the owner's range of a memory block */
+static bool held(SnxCtrProcess* p, uint32_t va, uint32_t size) {
+    for (unsigned i = 0; i < sizeof p->aliases / sizeof *p->aliases; ++i)
+        if (p->aliases[i].size && (overlaps(va, size, p->aliases[i].target, p->aliases[i].size) ||
+                                   overlaps(va, size, p->aliases[i].source, p->aliases[i].size)))
+            return true;
+    for (uint32_t i = 1; i < CTR_OBJECTS; ++i) {
+        const CtrObject* o = &p->objects[i];
+        if (o->type == CTR_OBJ_SHARED && o->data.shared.address &&
+            overlaps(va, size, o->data.shared.address, o->data.shared.size))
+            return true;
+    }
+    return false;
+}
+/* Private heap pages, read-write and held by nothing else: what MAP's source and a memory block's owner range must be
+   (Azahar's MemoryState::Private with VMAPermission::ReadWrite) */
+static bool private_heap(SnxCtrProcess* p, uint32_t va, uint32_t size) {
+    if (va < CTR_HEAP || (uint64_t)va + size > CTR_HEAP_END || held(p, va, size)) return false;
+    for (uint32_t off = 0; off < size; off += 4096) {
+        uint32_t pa;
+        unsigned permissions;
+        if (snx_ctr_query(p->space, va + off, &pa, &permissions) != SNX_CTR_MEM_OK || pa < CTR_PHYS_BASE ||
+            pa >= p->physical_end || p->physical_owner[(pa - CTR_PHYS_BASE) / 4096] != CTR_HEAP_PAGE ||
+            (permissions & 3) != 3)
+            return false;
+    }
+    return true;
+}
+/* Map size bytes at va onto the physical pages behind source in this process, page runs at a time; nothing stays
+   mapped on failure */
+static bool mirror(SnxCtrProcess* p, uint32_t va, uint32_t source, uint32_t size, unsigned permissions) {
+    for (uint32_t off = 0; off < size;) {
+        uint32_t pa, next;
+        if (snx_ctr_query(p->space, source + off, &pa, NULL) != SNX_CTR_MEM_OK) break;
+        uint32_t run = 4096;
+        while (off + run < size && snx_ctr_query(p->space, source + off + run, &next, NULL) == SNX_CTR_MEM_OK &&
+               next == pa + run)
+            run += 4096;
+        if (snx_ctr_map(p->space, va + off, pa, run, permissions) != SNX_CTR_MEM_OK) break;
+        off += run;
+        if (off == size) return true;
+    }
+    for (uint32_t off = 0; off < size; off += 4096) (void)snx_ctr_unmap(p->space, va + off, 4096);
+    return false;
+}
+/* ControlMemory MAP and UNMAP (Azahar Process::Map and Unmap, non-privileged): target mirrors heap pages at source
+   with the given permissions; the source stays mapped, and neither can be freed or reprotected until the UNMAP of
+   the same pair (Azahar does not check the pair; a mismatched UNMAP is refused here rather than unmapping memory
+   no MAP made). */
+static uint32_t alias(SnxCtrProcess* p, bool map, uint32_t target, uint32_t source, uint32_t size,
+                      uint32_t permissions) {
+    if (source < CTR_HEAP || (uint64_t)source + size > CTR_HEAP_END) return INVALID_ADDRESS;
+    if (source - target < size || target - source < size) return INVALID_STATE;
+    unsigned slot = sizeof p->aliases / sizeof *p->aliases;
+    for (unsigned i = 0; i < sizeof p->aliases / sizeof *p->aliases; ++i) {
+        bool same = p->aliases[i].target == target && p->aliases[i].source == source && p->aliases[i].size == size;
+        if (map ? !p->aliases[i].size : same && size) {
+            slot = i;
+            break;
+        }
+    }
+    if (map) {
+        if ((uint64_t)target + size > 0x20000000u || !available(p, target, size) || !private_heap(p, source, size))
+            return INVALID_STATE;
+        if (slot == sizeof p->aliases / sizeof *p->aliases) return OUT_OF_MEMORY;
+        if (!mirror(p, target, source, size, permissions)) return OUT_OF_MEMORY;
+        p->aliases[slot].target = target;
+        p->aliases[slot].source = source;
+        p->aliases[slot].size = size;
+        return OK;
+    }
+    if (slot == sizeof p->aliases / sizeof *p->aliases) return INVALID_STATE;
+    if (snx_ctr_unmap(p->space, target, size) != SNX_CTR_MEM_OK) return INVALID_STATE;
+    p->aliases[slot].size = 0;
+    (void)snx_ctr_protect(p->space, source, size, permissions); /* the source is private again, with these rights */
+    return OK;
+}
+/* MapMemoryBlock of a block the application made itself (Azahar SharedMemory::Map with the owner as target): the
+   rights asked (r2) within the block's own, another process's (r3) given as don't-care exactly for a new block;
+   address 0 maps a new block where the linear heap shows its memory. A heap-backed block mirrors its owner's
+   pages. */
+static uint32_t map_own_block(SnxCtrProcess* p, uint32_t id, uint32_t address, uint32_t asked, uint32_t other) {
+    CtrObject* o = &p->objects[id];
+    uint32_t size = o->data.shared.size, own = o->data.shared.permissions == DONT_CARE ? 3 : o->data.shared.permissions;
+    if (asked == DONT_CARE) asked = own;
+    if (asked > 7 || (asked & ~own & 3) || (other == DONT_CARE) != !o->data.shared.address) return INVALID_COMBINATION;
+    if (!address && !o->data.shared.address) address = CTR_LINEAR + (o->data.shared.physical - CTR_PHYS_BASE);
+    if ((address & 4095) || address < CTR_HEAP || (uint64_t)address + size > 0x1f800000u) return INVALID_ADDRESS;
+    if (!available(p, address, size)) return INVALID_STATE;
+    unsigned slot = 8;
+    for (unsigned i = 0; i < 8 && slot == 8; ++i)
+        if (!p->shared_maps[i].object) slot = i;
+    if (slot == 8) return OUT_OF_MEMORY;
+    unsigned rights = asked & 3;
+    bool mapped = o->data.shared.address
+                      ? mirror(p, address, o->data.shared.address, size, rights)
+                      : snx_ctr_map(p->space, address, o->data.shared.physical, size, rights) == SNX_CTR_MEM_OK;
+    if (!mapped) return OUT_OF_MEMORY;
+    p->shared_maps[slot] = (CtrSharedMap){address, size, id};
+    return OK;
+}
+/* Heap/linear commit, free and protect, and MAP/UNMAP aliases; no mappings, ownership or accounting change on
+   rejected calls. */
 uint32_t snx_ctr_kernel_memory(SnxCtrProcess* p, uint32_t op, uint32_t va, uint32_t source, uint32_t size,
                                uint32_t permissions, uint32_t* output) {
     *output = 0;
     if ((va | source) & 4095) return MISALIGNED_ADDRESS;
     if (size & 4095) return MISALIGNED_SIZE;
     if (permissions & ~3u) return INVALID_PERMISSION;
+    op &= ~0xf00u; /* the region bits: Azahar ignores them, every allocation is the application's */
     if (op & ~(0x10000u | 0xffu)) return INVALID_COMBINATION;
     bool linear = !!(op & 0x10000);
     op &= 0xff;
     if (linear && op != 3) return INVALID_COMBINATION;
-    if (op == 4 || op == 5) return NOT_IMPLEMENTED;
-    if (op != 1 && op != 3 && op != 6) return INVALID_COMBINATION;
+    if (op != 1 && op != 3 && op != 4 && op != 5 && op != 6) return INVALID_COMBINATION;
     if (!size) {
         *output = va;
         return OK;
     }
+    if (op == 4 || op == 5) { /* MAP and UNMAP write no address out */
+        uint32_t result = alias(p, op == 4, va, source, size, permissions);
+        if (!result) p->cpu.state.cpu.exclusive_valid = 0;
+        return result;
+    }
+    if ((op == 1 || op == 6) && held(p, va, size)) return INVALID_STATE;
     uint32_t base = linear ? CTR_LINEAR : CTR_HEAP;
     uint32_t end = linear ? CTR_LINEAR + p->app_limit : CTR_HEAP_END;
     if (op != 3) {
@@ -266,6 +414,7 @@ static SnxCtrSvcResult arbitrate(SnxCtrProcess* p, SnxArmCPU* cpu) {
             if (!best) break;
             CtrThread* t = &p->objects[best].data.thread;
             t->waiting_object = t->waiting_address = 0;
+            t->wake_ns = 0; /* a timed wait signaled before its deadline */
             t->context.r[0] = t->context.exit = t->context.syndrome = 0;
             snx_ctr_object_release(p, id);
             --remaining;
@@ -284,9 +433,6 @@ static SnxCtrSvcResult arbitrate(SnxCtrProcess* p, SnxArmCPU* cpu) {
         r[0] = type >= 3 ? TIMED_OUT : OK;
         return SNX_CTR_SVC_RETURN;
     }
-    /* Finite nonzero deadlines need an actual timer. Refuse before the
-       decrement or wait publication, rather than turn them into infinity. */
-    if (type >= 3 && (r[4] || r[5]) && (r[4] != UINT32_MAX || r[5] != UINT32_MAX)) return SNX_CTR_SVC_UNSUPPORTED;
     if (type == 2 || type == 4) {
         result = write32(p, va, value - 1);
         if (result) {
@@ -299,6 +445,9 @@ static SnxCtrSvcResult arbitrate(SnxCtrProcess* p, SnxArmCPU* cpu) {
         return SNX_CTR_SVC_RETURN;
     }
     snx_ctr_thread_block(p, id, va);
+    /* the timed variants wake at their deadline with Timeout (nanoseconds: r4 low, r5 high), as Azahar's
+       AddressArbiter's timeout callback does */
+    if (type >= 3) snx_ctr_thread_deadline(p, r[4], r[5]);
     return SNX_CTR_SVC_BLOCKED;
 }
 static SnxCtrSvcResult wait_one(SnxCtrProcess* p, uint32_t* r) {
@@ -309,7 +458,12 @@ static SnxCtrSvcResult wait_one(SnxCtrProcess* p, uint32_t* r) {
     }
     CtrObject* o = &p->objects[id];
     if (o->type == CTR_OBJ_EVENT && o->data.event.signaled) {
-        if (!o->data.event.reset_type) o->data.event.signaled = 0;
+        if (o->data.event.reset_type == CTR_RESET_ONESHOT) o->data.event.signaled = 0;
+        r[0] = OK;
+        return SNX_CTR_SVC_RETURN;
+    }
+    if (o->type == CTR_OBJ_TIMER && o->data.timer.signaled) {
+        if (o->data.timer.reset_type == CTR_RESET_ONESHOT) o->data.timer.signaled = 0;
         r[0] = OK;
         return SNX_CTR_SVC_RETURN;
     }
@@ -326,16 +480,16 @@ static SnxCtrSvcResult wait_one(SnxCtrProcess* p, uint32_t* r) {
         return SNX_CTR_SVC_RETURN;
     }
     if (o->type != CTR_OBJ_MUTEX && o->type != CTR_OBJ_EVENT && o->type != CTR_OBJ_THREAD &&
-        o->type != CTR_OBJ_SEMAPHORE)
+        o->type != CTR_OBJ_SEMAPHORE && o->type != CTR_OBJ_TIMER)
         return SNX_CTR_SVC_UNSUPPORTED;
     if (o->type == CTR_OBJ_EVENT || o->type == CTR_OBJ_THREAD || o->type == CTR_OBJ_SEMAPHORE ||
-        (o->data.mutex.depth && o->data.mutex.owner != p->current_thread)) {
+        o->type == CTR_OBJ_TIMER || (o->data.mutex.depth && o->data.mutex.owner != p->current_thread)) {
         if (!r[2] && !r[3]) {
             r[0] = TIMED_OUT;
             return SNX_CTR_SVC_RETURN;
         }
-        if (r[2] != UINT32_MAX || r[3] != UINT32_MAX) return SNX_CTR_SVC_UNSUPPORTED;
         snx_ctr_thread_block(p, id, 0);
+        snx_ctr_thread_deadline(p, r[2], r[3]); /* nanoseconds: r2 low, r3 high */
         return SNX_CTR_SVC_BLOCKED;
     }
     if (o->data.mutex.depth == UINT32_MAX)
@@ -424,22 +578,27 @@ SnxCtrSvcResult snx_ctr_svc(SnxCtrProcess* p, uint32_t number) {
             return SNX_CTR_SVC_RETURN;
         }
         case 0x08: {
-            if (r[4] != 0xfffffffeu && r[4] != 0) return SNX_CTR_SVC_UNSUPPORTED;
             uint32_t out = 0, result = snx_ctr_thread_create(p, r, &out);
             r[0] = result;
             r[1] = out;
             return SNX_CTR_SVC_RETURN;
         }
-        case 0x0a: { /* SleepThread: the thread is not runnable until a host deadline, and
-                        the others run meanwhile; the scheduler sleeps the host only when
-                        no thread can run. Zero yields at the next dispatch boundary;
-                        negative (sleep forever) is not modeled and stops. */
+        case 0x09: /* ExitThread */
+            cpu->exit = SNX_ARM_OK;
+            cpu->syndrome = 0;
+            return snx_ctr_thread_exit(p);
+        case 0x0a: { /* SleepThread: the thread is not runnable until a host deadline, and the others run meanwhile;
+                        the scheduler sleeps the host only when no thread can run. As Azahar's: zero gives the core
+                        to another thread that can run, if any; -1 sleeps forever. */
             int64_t ns = (int64_t)((uint64_t)r[0] | (uint64_t)r[1] << 32);
-            if (ns < 0 || ns > INT64_C(3600) * 1000000000) return SNX_CTR_SVC_UNSUPPORTED;
-            if (!ns) return SNX_CTR_SVC_RETURN;
-            snx_ctr_thread(p)->wake_ns = (uint64_t)(snx_seconds() * 1e9) + (uint64_t)ns;
             cpu->exit = SNX_ARM_OK; /* resumes after the SVC when it wakes */
             cpu->syndrome = 0;
+            if (!ns) {
+                snx_ctr_thread(p)->yield = 1;
+                return SNX_CTR_SVC_RETURN;
+            }
+            snx_ctr_thread_deadline(p, r[0], r[1]);
+            if (ns == -1) snx_ctr_thread(p)->wake_ns = UINT64_MAX;
             return SNX_CTR_SVC_BLOCKED;
         }
         case 0x13: { /* CreateMutex: initially-locked flag at r1 */
@@ -510,22 +669,73 @@ SnxCtrSvcResult snx_ctr_svc(SnxCtrProcess* p, uint32_t number) {
             }
             return SNX_CTR_SVC_RETURN;
         }
-        case 0x17: {
+        case 0x17: { /* CreateEvent: reset type at r1, one-shot, sticky or pulse */
             uint32_t out = 0;
-            if (r[1] > 1) return SNX_CTR_SVC_UNSUPPORTED;
+            if (r[1] > CTR_RESET_PULSE) {
+                r[0] = INVALID_ENUM;
+                r[1] = 0;
+                return SNX_CTR_SVC_RETURN;
+            }
             uint32_t reset = r[1], result = snx_ctr_object_create(p, CTR_OBJ_EVENT, &out);
             if (!result) p->objects[snx_ctr_handle_object(p, out)].data.event.reset_type = reset;
             r[0] = result;
             r[1] = out;
             return SNX_CTR_SVC_RETURN;
         }
-        case 0x18: {
+        case 0x18: { /* SignalEvent: a pulse wakes its waiters and is clear again (Azahar Event::Signal) */
             uint32_t id = snx_ctr_handle_object(p, r[0]);
             if (!id || p->objects[id].type != CTR_OBJ_EVENT)
                 r[0] = INVALID_HANDLE;
             else {
                 p->objects[id].data.event.signaled = 1;
                 snx_ctr_wake_waiters(p, id);
+                if (p->objects[id].data.event.reset_type == CTR_RESET_PULSE) p->objects[id].data.event.signaled = 0;
+                r[0] = OK;
+            }
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x1a: { /* CreateTimer: reset type at r1, the handle out at r1 */
+            uint32_t out = 0;
+            if (r[1] > CTR_RESET_PULSE) {
+                r[0] = INVALID_ENUM;
+                r[1] = 0;
+                return SNX_CTR_SVC_RETURN;
+            }
+            uint32_t reset = r[1], result = snx_ctr_object_create(p, CTR_OBJ_TIMER, &out);
+            if (!result) p->objects[snx_ctr_handle_object(p, out)].data.timer.reset_type = reset;
+            r[0] = result;
+            r[1] = out;
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x1b: { /* SetTimer: handle r0, initial delay r2 (low) r3 (high), interval r1 (low) r4 (high), as libctru's
+                        svcSetTimer loads them; negative values are refused before the handle (Azahar svc.cpp) */
+            int64_t initial = (int64_t)((uint64_t)r[3] << 32 | r[2]), interval = (int64_t)((uint64_t)r[4] << 32 | r[1]);
+            uint32_t id = snx_ctr_handle_object(p, r[0]);
+            if (initial < 0 || interval < 0)
+                r[0] = OUT_OF_RANGE;
+            else if (!id || p->objects[id].type != CTR_OBJ_TIMER)
+                r[0] = INVALID_HANDLE;
+            else {
+                /* Azahar Timer::Set: the previous schedule is cancelled; no initial delay signals at once */
+                uint64_t now = (uint64_t)(snx_seconds() * 1e9);
+                CtrObject* o = &p->objects[id];
+                o->data.timer.interval = (uint64_t)interval;
+                o->data.timer.deadline = initial ? now + (uint64_t)initial : now;
+                if (!initial) snx_ctr_timer_signal(p, id, now);
+                r[0] = OK;
+            }
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x1c:   /* CancelTimer */
+        case 0x1d: { /* ClearTimer */
+            uint32_t id = snx_ctr_handle_object(p, r[0]);
+            if (!id || p->objects[id].type != CTR_OBJ_TIMER)
+                r[0] = INVALID_HANDLE;
+            else {
+                if (number == 0x1c)
+                    p->objects[id].data.timer.deadline = 0;
+                else
+                    p->objects[id].data.timer.signaled = 0;
                 r[0] = OK;
             }
             return SNX_CTR_SVC_RETURN;
@@ -540,10 +750,65 @@ SnxCtrSvcResult snx_ctr_svc(SnxCtrProcess* p, uint32_t number) {
             }
             return SNX_CTR_SVC_RETURN;
         }
+        case 0x1e: { /* CreateMemoryBlock: other permissions r0, address r1, size r2, own permissions r3 (libctru's
+                        svcCreateMemoryBlock), the handle out at r1 (Azahar svc.cpp and shared_memory.cpp) */
+            uint32_t other = r[0], address = r[1], size = r[2], mine = r[3], out = 0, result = OK, physical = 0;
+            bool valid = (mine <= 3 || mine == DONT_CARE) && (other <= 3 || other == DONT_CARE);
+            if (size & 4095)
+                result = MISALIGNED_SIZE;
+            else if (!valid)
+                result = INVALID_COMBINATION;
+            else if (address && (address < 0x00100000u || (uint64_t)address + size > 0x14000000u))
+                result = INVALID_ADDRESS;
+            else if (address && (!size || !private_heap(p, address, size)))
+                result = INVALID_STATE; /* the owner's range must be private read-write heap; it is Locked now */
+            else if (!address && size && !(physical = snx_ctr_shared_pages(p, size)))
+                result = OUT_OF_MEMORY;
+            if (!result) {
+                /* a new block is zeroed */
+                unsigned char zero[4096] = {0};
+                for (uint32_t off = 0; physical && off < size; off += 4096)
+                    (void)snx_ctr_phys_write(p->memory, physical + off, zero, sizeof zero);
+                result = snx_ctr_object_create(p, CTR_OBJ_SHARED, &out);
+            }
+            if (!result) {
+                CtrObject* o = &p->objects[snx_ctr_handle_object(p, out)];
+                o->data.shared.physical = physical;
+                o->data.shared.size = size;
+                o->data.shared.permissions = mine;
+                o->data.shared.address = address;
+                o->data.shared.other_permissions = other;
+                o->data.shared.by_application = 1;
+            }
+            r[0] = result;
+            r[1] = out;
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x20: { /* UnmapMemoryBlock: handle r0, the address it was mapped at r1 */
+            uint32_t id = snx_ctr_handle_object(p, r[0]);
+            if (!id || p->objects[id].type != CTR_OBJ_SHARED) {
+                r[0] = INVALID_HANDLE;
+                return SNX_CTR_SVC_RETURN;
+            }
+            r[0] = INVALID_STATE;
+            for (unsigned i = 0; i < 8; ++i) {
+                CtrSharedMap* m = &p->shared_maps[i];
+                if (m->object != id || m->va != r[1]) continue;
+                if (snx_ctr_unmap(p->space, m->va, m->size) == SNX_CTR_MEM_OK) {
+                    *m = (CtrSharedMap){0};
+                    p->cpu.state.cpu.exclusive_valid = 0;
+                    r[0] = OK;
+                }
+                break;
+            }
+            return SNX_CTR_SVC_RETURN;
+        }
         case 0x1f: {
             uint32_t id = snx_ctr_handle_object(p, r[0]);
             if (!id || p->objects[id].type != CTR_OBJ_SHARED)
                 r[0] = INVALID_HANDLE;
+            else if (p->objects[id].data.shared.by_application)
+                r[0] = map_own_block(p, id, r[1], r[2], r[3]);
             else {
                 CtrObject* o = &p->objects[id];
                 if ((r[1] & 4095) || r[1] < 0x10000000 || (uint64_t)r[1] + o->data.shared.size > 0x1f800000)
@@ -595,22 +860,144 @@ SnxCtrSvcResult snx_ctr_svc(SnxCtrProcess* p, uint32_t number) {
             r[1] = (uint32_t)(ticks >> 32);
             return SNX_CTR_SVC_RETURN;
         }
-        case 0x2a: {
+        case 0x29: { /* GetHandleInfo: handle r1, type r2, the value out at r1:r2 (Azahar svc.cpp) */
+            uint32_t id = snx_ctr_handle_object(p, r[1]), type = r[2];
+            uint64_t value = 0;
+            if (!id)
+                r[0] = INVALID_HANDLE;
+            else if (type == 0 || type == 2 || type == 0x32107) /* process elapsed ticks: created at the clock origin */
+                r[0] = OK;
+            else if (type == 1) /* the reference count, as Azahar approximates it */
+                r[0] = OK, value = p->objects[id].refs - 1;
+            else
+                r[0] = INVALID_ENUM_KERNEL;
+            r[1] = (uint32_t)value;
+            r[2] = (uint32_t)(value >> 32);
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x2a: { /* GetSystemInfo: type r1, parameter r2, the value out at r1:r2, as Azahar answers each */
             uint32_t type = r[1], param = r[2];
             uint64_t value = 0;
             uint32_t result = OK;
-            if (type == 0 && (param == 0 || param == 1)) {
-                for (uint32_t i = 0; i < p->app_limit / 4096; ++i)
-                    if (p->physical_owner[i]) value += 4096;
-            } else if (type == 0 && (param == 2 || param == 3))
-                value = 0; /* no system/base allocations */
-            else
-                result = NOT_IMPLEMENTED;
+            bool new_3ds = snx_ctr_memory_profile(p->memory)->arm11_cores == 4;
+            if (type == 0 && (param == 0 || param == 1))
+                value = memory_used(p); /* APPLICATION (with SYSTEM and BASE, which hold nothing, for 0) */
+            else if (type == 26)
+                value = 5;                             /* the kernel's spawned process count */
+            else if (type == 0x10000 && param == 0x80) /* Luma: the APPLICATION region's size */
+                value = p->app_limit;
+            else if (type == 0x10000 && param == 0x201) /* Luma: a New 3DS */
+                value = new_3ds;
+            else if (type == 0x10001 && !new_3ds)
+                result = INVALID_ENUM_KERNEL; /* New 3DS information, only on a New 3DS */
+            /* 0x20000 is the emulator information Azahar gives about itself: nothing is claimed here (0) */
             r[0] = result;
             r[1] = (uint32_t)value;
             r[2] = (uint32_t)(value >> 32);
             return SNX_CTR_SVC_RETURN;
         }
+        case 0x2b: { /* GetProcessInfo: process r1, type r2, the value out at r1:r2 */
+            uint32_t id = snx_ctr_handle_object(p, r[1]), type = r[2];
+            uint64_t value = 0;
+            uint32_t result = OK;
+            if (!id || p->objects[id].type != CTR_OBJ_PROCESS)
+                result = INVALID_HANDLE;
+            else if (type == 0 || type == 2)
+                value = memory_used(p);
+            else if (type == 20) /* FCRAM's physical address less the linear heap's virtual one */
+                value = (uint32_t)(CTR_PHYS_BASE - CTR_LINEAR);
+            else if (type >= 21 && type <= 23)
+                result = NOT_IMPLEMENTED; /* QTM, as in Azahar */
+            else if (type == 0x10000)
+                memcpy(&value, p->name, sizeof value); /* the codeset's eight-character name */
+            else if (type == 0x10001)
+                value = p->title_id;
+            else if (type >= 0x10002 && type <= 0x10004) { /* text, read-only and data sizes, the data with BSS */
+                unsigned s = type - 0x10002;
+                value = (uint64_t)p->segment[s].pages * 4096 + (s == 2 ? (p->bss_size + 4095u) & ~4095u : 0);
+            } else if (type >= 0x10005 && type <= 0x10007)
+                value = p->segment[type - 0x10005].address;
+            else if (!(type <= 8))
+                result = INVALID_ENUM_KERNEL; /* 1 and 3 to 8 succeed unanswered, as in Azahar */
+            r[0] = result;
+            r[1] = (uint32_t)value;
+            r[2] = (uint32_t)(value >> 32);
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x2c: { /* GetThreadInfo: thread r1, type r2; only 0x10000, the thread's TLS address */
+            uint32_t id = snx_ctr_handle_object(p, r[1]);
+            uint64_t value = 0;
+            if (!id || p->objects[id].type != CTR_OBJ_THREAD)
+                r[0] = INVALID_HANDLE;
+            else if (r[2] != 0x10000)
+                r[0] = INVALID_ENUM_KERNEL;
+            else
+                r[0] = OK, value = id == p->current_thread ? p->cpu.state.cpu.tpidruro
+                                                           : p->objects[id].data.thread.context.tpidruro;
+            r[1] = (uint32_t)value;
+            r[2] = (uint32_t)(value >> 32);
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x36: { /* GetProcessIdOfThread: thread r1, the process ID out at r1 */
+            uint32_t id = snx_ctr_handle_object(p, r[1]);
+            bool thread = id && p->objects[id].type == CTR_OBJ_THREAD;
+            r[0] = thread ? OK : INVALID_HANDLE;
+            r[1] = thread ? CTR_PROCESS_ID : 0;
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x38: { /* GetResourceLimit: process r1, a handle to its resource limit out at r1 */
+            uint32_t id = snx_ctr_handle_object(p, r[1]), out = 0, result = OK;
+            if (!id || p->objects[id].type != CTR_OBJ_PROCESS)
+                result = INVALID_HANDLE;
+            else if (p->resource_limit)
+                result = snx_ctr_handle_add(p, p->resource_limit, &out);
+            else if (!(result = snx_ctr_object_create(p, CTR_OBJ_RESOURCE_LIMIT, &out))) {
+                p->resource_limit = snx_ctr_handle_object(p, out);
+                ++p->objects[p->resource_limit].refs; /* the process keeps it */
+            }
+            r[0] = result;
+            r[1] = out;
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x39:   /* GetResourceLimitLimitValues */
+        case 0x3a: { /* GetResourceLimitCurrentValues: values out r0, limit r1, names r2, count r3 (s64 each) */
+            uint32_t id = snx_ctr_handle_object(p, r[1]), values = r[0], names = r[2], count = r[3];
+            if (!id || p->objects[id].type != CTR_OBJ_RESOURCE_LIMIT) {
+                r[0] = INVALID_HANDLE;
+                return SNX_CTR_SVC_RETURN;
+            }
+            uint32_t result = OK;
+            for (uint32_t i = 0; i < count && !result; ++i) {
+                uint32_t name;
+                if ((result = read32(p, names + i * 4, &name))) break;
+                uint64_t value;
+                if (number == 0x39 && name >= 10)
+                    result = INVALID_ENUM_KERNEL;
+                else if (!(result = number == 0x39 ? limit_value(p, name, &value) : current_value(p, name, &value)))
+                    result = write32(p, values + i * 8, (uint32_t)value) |
+                             write32(p, values + i * 8 + 4, (uint32_t)(value >> 32));
+            }
+            r[0] = result;
+            return SNX_CTR_SVC_RETURN;
+        }
+        case 0x3c: /* Break: reason r0 (0 panic, 1 assert, 2 user); the title gave up, so the run stops here */
+            fprintf(stderr, "3ds: svcBreak(%s, 0x%08x, 0x%08x)\n",
+                    r[0] == 0   ? "panic"
+                    : r[0] == 1 ? "assert"
+                    : r[0] == 2 ? "user"
+                                : "unknown",
+                    r[1], r[2]);
+            return SNX_CTR_SVC_UNSUPPORTED;
+        case 0x52: /* InvalidateProcessDataCache */
+        case 0x53: /* StoreProcessDataCache */
+        case 0x54: /* FlushProcessDataCache: process r0, address r1, size r2. Guest memory has no cache here */
+            r[0] = snx_ctr_handle_object(p, r[0]) == 1 ? OK : INVALID_HANDLE;
+            return SNX_CTR_SVC_RETURN;
+        case 0x93: /* Luma's InvalidateInstructionCacheRange */
+        case 0x94: /* Luma's InvalidateEntireInstructionCache: compiled code is checked against guest memory at every
+                      block, so code written since stops at its first block instead (SNX_ARM_CODE_CHANGED) */
+            r[0] = OK;
+            return SNX_CTR_SVC_RETURN;
         case 0x2d: {
             uint32_t out = 0, result = snx_ctr_named_connect(p, r[1], &out);
             r[0] = result;

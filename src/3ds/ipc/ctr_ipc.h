@@ -18,21 +18,35 @@ enum {
     SNX_CTR_SERVICE_CFG,
     SNX_CTR_SERVICE_DSP
 };
-typedef enum { SNX_CTR_IPC_RETURN, SNX_CTR_IPC_UNSUPPORTED, SNX_CTR_IPC_BLOCKED, SNX_CTR_IPC_FAULT } SnxCtrIpcState;
+/* SNX_CTR_IPC_UNKNOWN: a command the service does not have, as opposed to a form of a known one it does not
+   support (SNX_CTR_IPC_UNSUPPORTED) */
+typedef enum {
+    SNX_CTR_IPC_RETURN,
+    SNX_CTR_IPC_UNSUPPORTED,
+    SNX_CTR_IPC_BLOCKED,
+    SNX_CTR_IPC_FAULT,
+    SNX_CTR_IPC_UNKNOWN
+} SnxCtrIpcState;
+#define SNX_CTR_IPC_HANDLES 8u
 struct SnxCtrProcess;
 /* Serialized stack-owned request/reply copies. Never a flat guest pointer.
    Header: command[31:16], normal words[11:6], translation words[5:0].
    Result is reply normal word 1. PID descriptors are kernel supplied, not the
-   raw client's claimed PID. Unknown commands never become successful stubs. */
+   raw client's claimed PID. Unknown commands stop the run, unless the process's
+   IPC stub list names the service: then they answer success, as Azahar's
+   ReportUnimplementedFunction does. */
 typedef struct {
     struct SnxCtrProcess* process;
     uint32_t object, caller_pid, transport_result;
     uint32_t in[SNX_CTR_IPC_WORDS], out[SNX_CTR_IPC_WORDS];
-    /* Bounded incoming handle capture (GSP forms only): raw words, resolved
-       and type-checked by the handler. Zero: none. */
-    uint32_t handle_in[2];
+    /* Incoming copied and moved handles in descriptor order: raw words, resolved and type-checked by the handler.
+       Zero: none. A moved handle leaves the caller's table once the request is answered. */
+    uint32_t handle_in[SNX_CTR_IPC_HANDLES], handle_count, handle_moved;
     SnxCtrIpcState state;
 } SnxCtrIpc;
+/* The --ipc-stubs list ("all", or service families: srv, fs, apt, ptm, hid, gsp, cfg, dsp, comma separated) as a
+   mask over SNX_CTR_SERVICE_*; false for a name it does not know */
+int snx_ctr_ipc_stub_mask(const char* list, uint32_t* mask);
 int snx_ctr_ipc_expect(SnxCtrIpc* c, uint32_t normal, uint32_t translated);
 void snx_ctr_ipc_bad(SnxCtrIpc* c);
 void snx_ctr_ipc_get_bytes(SnxCtrIpc* c, uint32_t first, uint8_t* bytes, uint32_t size);

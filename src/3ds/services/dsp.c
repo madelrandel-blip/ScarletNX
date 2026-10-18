@@ -253,7 +253,7 @@ void snx_ctr_dsp_dispatch(SnxCtrIpc* c) {
             if (!snx_ctr_ipc_expect(c, 1, 0)) return;
             reply(c, 1, 0);
             break;
-        default: c->state = SNX_CTR_IPC_UNSUPPORTED; break;
+        default: c->state = SNX_CTR_IPC_UNKNOWN; break;
     }
 }
 

@@ -74,6 +74,22 @@ static void signal_registered(SnxCtrProcess* p, uint32_t thread) {
 }
 static uint32_t screen_height(uint32_t screen) { return screen ? 320u : 400u; }
 static uint32_t bpp_of(uint32_t format) { return format == 0 ? 4u : format == 1 ? 3u : 2u; }
+/* A buffer swap, from SetBufferSwap or a shared FrameBufferUpdate block: info is FrameBufferInfo {active_fb,
+   address_left, address_right, stride, format, shown_fb, unknown}. active_fb picks the register pair written,
+   shown_fb the pair the LCD shows from now on. The right eye differs only for a stereoscopic top screen. As
+   GPU::SetBufferSwap in Azahar video_core/gpu.cpp (GPL-3.0-or-later). */
+static void buffer_swap(SnxCtrProcess* p, uint32_t screen, const uint32_t* info) {
+    unsigned pair = info[0] ? 1u : 0u;
+    if (screen == 0) {
+        bool stereoscopic = (info[4] & 0x70) == 0x20;
+        p->gsp.fb_screen[0].right[pair] = !stereoscopic || !info[2] ? info[1] : info[2];
+    }
+    p->gsp.fb_screen[screen].left[pair] = info[1];
+    p->gsp.fb_screen[screen].stride = info[3];
+    p->gsp.fb_screen[screen].format = info[4];
+    p->gsp.fb_screen[screen].active = info[5] & 0xff;
+    p->gsp.fb_pending[screen] = 1;
+}
 /* libctru gspPresentBuffer posts framebuffers into the shared FrameBufferUpdate
    blocks (0x200 + thread*0x80 + screen*0x40) instead of calling SetBufferSwap.
    Latch every dirty block at vblank and clear its update flag, as GSP does. */
@@ -90,22 +106,22 @@ static void latch_shared_framebuffers(SnxCtrProcess* p) {
             unsigned slot = header[0] & 1;
             unsigned char info[28];
             if (snx_ctr_read_ram(p->space, base + 4 + slot * 28, info, sizeof info) != SNX_CTR_MEM_OK) continue;
+            uint32_t words[7];
             for (unsigned i = 0; i < 7; ++i) {
-                uint32_t word = 0;
-                for (unsigned b = 0; b < 4; ++b) word |= (uint32_t)info[i * 4 + b] << (b * 8);
-                p->gsp.fb_screen[screen][i] = word;
+                words[i] = 0;
+                for (unsigned b = 0; b < 4; ++b) words[i] |= (uint32_t)info[i * 4 + b] << (b * 8);
             }
-            p->gsp.fb_pending[screen] = 1;
+            buffer_swap(p, screen, words);
             header[1] = 0; /* applied: the guest may post the next update */
             (void)snx_ctr_write_ram(p->space, base, header, sizeof header);
         }
     }
 }
-/* Present one latched buffer swap: the displayed half of the pair, read as
-   guest RAM and shown through the Vulkan presenter. */
+/* Present one latched buffer swap: the left eye of the pair the LCD shows, as the software renderer's
+   LoadFBToScreenInfo reads it, from guest RAM through the Vulkan presenter. */
 static void present_screen(SnxCtrProcess* p, uint32_t screen) {
-    const uint32_t* fb = p->gsp.fb_screen[screen];
-    uint32_t address = fb[5] ? fb[2] : fb[1], stride = fb[3], format = fb[4] & 7;
+    uint32_t address = p->gsp.fb_screen[screen].left[p->gsp.fb_screen[screen].active ? 1 : 0];
+    uint32_t stride = p->gsp.fb_screen[screen].stride, format = p->gsp.fb_screen[screen].format & 7;
     if (!address || format > 4) return;
     uint32_t height = screen_height(screen), width = 240, bytes = bpp_of(format);
     if (stride < width * bytes || stride > 0x40000) return;
@@ -153,15 +169,15 @@ bool snx_ctr_gsp_event(const SnxCtrProcess* p, uint32_t object) {
     return false;
 }
 /* Waits on a registered interrupt event that is not signaled block the thread on it; the scheduler delivers
-   vblanks when due (snx_ctr_schedule), which signals the event and wakes it, while the other threads run.
-   Immediate and infinite forms only; finite deadlines stop. */
+   vblanks when due (snx_ctr_schedule), which signals the event and wakes it, while the other threads run. A finite
+   wait times out at its deadline instead. */
 SnxCtrSvcResult snx_ctr_gsp_wait(SnxCtrProcess* p, uint32_t object, uint32_t* r) {
     if (!r[2] && !r[3]) {
         r[0] = GSP_TIMED_OUT;
         return SNX_CTR_SVC_RETURN;
     }
-    if (r[2] != UINT32_MAX || r[3] != UINT32_MAX) return SNX_CTR_SVC_UNSUPPORTED;
     snx_ctr_thread_block(p, object, 0);
+    snx_ctr_thread_deadline(p, r[2], r[3]); /* a finite wait times out at its deadline */
     return SNX_CTR_SVC_BLOCKED;
 }
 static uint32_t* regs(SnxCtrProcess* p) {
@@ -235,13 +251,14 @@ static void set_buffer_swap(SnxCtrIpc* c) {
     /* words: screen, then FrameBufferInfo {active_fb, address_left,
        address_right, stride, format, shown_fb, unknown} */
     uint32_t screen = c->in[1], stride = c->in[5], format = c->in[6] & 7, shown = c->in[7];
-    if (screen > 1 || format > 4) {
-        c->state = SNX_CTR_IPC_UNSUPPORTED;
+    /* Real hardware ignores an invalid screen and still answers success (Azahar gsp_gpu.cpp) */
+    if (screen > 1) {
+        c->out[0] = (c->in[0] & 0xffff0000u) | 0x40;
         return;
     }
-    /* Only the bit layouts the presenter converts are accepted; the rest stop
-       instead of being displayed with invented colors. */
-    if (format > 2) {
+    /* The five PICA framebuffer formats (RGBA8, RGB8, RGB565, RGB5A1, RGBA4) are what the presenter converts; the
+       rest stop instead of being displayed with invented colors. */
+    if (format > 4) {
         c->state = SNX_CTR_IPC_UNSUPPORTED;
         return;
     }
@@ -249,8 +266,7 @@ static void set_buffer_swap(SnxCtrIpc* c) {
         snx_ctr_ipc_error_reply(c, GSP_ERR_REGS_RANGE);
         return;
     }
-    for (unsigned i = 0; i < 7; ++i) p->gsp.fb_screen[screen][i] = c->in[2 + i];
-    p->gsp.fb_pending[screen] = 1;
+    buffer_swap(p, screen, &c->in[2]);
     /* A swap schedules the frame for the next real vblank; if display time has
        already passed while the guest ran, service it now. */
     if (p->gsp.shared_object && (uint64_t)(snx_seconds() * 1e9) >= p->gsp.next_vblank_ns) snx_ctr_gsp_vblank(p);
@@ -692,6 +708,6 @@ void snx_ctr_gsp_dispatch(SnxCtrIpc* c) {
         case 0x015:
         case 0x016: acquire(c); break;
         case 0x017: release_right(c); break;
-        default: c->state = SNX_CTR_IPC_UNSUPPORTED; break;
+        default: c->state = SNX_CTR_IPC_UNKNOWN; break;
     }
 }

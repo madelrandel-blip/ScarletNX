@@ -23,7 +23,15 @@ SnxCtrRunResult snx_ctr_dispatch(const SnxCtrModule* m, SnxCtrProcess* process, 
     SnxArmCPU* cpu = snx_ctr_process_cpu(process);
     if (!cpu || !m) return SNX_CTR_RUN_FAULT;
     if (!snx_ctr_schedule(process)) return SNX_CTR_RUN_BLOCKED;
+    uint32_t since_poll = 0;
     while (*executed < limit) {
+        /* Every block returns here, so a loop that makes no SVC still reaches the scheduler: due vblanks, audio frames,
+           timers and timeouts are delivered, and a thread they wake with a better priority takes the core, as the
+           interrupt would preempt it on the console */
+        if (++since_poll == SNX_CTR_POLL_BLOCKS) {
+            since_poll = 0;
+            if (!snx_ctr_schedule(process)) return SNX_CTR_RUN_BLOCKED;
+        }
         uint32_t pc = cpu->r[15];
         bool thumb = !!(cpu->cpsr & SNX_ARM_T);
         unsigned width = thumb ? 2 : 4;

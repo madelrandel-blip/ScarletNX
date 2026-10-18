@@ -57,11 +57,9 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   disks have less free, the menu says how much it needs and *Run anyway* takes a second press.
 - **Load 3DS CIA** uses `scarletnx-3ds`. Its `games/` browser lists CIA inputs,
   not host executables. The driver extracts supported decrypted application CIAs.
-  A native Linux build with `SNX_3DS_AOT=ON` then performs static ARM11 integer
-  compilation/execution; the default build reports missing AOT support. Larger
-  images use bounded conservative discovery (16 MiB text cap). SuperTux now
-  connects/registers `srv:`, then waits for absent `APT:S`, before main,
-  graphics or audio. No service/session success is invented to bypass that wait.
+  The driver then compiles the ARM11 code ahead of time and runs it, on Linux and
+  Windows. Larger images use bounded conservative discovery (16 MiB text cap).
+  SuperTux shows its title screen and plays its music, but takes no input yet.
   Full HLE/devices remain incomplete. Like the Switch driver, it uses an
   extraction and a compiled module already there, and recompiles only when needed.
   See [3DS port](3DS.md) for limits.

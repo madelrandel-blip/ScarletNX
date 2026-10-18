@@ -131,15 +131,36 @@ int main(void) {
         assert(word(p, 0) == 0x08610040 && !word(p, 1));
         assert(p->objects[fid].data.session.client_pid == CTR_PROCESS_ID &&
                p->objects[fid].data.session.sdk_version == 0x11223344);
+        /* a command the service lacks stops the run, unless the stub list names the service: then it answers
+           success with one normal word, as Azahar's ReportUnimplementedFunction does */
         uint32_t unknown[] = {0xbeef0000};
         request(p, unknown, 1);
         sync(p, fs, SNX_CTR_SVC_UNSUPPORTED, 0);
         assert(word(p, 0) == unknown[0] && objects(p) == 4);
-        /* Valid-but-unimplemented CTR mapped buffers stop, not HIPC parsing. */
+        uint32_t mask = 0;
+        assert(snx_ctr_ipc_stub_mask("apt,fs", &mask) && !snx_ctr_ipc_stub_mask("fs,nope", &mask));
+        assert(snx_ctr_ipc_stub_mask("fs", &p->ipc_stubs));
+        request(p, unknown, 1);
+        sync(p, fs, SNX_CTR_SVC_RETURN, 0);
+        assert(word(p, 0) == 0xbeef0040 && !word(p, 1));
+        p->ipc_stubs = 0;
+        /* Any well-formed descriptor is translated: a mapped buffer the command does not take reaches the handler,
+           which refuses its form; one over memory the caller cannot read never does */
         uint32_t buffer[] = {0x08010002, 0x0000100a, 0x300000};
         request(p, buffer, 3);
-        sync(p, fs, SNX_CTR_SVC_UNSUPPORTED, 0);
-        assert(word(p, 0) == buffer[0]);
+        sync(p, fs, SNX_CTR_SVC_RETURN, 0xd9001830u);
+        uint32_t unmapped[] = {0x08010002, 0x0000100a, 0x00500000};
+        request(p, unmapped, 3);
+        sync(p, fs, SNX_CTR_SVC_RETURN, 0xe0e01bf5u);
+        /* a moved handle leaves the caller's table once the request is answered (here a stubbed command) */
+        uint32_t moved = 0;
+        assert(!snx_ctr_object_create(p, CTR_OBJ_EVENT, &moved));
+        uint32_t move[] = {0xbeef0002, 0x10, moved};
+        assert(snx_ctr_ipc_stub_mask("fs", &p->ipc_stubs));
+        request(p, move, 3);
+        sync(p, fs, SNX_CTR_SVC_RETURN, 0);
+        assert(!snx_ctr_handle_object(p, moved) && objects(p) == 4);
+        p->ipc_stubs = 0;
         close_handle(p, fs);
         request(p, init, 4);
         sync(p, fs, SNX_CTR_SVC_RETURN, 0xd8e007f7);

@@ -3,6 +3,7 @@
 #include "3ds/board/board.h"
 #include "3ds/loader/ctr_loader.h"
 #include "3ds/aot/ctr_module.h"
+#include "3ds/ipc/ctr_ipc.h"
 #include "common/utilities/common.h"
 #include <ctype.h>
 #include <errno.h>
@@ -30,6 +31,8 @@ static void usage(FILE* out) {
           "  --output DIR    The extraction folder (default work/3ds/<the CIA's name>)\n"
           "  --max-blocks N  Stop after N native blocks (default: run until the game exits or its window\n"
           "                  closes)\n"
+          "  --ipc-stubs L   Answer a service command the runtime lacks with success instead of stopping, for\n"
+          "                  the services in L: all, or a comma list of srv, fs, apt, ptm, hid, gsp, cfg, dsp\n"
           "An extraction and a compiled module already there are used as they are: the ARM11 code is compiled\n"
           "again only when its module is missing or no longer matches the build or the extracted code.\n"
           "Encrypted content is not implemented.\n",
@@ -67,6 +70,7 @@ int main(int argc, char** argv) {
     const char *input = NULL, *output = NULL, *repo = NULL;
     bool info = false, positional = false, extract_only = false, recompile = false, budget_set = false;
     uint64_t max_blocks = 0; /* no budget */
+    uint32_t ipc_stubs = 0;  /* every unknown service command stops the run */
     SnxCtrBoard board;
     snx_tool_console();
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -109,6 +113,13 @@ int main(int argc, char** argv) {
             }
             max_blocks = (uint64_t)n;
             budget_set = true;
+        } else if (!positional && !strcmp(arg, "--ipc-stubs")) {
+            if (++i == argc || !snx_ctr_ipc_stub_mask(argv[i], &ipc_stubs)) {
+                fputs("scarletnx-3ds: --ipc-stubs requires all or a comma list of srv, fs, apt, ptm, hid, gsp, cfg, "
+                      "dsp\n",
+                      stderr);
+                return 2;
+            }
         } else if (!positional && !strcmp(arg, "--model")) {
             if (++i == argc || (strcmp(argv[i], "old") && strcmp(argv[i], "new"))) {
                 fputs("scarletnx-3ds: --model requires old or new\n", stderr);
@@ -181,7 +192,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     int status = snx_ctr_aot_run(extracted, model, max_blocks, recompile ? SNX_CTR_RECOMPILE | SNX_CTR_COMPILE_ONLY : 0,
-                                 error, sizeof error);
+                                 ipc_stubs, error, sizeof error);
     free(extracted);
     if (status) fprintf(stderr, "scarletnx-3ds: %s\n", error);
     return status;

@@ -88,21 +88,13 @@ output and combined CPU/RAM usage. See [GUI launcher](docs/GUI.md).
 
 The experimental `scarletnx-3ds` driver and **Load 3DS CIA** menu entry support
 decrypted application CIA extraction (`scarletnx-3ds -x game.cia`) and an independent
-page-based memory controller. `SNX_3DS_AOT=ON` additionally enables an experimental
-**extract -> offline AOT -> native run** pipeline on native 64-bit Linux, using an
+page-based memory controller. It runs them through an experimental
+**extract -> offline AOT -> native run** pipeline on 64-bit Linux and Windows, using an
 explicit ARM11/checked-memory profile without changing shared A57 defaults.
-Larger images now use bounded chunked static CFG compilation (16 MiB text cap).
-SuperTux now completes minimal APT startup with real synchronization/thread
-resources, initializes HID handles and **reaches and executes main**. It then
-opens its reconstructed RomFS using NX's shared filesystem backing, executes
-scalar VFP in `gettimeofday`, opens its SelfNCCH archive and stopped at FS's
-archive timestamp request — real timestamp semantics and a minimal Vulkan-only
-GSP/GPU display path (live SDL3 window + PPM frames) now exist.
-**No first frame, audio or gameplay is claimed.**
-Checked CTR IPC uses a separate SwIPC mode; ARM11 exclusives and serialized
-native thread scheduling work. Full VFPv2, cache/resume, HLE and devices remain incomplete. The default
-build still stops after extraction.
-See the [staged 3DS port](docs/3DS.md) for limits, build instructions and remaining work.
+The homebrew SuperTux draws its title and loading screens with a software port of
+Azahar's PICA pipeline and plays its music through a port of Azahar's HLE DSP.
+It is not playable yet, because input, the bottom screen and parts of the OS are missing.
+See the [3DS port](docs/3DS.md) for limits, build instructions and the parity roadmap.
 
 For more detailed information please see: [Build + run](./docs/BUILD.md). For the Android app (arm64 and x86_64),
 see [Android](./docs/ANDROID.md). macOS and iOS build in CI, but no game runs on them yet: see

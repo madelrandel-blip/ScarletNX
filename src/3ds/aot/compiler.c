@@ -35,6 +35,13 @@ static uint32_t little(const unsigned char* p, unsigned size) {
     for (unsigned i = 0; i < size; ++i) result |= (uint32_t)p[i] << (i * 8);
     return result;
 }
+/* a staged file's name inside the staging directory */
+static const char* leaf(const char* path) {
+    const char* last = path;
+    for (const char* p = path; *p; ++p)
+        if (*p == '/' || *p == '\\') last = p + 1;
+    return last;
+}
 static void name(char out[40], unsigned mode, unsigned index) {
     snprintf(out, 40, "ctr_%c_%u", mode ? 't' : 'a', index);
 }
@@ -94,6 +101,12 @@ static bool descriptor(LLVMModuleRef mod, LLVMTargetDataRef layout, const SnxCtr
     LLVMValueRef global = LLVMAddGlobal(mod, structure, "snx_ctr_module_v1");
     LLVMSetInitializer(global, LLVMConstNamedStruct(structure, values, 18));
     LLVMSetGlobalConstant(global, 1);
+#ifdef _WIN32
+    /* COFF has no hidden visibility: without an explicit export, lld exports every global of the DLL, a block
+       function each, past PE's 65535 exports. Exporting the descriptor alone turns that off, as the ELF module's
+       hidden blocks leave it the only symbol the loader looks up. */
+    LLVMSetDLLStorageClass(global, LLVMDLLExportStorageClass);
+#endif
     return true;
 }
 static LLVMModuleRef new_module(Host* h, LLVMContextRef c) {
@@ -303,20 +316,26 @@ int snx_ctr_aot_compile(const char* extracted, char* error, size_t error_size) {
         snprintf(error, error_size, "out of memory for native linker arguments");
         goto done;
     }
-    command[0] = SNX_CTR_HOST_CC;
-    command[1] = "-shared";
+    unsigned arg = 0;
+    command[arg++] = SNX_CTR_HOST_CC;
+    command[arg++] = "-shared";
 #ifdef __APPLE__
     /* ld64's: a dylib refuses undefined symbols, as -z defs does (its default, said); its stacks aren't executable and
        its constant data is kept read-only without being asked, which noexecstack, relro and now ask GNU ld for */
-    command[2] = "-Wl,-undefined,error";
-#else
-    command[2] = "-Wl,-z,defs,-z,noexecstack,-z,relro,-z,now";
+    command[arg++] = "-Wl,-undefined,error";
+#elif !defined(_WIN32)
+    command[arg++] = "-Wl,-z,defs,-z,noexecstack,-z,relro,-z,now";
 #endif
-    for (unsigned i = 0; i < files; ++i) command[3 + i] = objects[i];
-    command[3 + files] = runtime;
-    command[4 + files] = "-o";
-    command[5 + files] = module;
-    if (snx_run_stage(command, NULL, "native linking")) {
+    /* A PE DLL needs none of those: an unresolved symbol is always a link error, lld marks it NXCOMPAT, and it has no
+       lazily bound PLT for relro and now to protect. lld's MinGW driver refuses -z. */
+    /* The linker runs in the staging directory and is given the files' names alone. With full paths a large image's
+       hundreds of chunks pass the 32767 characters a Windows command line holds (CreateProcessW fails with
+       ERROR_FILENAME_EXCED_RANGE); 1024 chunks, the most the entry limit allows, take about 15000 by name. */
+    for (unsigned i = 0; i < files; ++i) command[arg++] = leaf(objects[i]);
+    command[arg++] = leaf(runtime);
+    command[arg++] = "-o";
+    command[arg++] = leaf(module);
+    if (snx_run_stage(command, stage, "native linking")) {
         snprintf(error, error_size, "native linker failed; no runnable module published");
         goto done;
     }

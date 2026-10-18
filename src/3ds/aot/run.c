@@ -13,8 +13,8 @@
 
 #define SNX_CTR_RUN_SLICE 1000000u
 
-int snx_ctr_aot_run(const char* directory, SnxCtrModel model, uint64_t limit, unsigned flags, char* error,
-                    size_t error_size) {
+int snx_ctr_aot_run(const char* directory, SnxCtrModel model, uint64_t limit, unsigned flags, uint32_t ipc_stubs,
+                    char* error, size_t error_size) {
     SnxCtrImage image = {0};
     SnxCtrProcess* process = NULL;
     SnxCtrNative native = {0};
@@ -42,6 +42,7 @@ int snx_ctr_aot_run(const char* directory, SnxCtrModel model, uint64_t limit, un
         snprintf(error, error_size, "cannot create checked ARM11 process mappings");
         goto done;
     }
+    process->ipc_stubs = ipc_stubs;
     if (!snx_ctr_process_mount_fs(process, directory)) {
         snprintf(error, error_size, "cannot index extracted title filesystem");
         goto done;

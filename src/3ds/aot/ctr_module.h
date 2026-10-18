@@ -32,6 +32,9 @@ typedef enum {
     SNX_CTR_RUN_BUDGET,
     SNX_CTR_RUN_BLOCKED
 } SnxCtrRunResult;
+/* Blocks between the dispatcher's scheduler polls: at about 2 million blocks a second, half a millisecond or so, well
+   inside the DSP's 4.9 ms audio frame and the display's 16.7 ms */
+#define SNX_CTR_POLL_BLOCKS 4096u
 /* Requires a compatible module and its matching freshly initialized process.
    Bounded static blocks; no discovery, compiler, interpreter or JIT here.
    Process-owned kernel HLE handles a bounded SVC subset. Unknown calls stop.
@@ -52,6 +55,7 @@ void snx_ctr_native_close(SnxCtrNative* native);
    or its window closes, or for limit blocks when limit is not 0. The module is
    trusted as code the driver compiled itself, never as a sandbox. */
 enum { SNX_CTR_RECOMPILE = 1, SNX_CTR_COMPILE_ONLY = 2 };
-int snx_ctr_aot_run(const char* directory, SnxCtrModel model, uint64_t limit, unsigned flags, char* error,
-                    size_t error_size);
+/* ipc_stubs: the services whose unknown commands answer success instead of stopping (snx_ctr_ipc_stub_mask) */
+int snx_ctr_aot_run(const char* directory, SnxCtrModel model, uint64_t limit, unsigned flags, uint32_t ipc_stubs,
+                    char* error, size_t error_size);
 #endif

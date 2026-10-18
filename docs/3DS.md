@@ -11,7 +11,8 @@
   * [Build and test](#build-and-test)
 * [Source provenance and licensing](#source-provenance-and-licensing)
 * [Boundaries and prerequisites for stage 2b](#boundaries-and-prerequisites-for-stage-2b)
-* [Staged roadmap (2a implemented; 2b partially implemented)](#staged-roadmap-2a-implemented-2b-partially-implemented)
+* [Parity roadmap (Azahar)](#parity-roadmap-azahar)
+* [Staged roadmap (stages 2–6, superseded by the parity roadmap)](#staged-roadmap-stages-26-superseded-by-the-parity-roadmap)
   * [2. CIA extraction, memory controller and static execution](#2-cia-extraction-memory-controller-and-static-execution)
   * [3. Basic HLE OS and a SwIPC-derived generator](#3-basic-hle-os-and-a-swipc-derived-generator)
   * [4. Audio DSP](#4-audio-dsp)
@@ -20,16 +21,26 @@
 
 ## Status: stage 1 + stage 2a + stages 2b1–2b4 + initial 3a/3b/FS
 
-`scarletnx-3ds` extracts **decrypted application CIAs**. With `SNX_3DS_AOT=ON`,
-it performs **extract -> offline static AOT -> native module -> checked ARM/Thumb
-execution**. Both asset-free witnesses and the supplied SuperTux CIA's native
-startup gate pass. SuperTux completes minimal APT startup, creates a native
-background thread, initializes HID and **reaches and executes main** at
-`0x00167d88` (50,489 blocks), then opens its reconstructed RomFS. It stops at
-FS `ControlArchive` (timestamp) after 50,629 blocks / 61 SVCs, having executed
-scalar VFP in `gettimeofday`, but before its first
-file read. It is **not playable**; no first frame or audio yet. See the
-[SuperTux integration target](3DS-SUPERTUX.md) for the pinned input and next blockers.
+`scarletnx-3ds` extracts **decrypted application CIAs** and runs them through
+**extract -> offline static AOT -> native module -> checked ARM/Thumb execution**,
+with the compiler built into the driver. A launch reuses a finished extraction
+and module and runs until the game exits or its window closes.
+
+Since 2026-10-16, SuperTux runs past `main` and its RomFS reads. It draws its title and loading
+screens through a software port of Azahar's PICA pipeline (command processor,
+shader interpreter, rasterizer, texturing, combiners, lighting) and plays its
+title music through a port of Azahar's HLE DSP. A run of about 2 billion native
+blocks presented frames until it was ended. It is **not playable** yet:
+
+- There is no input, because HID gives handles and no samples.
+- Only the top screen is shown in the window.
+- The music has a gap after every rendered frame, because rendering and presenting
+  run inside the guest's GSP call.
+- Finite timeouts, syscore threads, unknown services, geometry shaders, procedural
+  textures, shadows and the DSP's AAC pipe still stop the run explicitly.
+
+The [parity roadmap](#parity-roadmap-azahar) lists the remaining work, and the
+[SuperTux integration target](3DS-SUPERTUX.md) holds the pinned input.
 
 Text is bounded at **16 MiB**, using conservative static CFG discovery for larger
 images. This is not complete indirect-target coverage or a general 3DS runtime.
@@ -340,12 +351,12 @@ This requires a native LLVM SDK (select with `SNX_LLVM_CONFIG` if needed).
 `SNX_TEST_ARM_DIFF=ON` additionally requires Python `unicorn==2.1.4`, and enables
 ARM11 MPCore plus shared A57 integer/VFP/NEON/Thumb regressions. See
 `src/common/cpu/arm/README.md` for the codegen contract and exact limitations.
-Those test options alone do not enable the pipeline. To build/run it on a
-**native 64-bit Linux host** with Clang and the LLVM SDK:
+The pipeline is always built with `SNX_BUILD_3DS` (the default). To build and run it
+alone on a 64-bit Linux or Windows host with Clang and the LLVM SDK:
 
 ```sh
 cmake -S . -B build/ctr-aot -DSNX_BUILD_NX=OFF -DSNX_BUILD_GNUABI=OFF \
-  -DSNX_BUILD_GUI=OFF -DSNX_3DS_AOT=ON
+  -DSNX_BUILD_GUI=OFF
 cmake --build build/ctr-aot
 ctest --test-dir build/ctr-aot --output-on-failure
 build/ctr-aot/scarletnx-3ds --output work/small-title --max-blocks 100000 small.cia
@@ -355,7 +366,7 @@ The compiler calls the host C compiler selected by CMake to link its PIC object;
 that compiler must remain installed at the configured path. The compiler is part of
 `scarletnx-3ds`, which links LLVM as `scarletnx` does; the compiled modules need no
 LLVM library.
-Use both `SNX_3DS_AOT=ON` and `SNX_TEST_ARM_AOT=ON` for pipeline plus CPU tests.
+Add `SNX_TEST_ARM_AOT=ON` for the CPU tests as well as the pipeline's.
 The bounded CFG unit test needs no LLVM. To run the optional external SuperTux
 bootstrap gate, set `SNX_TEST_3DS_SUPERTUX=/absolute/path/to/Supertux.cia`.
 `SNX_TEST_ARM_DIFF=ON` additionally compares its first-SVC GPR/CPSR and complete
@@ -420,6 +431,10 @@ Stage 3a references GPL-2.0-or-later `core/hle/ipc.h`, `kernel/hle_ipc.cpp`,
 `kernel/svc.cpp`, `service/sm/{srv.cpp,sm.h}` and `service/fs/fs_user.cpp` at that
 revision for wire/result/initialization facts. Its new C transport/services and
 separate SwIPC emitter are project code; see [CTR IPC](CTR-IPC.md).
+The parity roadmap's F1 reads Azahar's master as of 2026-10-17 for kernel semantics, without porting code:
+`core/hle/kernel/{svc,thread,timer,address_arbiter,resource_limit,shared_memory,shared_page,process}.cpp` and
+`errors.h` (GPL-2.0-or-later; `svc.cpp` is GPL-3.0-or-later at that revision), and `service/service.cpp`'s
+ReportUnimplementedFunction. SVC register layouts are checked against libctru's `source/svc.s` (zlib).
 Azahar is not a build dependency.
 Azahar's root license is GPLv3; individual files carry GPLv2-or-later or
 GPLv3-or-later notices. Future adaptations must retain each source's notices
@@ -462,7 +477,7 @@ The page controller is now connected through an opt-in `SnxArmCheckedCPU`
 callback ABI, while the original CPU block/state ABI is deliberately unchanged.
 The adapter is not linked to the legacy execution runner. The A32 runner in
 `src/common/cpu/arm/exec.c` uses MCJIT and is **not** used by this pipeline.
-`SNX_3DS_AOT` selects the separate offline compiler and ARM11/checked codegen
+`scarletnx-3ds` builds the separate offline compiler with the ARM11/checked codegen
 options; shared A57 emission and CPU ABI defaults remain unchanged.
 
 The tick domain remains 268,111,856 Hz, with 4,481,136 base ticks per frame, as
@@ -470,7 +485,31 @@ in Azahar. New 3DS CPU scaling is a separate future scheduler concern. There is
 still no interrupt scheduling, ARM9 emulation or boot ROM. Synthetic CIAs and
 the supplied SuperTux startup execute natively, not complete games/retail titles.
 
-## Staged roadmap (2a implemented; 2b partially implemented)
+## Parity roadmap (Azahar)
+
+The goal is general parity with Azahar, area by area, on Linux x86-64 and Windows.
+The software renderer is finished first and a Vulkan one follows. Each phase names the Azahar
+files it ports or reads. Each ported file keeps its notice, and its origin and revision are
+recorded under [Source provenance and licensing](#source-provenance-and-licensing).
+
+| Phase | Work | Azahar references |
+| --- | --- | --- |
+| F0 Base (done 2026-10-17) | The 3DS driver builds, compiles and runs SuperTux on Windows: the module links by file name in its staging folder (a full-path command line passed Windows' 32767 characters), without ELF's `-z` options, and exports only its descriptor (COFF has no hidden visibility). The GSP, transfer, PICA, DSP and SuperTux tests run there too. SuperTux baseline in [its page](3DS-SUPERTUX.md); GSP shows the left eye of the pair `shown_fb` selects and takes RGB5A1/RGBA4 framebuffers; these docs | `video_core/gpu.cpp`, `service/gsp/gsp_gpu.cpp` |
+| F1 Kernel and time (done 2026-10-17) | The scheduler delivers every deadline (vblank, DSP frame, timers, wait timeouts, sleeps, the shared page's hourly time) and the dispatcher reaches it every 4096 blocks, so a thread they wake with a better priority preempts one that makes no SVC; finite timeouts on WaitSynchronization1/N, the arbiter and GSP; SleepThread 0 yields and -1 sleeps forever; ExitThread, with the process ending at its last thread; timers and pulse events; CreateThread on processors -2 to 3 within the APPLICATION limit's priority; GetHandleInfo, GetSystemInfo (Luma's queries too), GetProcessInfo, GetThreadInfo, GetProcessIdOfThread, the resource limit SVCs, Break, the cache SVCs and Luma's 0x93/0x94; CreateMemoryBlock, UnmapMemoryBlock, MapMemoryBlock of the application's own blocks and ControlMemory MAP/UNMAP; any well-formed IPC descriptor translated, buffers checked against the caller's memory, moved handles closed; `--ipc-stubs` answers unknown commands of the services it names; the shared page's retail, battery, Wi-Fi and hourly time fields. Guest time stays host time: subtracting slow HLE work from it waits for the GPU thread (F2), since the audio device plays in host time | `core_timing.*`, `kernel/{svc,thread,timer,address_arbiter,resource_limit,shared_memory,process,shared_page,hle_ipc}.cpp`, `service/service.cpp` |
+| F2 SuperTux playable | Presenter without readback or queue waits, on its own thread; both screens and the Default, Single, Large, Side-by-side and Hybrid layouts; keyboard, SDL3 gamepad, touch and motion input; full `hid:USER`/`hid:SPVR` rings and `ir:rst`; GX work on a GPU thread with interrupts delivered by the poll; banded raster threads; audio prebuffer and hold-last-frame | `frontend/framebuffer_layout.cpp`, `frontend/emu_window.cpp`, `service/hid/hid.*`, `service/ir/ir_rst.*`, `renderer_software/sw_rasterizer.cpp`, `audio_core/dsp_interface.cpp` |
+| F3 OS for retail titles | cfg blocks; APT:U/APT:A and the `aptMainLoop` lifecycle; shared font; HLE applets (swkbd first); FS save data, extdata, system save data, writable SDMC and file and directory operations; ptm:u, ac:u and registered stubs for the small services; err:f | `service/{cfg,apt,fs,ptm,ac,err}/`, `hle/applets/`, `file_sys/archive_*` |
+| F4 Software GPU | Geometry shaders, procedural textures, shadow textures and rendering, VRAM save and restore, the stereo right eye | `pica/geometry_pipeline.cpp`, `pica/shader_unit.cpp`, `renderer_software/{sw_proctex,sw_framebuffer,sw_rasterizer}.cpp` |
+| F5 Dynamic code | ldr:ro CROs compiled ahead of time, with a design for their run-time base and relocations; a log of missed targets for a second discovery pass; an explicit result for self-modifying code | `service/ldr_ro/` |
+| F6 Audio | The DSP's AAC pipe on FFmpeg; CSND; time stretching if gaps remain | `audio_core/hle/aac_decoder.cpp`, `audio_core/csnd.cpp`, `service/csnd/`, `audio_core/time_stretch.cpp` |
+| F7 Peripherals and network | y2r, mic, cam (no camera), ir:USER, soc:U, then ssl and http | `service/{cam,mic,ir,soc,ssl,http}/`, `hw/y2r.cpp` |
+| F8 Loader | Encrypted content with the user's keys; CCI, CXI, 3DSX and ELF; updates and DLC; a complete module cache key | `file_sys/`, `loader/` |
+| F9 Vulkan renderer | A Vulkan device shared with NX; the PICA fragment shader generator on `spirv_emit.c`; the surface cache with page-level coherence in the memory controller; host vertex and geometry shaders. The software renderer stays as the reference and fallback | `renderer_vulkan/`, `rasterizer_cache/`, `shader/generator/` |
+| F10 Performance | Shader JIT if profiles call for it; the syscore CPU limiter; GUI settings for layouts and controls | `shader/shader_jit_*`, `core.cpp` |
+
+F3 and F4 can run in parallel after F2. Every phase is checked by asset-free tests
+(`ctest -R 3ds`) and by a run of the title it affects.
+
+## Staged roadmap (stages 2–6, superseded by the parity roadmap)
 
 Each stage should be one independently reviewable commit/diff, with all earlier
 stages as its base. Stubs must return explicit unsupported errors, not pretend

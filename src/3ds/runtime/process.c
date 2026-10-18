@@ -58,6 +58,42 @@ static bool special_mappings(SnxCtrProcess* p, const uint32_t* caps) {
     }
     return true;
 }
+/* UTC now in milliseconds since 1900, the shared page's date_time */
+static bool utc_1900_ms(uint64_t* out) {
+    struct timespec now;
+    if (
+#if defined(__ANDROID__) && __ANDROID_API__ < 29
+        clock_gettime(CLOCK_REALTIME, &now)
+#else
+        !timespec_get(&now, TIME_UTC)
+#endif
+        || now.tv_sec < 0 || (uint64_t)now.tv_sec > (UINT64_MAX - 999) / 1000 - UINT64_C(2208988800))
+        return false;
+    *out = ((uint64_t)now.tv_sec + UINT64_C(2208988800)) * 1000 + (uint64_t)now.tv_nsec / 1000000;
+    return true;
+}
+void snx_ctr_shared_page_time(SnxCtrProcess* p) {
+    /* Azahar's UpdateTimeCallback: the entry the counter's parity does not select gets the time, the tick it was
+       taken at and the tick rate; then the counter moves on, so readers (index counter & 1) switch to it whole */
+    uint64_t rtc, ticks = (uint64_t)((snx_seconds() - p->clock_origin) * 268111856.0), values[4];
+    p->time_update_ns = (uint64_t)(snx_seconds() * 1e9) + UINT64_C(3600000000000);
+    unsigned char counter[4];
+    if (!utc_1900_ms(&rtc) || snx_ctr_phys_read(p->memory, 0x1ff81000, counter, 4) != SNX_CTR_MEM_OK) return;
+    uint32_t count =
+        (uint32_t)counter[0] | (uint32_t)counter[1] << 8 | (uint32_t)counter[2] << 16 | (uint32_t)counter[3] << 24;
+    values[0] = rtc;
+    values[1] = ticks;
+    values[2] = UINT64_C(268111856);
+    values[3] = 0;
+    unsigned char entry[32];
+    for (unsigned v = 0; v < 4; ++v)
+        for (unsigned i = 0; i < 8; ++i) entry[v * 8 + i] = (unsigned char)(values[v] >> (i * 8));
+    if (snx_ctr_phys_write(p->memory, 0x1ff81020 + (count % 2 ? 0 : 0x20), entry, sizeof entry) != SNX_CTR_MEM_OK)
+        return;
+    ++count;
+    for (unsigned i = 0; i < 4; ++i) counter[i] = (unsigned char)(count >> (i * 8));
+    (void)snx_ctr_phys_write(p->memory, 0x1ff81000, counter, 4);
+}
 void snx_ctr_process_free(SnxCtrProcess* p) {
     if (!p) return;
     free(p->gsp.regs);
@@ -81,6 +117,10 @@ SnxCtrProcess* snx_ctr_process_new(const SnxCtrImage* image, SnxCtrModel model) 
     SnxCtrProcess* p = calloc(1, sizeof *p + app_limit / 4096);
     if (!p) return NULL;
     p->app_limit = app_limit;
+    memcpy(p->segment, image->segment, sizeof p->segment);
+    p->bss_size = image->bss_size;
+    p->title_id = image->title_id;
+    memcpy(p->name, image->name, sizeof p->name);
     p->gsp.rights_thread = UINT32_MAX; /* no GPU right holder until an AcquireRight */
     p->physical_next = CTR_PHYS_BASE;
     p->physical_end = p->physical_next + p->app_limit;
@@ -135,31 +175,24 @@ SnxCtrProcess* snx_ctr_process_new(const SnxCtrImage* image, SnxCtrModel model) 
     if (snx_ctr_write_ram(p->space, CTR_CONFIG, config, sizeof config) != SNX_CTR_MEM_OK ||
         snx_ctr_protect(p->space, CTR_CONFIG, 4096, SNX_CTR_READ) != SNX_CTR_MEM_OK)
         goto fail;
-    /* Shared-page time snapshot (Azahar shared_page.h): UTC milliseconds since
-       1900 plus an ARM11 base-clock reference. Clients interpolate via SVC 28.
+    /* The shared page (Azahar kernel/shared_page.{h,cpp}, GPL-2.0-or-later): a retail console (running_hw 1),
+       unknown_value 1 as Azahar sets it, a full battery on its charger, Wi-Fi at its best link with Internet, the 3D
+       slider down. The time entry is written now and then every hour; clients interpolate between with SVC 0x28.
        Host-paced monotonic ticks, not an instruction/cycle-accuracy claim. */
-    struct timespec now;
-    if (
-#if defined(__ANDROID__) && __ANDROID_API__ < 29
-        clock_gettime(CLOCK_REALTIME, &now)
-#else
-        !timespec_get(&now, TIME_UTC)
-#endif
-        || now.tv_sec < 0 || (uint64_t)now.tv_sec > (UINT64_MAX - 999) / 1000 - UINT64_C(2208988800))
-        goto fail;
+    uint64_t rtc;
+    if (!utc_1900_ms(&rtc)) goto fail;
     p->clock_origin = snx_seconds();
-    uint64_t rtc = ((uint64_t)now.tv_sec + UINT64_C(2208988800)) * 1000 + (uint64_t)now.tv_nsec / 1000000;
     unsigned char shared[4096] = {0};
-    for (unsigned bank = 0; bank < 2; ++bank) {
-        for (unsigned i = 0; i < 8; ++i) {
-            shared[0x20 + bank * 0x20 + i] = (unsigned char)(rtc >> (i * 8));
-            shared[0x30 + bank * 0x20 + i] = (unsigned char)(UINT64_C(268111856) >> (i * 8));
-        }
-    }
+    shared[0x04] = 1;    /* running_hw: product */
+    shared[0x66] = 3;    /* wifi_link_level: best */
+    shared[0x67] = 2;    /* wifi_state: Internet */
+    shared[0x85] = 0x17; /* battery_state: adapter connected, charging, completely full (5) */
+    shared[0x86] = 1;    /* unknown_value */
     if (snx_ctr_map(p->space, 0x1ff81000, 0x1ff81000, 4096, 3) != SNX_CTR_MEM_OK ||
         snx_ctr_write_ram(p->space, 0x1ff81000, shared, sizeof shared) != SNX_CTR_MEM_OK ||
         snx_ctr_protect(p->space, 0x1ff81000, 4096, SNX_CTR_READ) != SNX_CTR_MEM_OK)
         goto fail;
+    snx_ctr_shared_page_time(p);
     if (!special_mappings(p, image->kernel_caps)) goto fail;
     return p;
 fail:

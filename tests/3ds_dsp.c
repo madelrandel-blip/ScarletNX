@@ -228,7 +228,7 @@ static void service(void) {
                          .code_size = sizeof code};
     SnxCtrProcess* p = snx_ctr_process_new(&image, SNX_CTR_OLD);
     assert(p);
-    uint32_t dsp, event;
+    uint32_t dsp = 0, event = 0; /* MinGW's assert is not noreturn: Clang cannot see the failed path ends */
     assert(!snx_ctr_dsp_open(p) && !snx_ctr_session_create(p, SNX_CTR_SERVICE_DSP, &dsp));
     assert(!snx_ctr_object_create(p, CTR_OBJ_EVENT, &event));
     uint32_t id = snx_ctr_handle_object(p, event);

@@ -41,6 +41,6 @@ static void get_config(SnxCtrIpc* c) {
 void snx_ctr_cfg_dispatch(SnxCtrIpc* c) {
     switch (c->in[0] >> 16) {
         case 0x0001: get_config(c); break;
-        default: c->state = SNX_CTR_IPC_UNSUPPORTED; break;
+        default: c->state = SNX_CTR_IPC_UNKNOWN; break;
     }
 }
