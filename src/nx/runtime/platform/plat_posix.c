@@ -137,6 +137,11 @@ static void* thread_start(void* p) {
     return NULL;
 }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+/* every CPU the process may use (plat_cpus), which plat_thread gives each thread it starts: one a game thread started
+   would otherwise run only on the share of that thread's core (plat_thread_cpus) */
+static cpu_set_t g_all_cpus;
+#endif
 int plat_thread(PThreadFn fn, void* arg, size_t stack) {
     ThreadStart* s = malloc(sizeof *s);
     pthread_attr_t a;
@@ -148,6 +153,9 @@ int plat_thread(PThreadFn fn, void* arg, size_t stack) {
     s->alt_stack = stack == 0 || stack >= ALT_STACK_MIN_THREAD;
     pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (CPU_COUNT(&g_all_cpus)) pthread_attr_setaffinity_np(&a, sizeof g_all_cpus, &g_all_cpus);
+#endif
     if (stack) {
         /* smaller than the minimum, setstacksize fails and the default would be used silently */
         if (stack < THREAD_STACK_FLOOR) stack = THREAD_STACK_FLOOR;
@@ -172,6 +180,37 @@ void plat_thread_exit(void) {
     alt_stack_off();
     pthread_exit(NULL);
 }
+/* Linux only: Android's CPUs differ in speed, so a fixed share of them would make a core slow */
+#if defined(__linux__) && !defined(__ANDROID__)
+int plat_cpus(int* ids, int max) {
+    int c, n = 0;
+    if (sched_getaffinity(0, sizeof g_all_cpus, &g_all_cpus)) {
+        CPU_ZERO(&g_all_cpus);
+        return 0;
+    }
+    for (c = 0; c < CPU_SETSIZE && n < max; c++)
+        if (CPU_ISSET(c, &g_all_cpus)) ids[n++] = c;
+    return n;
+}
+void plat_thread_cpus(const int* ids, int n) {
+    cpu_set_t s;
+    int i;
+    CPU_ZERO(&s);
+    for (i = 0; i < n; i++) CPU_SET(ids[i], &s);
+    if (sched_setaffinity(0, sizeof s, &s))
+        WARN_LIMIT(1, "Could not move a game thread to its CPUs: %s\n", strerror(errno));
+}
+#else
+int plat_cpus(int* ids, int max) {
+    (void)ids;
+    (void)max;
+    return 0;
+}
+void plat_thread_cpus(const int* ids, int n) {
+    (void)ids;
+    (void)n;
+}
+#endif
 void plat_yield(void) { sched_yield(); }
 void plat_sleep_ns(i64 ns) {
     struct timespec ts;
@@ -272,7 +311,8 @@ int plat_ww_scan(u8* p, u64 size, void (*cb)(u8* p, u64 size)) {
 #if defined(__linux__) && defined(PAGEMAP_SCAN)
     struct page_region regions[64];
     struct pm_scan_arg arg;
-    u64 start = (u64)(uintptr_t)p & ~(u64)4095, end = ((u64)(uintptr_t)p + size + 4095) & ~(u64)4095;
+    u64 mask = (u64)sysconf(_SC_PAGESIZE) - 1; /* the kernel's pages: PAGEMAP_SCAN wants its bounds on them */
+    u64 start = (u64)(uintptr_t)p & ~mask, end = ((u64)(uintptr_t)p + size + mask) & ~mask;
     int pm = __atomic_load_n(&g_pagemap, __ATOMIC_ACQUIRE);
     if (pm < 0) return -1;
     while (start < end) {
@@ -302,16 +342,28 @@ int plat_ww_scan(u8* p, u64 size, void (*cb)(u8* p, u64 size)) {
 #endif
 }
 
+u64 plat_vm_page(void) {
+    long host = sysconf(_SC_PAGESIZE);
+    u64 page = host > 0 ? (u64)host : 4096;
+    const char* forced = getenv("SNX_HOST_PAGE");
+    if (forced) { /* a larger power of two only: the host's pages can't be split */
+        u64 v = strtoull(forced, NULL, 0);
+        if (v > page && v <= (1u << 20) && !(v & (v - 1))) page = v;
+    }
+    return page;
+}
+/* mmap aligns to the host's own page: a larger plat_vm_page (SNX_HOST_PAGE) takes a page more and trims the rest, so
+   guest addresses sit at the same place in a page as their host addresses */
 u8* plat_vm_reserve(u64 size) {
-    long page = sysconf(_SC_PAGESIZE);
-    void* p;
-    /* the guest's memory is protected in the Switch's 4 KiB pages, which mprotect can't do with larger host pages */
-    if (page != 4096)
-        fatal("This system uses %ld KiB memory pages. ScarletNX only runs on systems with 4 KiB pages.", page / 1024);
-    p = mmap(NULL, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) return NULL;
-    ww_init((u8*)p, size);
-    return (u8*)p;
+    u64 page = plat_vm_page(), extra = page - (u64)sysconf(_SC_PAGESIZE), head;
+    u8* p = (u8*)mmap(NULL, (size_t)(size + extra), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == (u8*)MAP_FAILED) return NULL;
+    head = (page - (u64)(uintptr_t)p % page) % page;
+    if (head) munmap(p, (size_t)head);
+    if (extra > head) munmap(p + head + size, (size_t)(extra - head));
+    p += head;
+    ww_init(p, size);
+    return p;
 }
 int plat_vm_commit(u8* p, u64 size) { return mprotect(p, (size_t)size, PROT_READ | PROT_WRITE) ? -1 : 0; }
 void plat_vm_decommit(u8* p, u64 size) {
@@ -440,6 +492,7 @@ const char* plat_dl_error(void) {
     const char* e = dlerror();
     return e ? e : "no error reported";
 }
+int plat_setenv(const char* name, const char* value) { return setenv(name, value, 1); }
 
 /* ================================================================ files and folders */
 int plat_is_dir(const char* path) {
@@ -674,6 +727,8 @@ static void* context_pc(void* ctx) {
     return (void*)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
 #elif defined(__linux__) && defined(__aarch64__)
     return (void*)(uintptr_t)uc->uc_mcontext.pc;
+#elif defined(__linux__) && defined(__powerpc64__)
+    return (void*)(uintptr_t)uc->uc_mcontext.gp_regs[32]; /* PT_NIP (asm/ptrace.h), glibc's and musl's alike */
 #elif defined(__FreeBSD__) && defined(__x86_64__)
     return (void*)(uintptr_t)uc->uc_mcontext.mc_rip;
 #elif defined(__FreeBSD__) && defined(__aarch64__)

@@ -6,10 +6,11 @@
 #   scripts/android-apk.sh OUT LLVM ABI... [-- cmake args]
 #
 # LLVM holds a scripts/android-llvm.sh prefix per ABI (LLVM/x86_64, LLVM/arm64-v8a), made for the same ANDROID_API
-# (default 21, the app's minSdk). GRADLE names a Gradle 9 (default: gradle). The APK lands in
-# OUT/stage/gradle/outputs/apk/debug/.
+# (default 21, the app's minSdk). GRADLE names a Gradle 9 (default: gradle). SNX_ANDROID_KEYSTORE names the keystore
+# that signs it, its password in SNX_ANDROID_KEYSTORE_PASSWORD (dist/android/build.gradle); without one, this machine's
+# debug key does. The APK lands in OUT/stage/gradle/outputs/apk/debug/.
 set -eu
-[ $# -ge 3 ] || { sed -n '4,10p' "$0"; exit 2; }
+[ $# -ge 3 ] || { sed -n '4,11p' "$0"; exit 2; }
 out=$1 llvm=$2
 shift 2
 abis=
@@ -26,4 +27,4 @@ for abi in $abis; do
     cmake --install "$out/$abi" --prefix "$out/stage" --strip
 done
 "${GRADLE:-gradle}" -p "$src/dist/android" --project-cache-dir "$out/gradle-cache" assembleDebug \
-    -Pscarletnx.stage="$out/stage"
+    -Pscarletnx.stage="$out/stage" ${SNX_ANDROID_KEYSTORE:+"-Pscarletnx.keystore=$SNX_ANDROID_KEYSTORE"}

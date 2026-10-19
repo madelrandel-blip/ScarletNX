@@ -40,28 +40,35 @@ if(NOT SNX_GLSLANG)
         "glslangValidator to compile shaders with (empty: the pinned release, or PATH)" FORCE)
 endif()
 
-# snx_glsl_spirv(target SOURCE file.comp NAME symbol HEADER include/path.h)
+# snx_glsl_spirv(target SOURCE file.comp NAME symbol HEADER include/path.h [DEFINES MACRO[=value]...])
 # Compiles SOURCE (its #includes followed through glslang's depfile) for Vulkan 1.1, optimized, validated and without
 # debug information, into a C file added to target: `const u32 NAME[]` and `const u64 NAME_size` (bytes), as HEADER,
-# which the C file includes, declares them
+# which the C file includes, declares them. DEFINES are predefined macros, for another build of the same source
 function(snx_glsl_spirv target)
-    cmake_parse_arguments(arg "" "SOURCE;NAME;HEADER" "" ${ARGN})
+    cmake_parse_arguments(arg "" "SOURCE;NAME;HEADER" "DEFINES" ${ARGN})
+    set(defines "")
+    foreach(define IN LISTS arg_DEFINES)
+        list(APPEND defines "-D${define}")
+    endforeach()
     get_filename_component(source "${arg_SOURCE}" ABSOLUTE)
     set(dir "${CMAKE_BINARY_DIR}/generated/spirv")
     set(words "${dir}/${arg_NAME}.inc")
     set(out "${dir}/${arg_NAME}.c")
     file(MAKE_DIRECTORY "${dir}")
     file(RELATIVE_PATH shown "${PROJECT_SOURCE_DIR}" "${source}")
-    add_custom_command(OUTPUT "${out}"
-        COMMAND "${SNX_GLSLANG}" -V --target-env vulkan1.1 -O -g0 --spirv-val -x
+    # two steps, so that glslang's depfile names its command's output (the .inc), as the Makefile generators need it
+    # to (they make it a rule for the file it names). DEPENDS rather than MAIN_DEPENDENCY: a source can be built twice
+    add_custom_command(OUTPUT "${words}"
+        COMMAND "${SNX_GLSLANG}" -V --target-env vulkan1.1 -g0 --spirv-val -x ${defines}
                 --depfile "${words}.d" -o "${words}" "${source}"
+        DEPENDS "${source}"
+        DEPFILE "${words}.d"
+        COMMENT "Compiling ${shown} to SPIR-V (${arg_NAME})"
+        VERBATIM)
+    add_custom_command(OUTPUT "${out}"
         COMMAND "${CMAKE_COMMAND}" -DWORDS=${words} -DOUT=${out} -DNAME=${arg_NAME} -DHEADER=${arg_HEADER}
                 -DSOURCE=${shown} -P "${PROJECT_SOURCE_DIR}/cmake/spirv_source.cmake"
-        MAIN_DEPENDENCY "${source}"
-        DEPENDS "${PROJECT_SOURCE_DIR}/cmake/spirv_source.cmake"
-        DEPFILE "${words}.d"
-        COMMENT "Compiling ${shown} to SPIR-V"
+        DEPENDS "${words}" "${PROJECT_SOURCE_DIR}/cmake/spirv_source.cmake"
         VERBATIM)
-    # the depfile names the .inc, not the .c: CMake takes it for the command as a whole
     target_sources(${target} PRIVATE "${out}")
 endfunction()

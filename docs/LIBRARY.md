@@ -36,16 +36,15 @@ find_package(ScarletNXRecompiler REQUIRED)
 target_link_libraries(my_emulator PRIVATE ScarletNX::recompiler)
 ```
 
-The archive carries the function discovery, both backends' emitters, the linker and
-the prebuilt runtime library every module gets. Its link line adds LLVM (always) and
-libgccjit (when the build found it, see `cmake/gccjit.cmake`), which the package
-records. The backends generate code for the machine they run on, as the `scarletnx`
+The archive carries the function discovery, the LLVM emitters, the linker and
+the prebuilt runtime library every module gets. Its link line adds LLVM, which the
+package records. The backend generates code for the machine it runs on, as the `scarletnx`
 command does: build the library on the machine that will use it, or one with the
 same instruction set extensions.
 
 `-DSNX_RECOMPILER_SHARED=ON` also builds `libscarletnx-recompiler.so` (a DLL on
 Windows), which exports only the header's functions and is linked with
-`ScarletNX::recompiler-shared`. It compiles the backends as position-independent code.
+`ScarletNX::recompiler-shared`. It compiles the backend as position-independent code.
 
 ## Use
 
@@ -79,12 +78,11 @@ snx_recompiled_free(m);
 snx_recompiler_free(r);
 ```
 
-`snx_recompiler_new` takes the backend: `SNX_RECOMPILER_FLAG_LLVM` (always built,
-the recommended one) or `SNX_RECOMPILER_FLAG_GCCJIT` (libgccjit, for hosts LLVM has no
-code generator for). `snx_recompiler_has` tells which the build and the host support.
+`snx_recompiler_new` takes the backend: `SNX_RECOMPILER_FLAG_LLVM`, the only one.
+`snx_recompiler_has` tells whether LLVM can target this host.
 The recompiler also takes the `-O` level (`snx_recompiler_set_optimization`, `2` by
-default), how many code units compile at once (`snx_recompiler_set_jobs`: threads
-with LLVM; with libgccjit, which compiles one at a time per process, child processes),
+default), how many code units compile at once (`snx_recompiler_set_jobs`, on
+threads),
 progress lines (`snx_recompiler_set_verbose`) and a folder to save the generated
 code's text in (`snx_recompiler_set_keep_ir`).
 
@@ -95,17 +93,19 @@ is freed on Windows, where a loaded DLL keeps its file. `snx_recompile_ranges` t
 several ranges (the `.text` of several modules) and hints: known function addresses,
 such as the entry point or a symbol table. Functions are found by exploring calls and branches from the
 start of each range and from the hints, as the game workflow does. Code the
-exploration does not reach is not lost: the module carries the interpreter, which runs
-any address the dispatch table has no function for, reading the instructions from the
-CPU's memory. This is why the code must be present in guest memory too.
-`snx_recompiled_functions` and `snx_recompiled_fallbacks` report what was recompiled and
-how many instructions the backend left to the interpreter's step function.
+exploration does not reach is not lost: the module keeps a copy of its code ranges, and
+its JIT (`jit_service.c`, started by the first miss) compiles any address of them the
+dispatch table has no function for when a CPU reaches it, which waits for the compile.
+An address it can't compile (outside the ranges, or on a host without the JIT) is an
+undefined instruction. `snx_recompiled_functions` reports what was recompiled, and
+`snx_recompiled_fallbacks` is always 0: an instruction without an emitter fails the build.
 
 The contract between the generated code and the caller is `cpu.h` (the `CPU` state,
 versioned by `SNX_ABI`, which `snx_recompiler_abi` reports) and
 `runtime/interface.h` (`RtAPI`). `snx_runtime_defaults` fills every hook but `svc`,
 `undef` and `brk`, which the caller writes, and `snx_recompiled_bind` refuses a CPU
-without them. `snx_svc_call64` is the type of the SVC hook: the generated code calls
+without them. Its `miss` runs the code the module a CPU is bound to compiles for a pc
+it has no function for. `snx_svc_call64` is the type of the SVC hook: the generated code calls
 it with `cpu->pc` past the SVC instruction, and the handler reads and writes the
 registers. `snx_recompiled_bind` points a CPU at the module's dispatch table and code
 range. Any number of CPUs, run by any number of threads, may be bound to one module.
@@ -128,10 +128,11 @@ only the functions at its hints and the functions they call, breadth first, unti
 a given number of instructions, skipping call targets a callback says are compiled
 already, and splits a function longer than 4096 instructions into pieces. Its module's
 table covers just what it found. `snx_recompiled_function` gives the function a module
-has for an address (NULL for any other), for the caller's own dispatch table, and
-`snx_recompiled_set_fallback` replaces the interpreter the module's lookups fall back to
-with the caller's handler, which compiles the code at that address and runs it. The Linux
-runtime (`src/gnuabi/runtime/jit.c`) works this way. `snx_recompiler_set_cache` names a
+has for an address (NULL for any other), for the caller's own dispatch table. A caller with
+its own table also gives `RtAPI.miss` its own handler, which compiles the code at that
+address and runs it, as the Linux runtime (`src/gnuabi/runtime/jit.c`) does. A caller that
+keeps `snx_runtime_defaults`' miss can instead name that handler with
+`snx_recompiled_set_fallback`, which the module's misses then run instead of its own JIT. `snx_recompiler_set_cache` names a
 folder that keeps linked modules (LLVM) by a hash of everything they are made from, and
 the compiled runtime library: a module found there is loaded instead of compiled.
 
@@ -145,8 +146,7 @@ bytes (Thumb) and end at or below 4 GiB. `cpu->exit` is cleared when a run start
 run after an exit starts over from `r[15]`. `cpu->rt` (an `SnxArmRt`, or NULL) decides
 what the blocks leave to the system: instructions they can't run, and the coprocessor
 registers (`cpu/arm/README.md`). With NULL, they stop with an exit, and the thread ID
-registers come from the CPU's fields. libgccjit has no A32
-backend, and a libgccjit recompiler refuses A32 code with a reason.
+registers come from the CPU's fields.
 
 ## Limits
 
@@ -164,4 +164,4 @@ backend, and a libgccjit recompiler refuses A32 code with a reason.
 
 The test `tests/recompiler_library.c` is a complete example: hand-assembled A64 and A32
 programs recompiled on each backend, with SVC, BRK and undefined-instruction hooks,
-hints, and the interpreter fallback.
+hints, and code compiled at its miss.

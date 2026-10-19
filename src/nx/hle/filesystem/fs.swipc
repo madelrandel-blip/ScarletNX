@@ -81,7 +81,7 @@ interface nn::fssrv::sf::IFileSystem {
     [11] GetFreeSpaceSize(buffer<nn::fssrv::sf::Path, 0x19> path) -> i64 size;
     [12] GetTotalSpaceSize(buffer<nn::fssrv::sf::Path, 0x19> path) -> i64 size;
     [13] CleanDirectoryRecursively(buffer<nn::fssrv::sf::Path, 0x19> path);
-    @stub [14] GetFileTimeStampRaw(buffer<nn::fssrv::sf::Path, 0x19> path) -> nn::fs::FileTimeStampRaw timestamp;
+    [14] GetFileTimeStampRaw(buffer<nn::fssrv::sf::Path, 0x19> path) -> nn::fs::FileTimeStampRaw timestamp;
     @stub [15] QueryEntry(buffer<u8, 0x46> out_buffer, buffer<u8, 0x45> in_buffer, i32 query_id,
                           buffer<nn::fssrv::sf::Path, 0x19> path);
     @stub [16] GetFileSystemAttribute() -> nn::fs::FileSystemAttribute attribute;

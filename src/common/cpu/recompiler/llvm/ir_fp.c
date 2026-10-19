@@ -76,11 +76,12 @@ static V ixc_set(SnxIr* ir) {
     V fpsr = ir_cpu_load(ir, ir->t_i32, ir_off_fpcr() + 4);
     return LLVMBuildICmp(B, LLVMIntNE, LLVMBuildAnd(B, fpsr, i32c(ir, 1u << 4), ""), i32c(ir, 0), "");
 }
-/* the host fuses multiply-add in hardware (x86 FMA3 from CPUID; AArch64 always): llvm.fma is then one instruction,
-   never a call into a C library the module doesn't link */
+/* the host fuses multiply-add in hardware (x86 FMA3 from CPUID; AArch64 and PowerPC64 always): llvm.fma is then one
+   instruction, never a call into a C library the module doesn't link */
 static int host_fma(SnxIr* ir) {
+    const char* target = LLVMGetTarget(ir->mod);
     if (ir->features->x86) return ir->features->fma;
-    return !strncmp(LLVMGetTarget(ir->mod), "aarch64", 7);
+    return !strncmp(target, "aarch64", 7) || !strncmp(target, "powerpc64", 9) || !strncmp(target, "ppc64", 5);
 }
 static V fp_intrinsic(SnxIr* ir, const char* name, const Shape* s, V* args, unsigned count) {
     return ir_intrinsic(ir, name, s->ft, args, count);
@@ -576,7 +577,8 @@ static void fp3(SnxIr* ir, SnxU32 w, size_t index) {
 }
 
 /* the host rounds to an integral value in one instruction (x86 SSE4.1 ROUNDSD, part of the CPUID sse4.2 gate;
-   AArch64 FRINT*): llvm.floor and friends never become C library calls */
+   AArch64 FRINT*): llvm.floor and friends never become C library calls. Not PowerPC64: it has xsrdpi* for the others,
+   but llvm.roundeven is a call to libm's roundeven there (LLVM 19), and its vector form fails instruction selection */
 static int host_round(SnxIr* ir) {
     if (ir->features->x86) return ir->features->sse42;
     return !strncmp(LLVMGetTarget(ir->mod), "aarch64", 7);

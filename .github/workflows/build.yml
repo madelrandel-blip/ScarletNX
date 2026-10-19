@@ -14,6 +14,14 @@ on:
 permissions:
   contents: read
 
+# a push to a pull request cancels that pull request's build still running: only its newest commit is built. main and
+# the tags build every commit
+concurrency:
+  group: >-
+    build-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number)
+    || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Linux jobs run in Arch Linux, which has the same Clang 23 and clang-format 23 as development, and its LLVM 23 for the
 # recompiler's code generator (required, cmake/llvm.cmake). Windows uses MSYS2 CLANG64 so Clang, the MinGW/UCRT runtime
 # and LLVM's development libraries come from one compatible toolchain. FFmpeg, OpenSSL, Vulkan and SDL3 are built from
@@ -47,14 +55,12 @@ jobs:
         env:
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
-      # llvm: llvm-config and LLVM-C for the recompiler (llvm-libs alone has no headers). libgccjit builds the
-      # optional --backend=gcc too, so its tests (gccjit_differential, native_recompiler_gcc) run here. gdb: the
-      # gdbserver gdbstub_native drives. jq: scripts/pr-builds.sh, which pr_builds tests. Mirrors drop a connection now
+      # llvm: llvm-config and LLVM-C for the recompiler (llvm-libs alone has no headers). gdb: the gdbserver gdbstub_native drives. jq: scripts/pr-builds.sh, which pr_builds tests. Mirrors drop a connection now
       # and then (pkgforge's for aarch64 most), so each pacman install is tried 3 times, 5 s apart
       - name: Install tools
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang llvm libgccjit pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast ccache gdb jq glslang && break
+            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python git clang llvm pkgconf sdl3 libxtst libxrandr libxss vulkan-swrast ccache gdb jq glslang && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
@@ -148,7 +154,7 @@ jobs:
           path: .cache/deps
           key: ${{ steps.deps-used.outputs.key }}
       - name: Test headless Vulkan and NX runtime
-        run: ctest --test-dir build/headless -R '^(vulkan_headless|nx_runtime_homebrew)$' --output-on-failure
+        run: ctest --test-dir build/headless -R '^(vulkan_headless|nx_runtime_homebrew|nx_runtime_homebrew_64k_pages)$' --output-on-failure
       # The game modules compile src/common/cpu/aarch64/cpu_helpers.c, which no CMake target does
       - name: Check the ABI helpers compile
         run: clang -fsyntax-only -Wall -fno-strict-aliasing -fwrapv -I src src/common/cpu/aarch64/cpu_helpers.c
@@ -162,6 +168,96 @@ jobs:
         with:
           name: ScarletNX-linux-${{ matrix.arch }}-${{ steps.commit.outputs.short }}-install
           path: stage
+
+  # # ppc64le, cross-built on an x86-64 runner and tested under qemu-user: nothing is compiled under the emulator, which
+  # # is 10 to 20 times slower. Debian, not Arch: it has a ppc64el archive, which the sysroot (scripts/ppc64-sysroot.sh)
+  # # comes from, cached a week at a time. One build, without debug symbols (SNX_OPT_FLAGS), through ccache, with
+  # # FFmpeg and OpenSSL from the dependency cache, as the linux job has them
+  # linux-ppc64le:
+  #   name: Linux (ppc64le, cross)
+  #   runs-on: ubuntu-24.04
+  #   timeout-minutes: 60
+  #   container: debian:trixie
+  #   concurrency:
+  #     group: ppc64le-${{ github.ref }}
+  #     cancel-in-progress: true
+  #   env:
+  #     SNX_SYSROOT: ${{ github.workspace }}/.cache/sysroot-ppc64el
+  #   steps:
+  #     # the build machine's tools: Clang, LLD and LLVM 19 (the sysroot's LLVM is 19 too), the emulator the tests and
+  #     # llvm-config run under, mmdebstrap for the sysroot, and what FFmpeg's and OpenSSL's builds run
+  #     - name: Install tools
+  #       run: |
+  #         apt-get update
+  #         apt-get install -y --no-install-recommends ca-certificates git clang lld llvm cmake ninja-build make perl \
+  #           python3 ccache mmdebstrap qemu-user glslang-tools spirv-tools pkgconf xz-utils zstd
+  #     - uses: actions/checkout@v7
+  #     - id: week
+  #       run: echo "week=$(date +%G-%V)" >> "$GITHUB_OUTPUT"
+  #     - uses: actions/cache@v5
+  #       id: sysroot
+  #       with:
+  #         path: .cache/sysroot-ppc64el
+  #         key: sysroot-ppc64el-${{ hashFiles('scripts/ppc64-sysroot.sh') }}-${{ steps.week.outputs.week }}
+  #     - name: Make the sysroot
+  #       if: steps.sysroot.outputs.cache-hit != 'true'
+  #       run: scripts/ppc64-sysroot.sh ppc64el .cache/sysroot-ppc64el
+  #     - uses: actions/cache@v5
+  #       with:
+  #         path: .cache/cpm
+  #         key: cpm-${{ github.job }}-${{ hashFiles('cmake/dependencies.cmake') }}
+  #     - uses: actions/cache/restore@v5
+  #       with:
+  #         path: .cache/ccache
+  #         key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  #         restore-keys: ccache-${{ github.job }}-
+  #     - uses: actions/cache/restore@v5
+  #       id: deps
+  #       with:
+  #         path: .cache/deps
+  #         key: deps-${{ github.job }}-${{ github.run_id }}
+  #         restore-keys: deps-${{ github.job }}-
+  #     - name: Set up the caches
+  #       shell: bash
+  #       run: |
+  #         {
+  #           echo "CCACHE_DIR=$GITHUB_WORKSPACE/.cache/ccache"
+  #           echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
+  #           echo "CCACHE_NOHASHDIR=true"
+  #           echo "SNX_DEPS_CACHE=$GITHUB_WORKSPACE/.cache/deps"
+  #           echo "SNX_CCACHE_START=$(date +%s)"
+  #         } >> "$GITHUB_ENV"
+  #     - name: Build
+  #       run: |
+  #         cmake --preset linux-ppc64le-cross -DSNX_OPT_FLAGS="-O2 -g0" \
+  #           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+  #         cmake --build --preset linux-ppc64le-cross --parallel "$(getconf _NPROCESSORS_ONLN)"
+  #     - name: Trim the compiler cache
+  #       shell: bash
+  #       run: |
+  #         ccache --show-stats
+  #         ccache --evict-older-than "$(( $(date +%s) - SNX_CCACHE_START ))s"
+  #         ccache --zero-stats
+  #     - uses: actions/cache/save@v5
+  #       with:
+  #         path: .cache/ccache
+  #         key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+  #     - name: Name the dependency builds
+  #       id: deps-used
+  #       shell: bash
+  #       run: |
+  #         used=$(find build -path '*/snx-deps/*.dir' -exec cat {} + | sort -u)
+  #         for d in .cache/deps/*; do grep -qxF "${d##*/}" <<<"$used" || rm -rf "$d"; done
+  #         echo "key=deps-${{ github.job }}-$(sha256sum <<<"$used" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+  #     - if: steps.deps-used.outputs.key != steps.deps.outputs.cache-matched-key
+  #       uses: actions/cache/save@v5
+  #       with:
+  #         path: .cache/deps
+  #         key: ${{ steps.deps-used.outputs.key }}
+  #     # every test through qemu-ppc64le (the preset's emulator and QEMU_LD_PREFIX), the recompiler's included: the
+  #     # LLVM backend's PowerPC code against the C templates (llvm_differential), linked by link_elf.c and loaded
+  #     - name: Test under qemu-user
+  #       run: ctest --preset linux-ppc64le-cross --parallel "$(getconf _NPROCESSORS_ONLN)"
 
   appimage:
     name: Linux AppImage (${{ matrix.arch }})
@@ -240,12 +336,11 @@ jobs:
           217ff68aafe085d2d4ab34a50e267805af43736ad8ef880c01ef88e52db8589f  /usr/local/bin/get-debloated-pkgs
           86afbf5045b78020c93fcd35bf0f642765a8dc339bb2dce534a0461ce3d3508d  /usr/local/bin/make-aur-package
           EOF
-      # llvm for the recompiler, libgccjit for its --backend=gcc; quick-sharun bundles the libLLVM and libgccjit the
-      # runtime links, with their own dependencies. GNU as and ld, which --backend=gcc runs, stay the system's
+      # llvm for the recompiler; quick-sharun bundles the libLLVM the runtime links, with its own dependencies
       - name: Install the build tools and the debloated Mesa
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl clang llvm libgccjit sdl3 libx11 mesa vulkan-icd-loader ccache glslang && break
+            pacman -Syu --noconfirm --needed cmake ninja make patch nasm perl python clang llvm sdl3 libx11 mesa vulkan-icd-loader ccache glslang && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
@@ -357,15 +452,9 @@ jobs:
             mingw-w64-clang-x86_64-python
             mingw-w64-clang-x86_64-spirv-tools
             mingw-w64-clang-x86_64-ccache
-            mingw-w64-ucrt-x86_64-libgccjit
-            mingw-w64-ucrt-x86_64-binutils
       - name: Check required dependencies
         run: |
           set -euo pipefail
-          # libgccjit and the binutils it runs come from UCRT64 (CLANG64 has no libgccjit), after CLANG64's on PATH
-          echo 'PATH="$PATH:/ucrt64/bin"' > /etc/profile.d/zz-ucrt64.sh
-          test -f /ucrt64/include/libgccjit.h
-          test -f /ucrt64/lib/libgccjit.dll.a
           clang --version
           llvm-config --version
           test -f "$(llvm-config --includedir)/llvm-c/Core.h"
@@ -379,9 +468,6 @@ jobs:
       - name: Build the runtime and pinned dependencies
         run: |
           set -euo pipefail
-          # libgccjit.h alone: UCRT64's include folder is another C runtime's headers too
-          mkdir -p build/gccjit-include
-          cp /ucrt64/include/libgccjit.h build/gccjit-include/
           cmake --preset default \
             -DSNX_LLVM_CONFIG="$(cygpath -m "$(command -v llvm-config)")" \
             -DSNX_FFMPEG_SH="$(cygpath -m /usr/bin/sh.exe)" \
@@ -389,8 +475,6 @@ jobs:
             -DPERL_EXECUTABLE="$(cygpath -m /usr/bin/perl.exe)" \
             -DSNX_OPENSSL_MAKE="$(cygpath -m /usr/bin/make.exe)" \
             -DCMAKE_DISABLE_FIND_PACKAGE_SDL3=ON -DSNX_DEPLOY=OFF \
-            -DSNX_GCCJIT_INCLUDE_DIR="$(cygpath -m "$PWD/build/gccjit-include")" \
-            -DSNX_GCCJIT_LIBRARY="$(cygpath -m /ucrt64/lib/libgccjit.dll.a)" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build --preset default --parallel "$(getconf _NPROCESSORS_ONLN)"
           cmake --install build/default --prefix stage
@@ -441,8 +525,6 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # --backend=gcc assembles and links with these, beside the runtime (gccjit/jit_units.c)
-          cp /ucrt64/bin/as.exe /ucrt64/bin/ld.exe stage/bin/
           # Follow imports recursively so the artifact works without MSYS2 on PATH.
           # Windows system DLLs are supplied by Windows, never copied from the runner.
           binaries=(stage/bin/*.exe stage/bin/*.dll)
@@ -450,7 +532,6 @@ jobs:
             imports=$(llvm-objdump -p "${binaries[i]}")
             while IFS= read -r dll; do
               source="$MINGW_PREFIX/bin/$dll"
-              [[ -f "$source" ]] || source="/ucrt64/bin/$dll" # libgccjit's and binutils'
               destination="stage/bin/$dll"
               if [[ -f "$source" && ! -f "$destination" ]]; then
                 cp "$source" "$destination"
@@ -460,7 +541,6 @@ jobs:
           done
           mkdir -p stage/share/licenses/msys2
           cp -R "$MINGW_PREFIX/share/licenses/." stage/share/licenses/msys2/
-          cp -R /ucrt64/share/licenses/. stage/share/licenses/msys2/
           pacman -Q > stage/share/licenses/msys2/build-packages.txt
       - name: Check the artifact without the toolchain on PATH
         shell: pwsh
@@ -475,17 +555,13 @@ jobs:
           path: stage
           if-no-files-found: error
 
-  # The Android app (docs/ANDROID.md): each ABI on a runner of its own, with the runner's Gradle and JDK. LLVM's
-  # libraries for the ABI take most of an hour, so they are kept until the script that builds them changes. Each job
-  # packs an APK of its ABI; android-apk packs one holding both
+  # The Android app (docs/ANDROID.md), both ABIs on one runner, with the runner's Gradle and JDK. LLVM's libraries for an
+  # ABI take most of an hour, so they are kept until the script that builds them changes (both cold: about two hours).
+  # Each ABI packs an APK of its own, then one APK holds both
   android:
-    name: Android (${{ matrix.abi }})
+    name: Android APK
     runs-on: ubuntu-26.04
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        abi: [x86_64, arm64-v8a]
+    timeout-minutes: 240
     env:
       ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/28.2.13676358
     steps:
@@ -500,12 +576,17 @@ jobs:
       - uses: actions/cache@v5
         with:
           path: .cache/cpm
-          key: cpm-${{ github.job }}-${{ matrix.abi }}-${{ hashFiles('cmake/dependencies.cmake') }}
+          key: cpm-${{ github.job }}-${{ hashFiles('cmake/dependencies.cmake') }}
       - uses: actions/cache@v5
-        id: llvm
+        id: llvm-x86_64
         with:
-          path: android-llvm/${{ matrix.abi }}
-          key: android-llvm-${{ matrix.abi }}-${{ hashFiles('scripts/android-llvm.sh') }}-${{ env.ANDROID_NDK_ROOT }}
+          path: android-llvm/x86_64
+          key: android-llvm-x86_64-${{ hashFiles('scripts/android-llvm.sh') }}-${{ env.ANDROID_NDK_ROOT }}
+      - uses: actions/cache@v5
+        id: llvm-arm64
+        with:
+          path: android-llvm/arm64-v8a
+          key: android-llvm-arm64-v8a-${{ hashFiles('scripts/android-llvm.sh') }}-${{ env.ANDROID_NDK_ROOT }}
       # The NDK named above, which the runner's image may no longer carry, and NASM for FFmpeg's x86-64 assembly.
       # sdkmanager's download sometimes ends early ("Premature EOF"): tried 3 times, 5 s apart
       - name: Install the NDK and NASM
@@ -516,22 +597,25 @@ jobs:
             sleep 5
           done
           sudo apt-get update && sudo apt-get install -y nasm ccache spirv-tools
-      - name: Build LLVM's libraries
-        if: steps.llvm.outputs.cache-hit != 'true'
-        run: scripts/android-llvm.sh ${{ matrix.abi }} "$PWD/android-llvm/${{ matrix.abi }}"
-      # ccache, set up as in the linux job
+      - name: Build LLVM's libraries for x86_64
+        if: steps.llvm-x86_64.outputs.cache-hit != 'true'
+        run: scripts/android-llvm.sh x86_64 "$PWD/android-llvm/x86_64"
+      - name: Build LLVM's libraries for arm64-v8a
+        if: steps.llvm-arm64.outputs.cache-hit != 'true'
+        run: scripts/android-llvm.sh arm64-v8a "$PWD/android-llvm/arm64-v8a"
+      # ccache, set up as in the linux job: one for both ABIs, which compile apart
       - uses: actions/cache/restore@v5
         with:
           path: .cache/ccache
-          key: ccache-${{ github.job }}-${{ matrix.abi }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ccache-${{ github.job }}-${{ matrix.abi }}-
+          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ github.job }}-
       # the dependency builds, as in the linux job
       - uses: actions/cache/restore@v5
         id: deps
         with:
           path: .cache/deps
-          key: deps-${{ github.job }}-${{ matrix.abi }}-${{ github.run_id }}
-          restore-keys: deps-${{ github.job }}-${{ matrix.abi }}-
+          key: deps-${{ github.job }}-${{ github.run_id }}
+          restore-keys: deps-${{ github.job }}-
       - name: Set up the caches
         shell: bash
         run: |
@@ -545,12 +629,30 @@ jobs:
             echo "SNX_DEPS_CACHE=$ws/.cache/deps"
             echo "SNX_CCACHE_START=$(date +%s)"
           } >> "$GITHUB_ENV"
-      - name: Build the native libraries and the APK
+      # One key signs every APK, so each installs over the one before (docs/ANDROID.md): the ANDROID_KEYSTORE secret, a
+      # keystore in base64. A fork's pull request has no secrets: its APKs carry the runner's own debug key, said here
+      - name: The signing key
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
         run: |
-          JAVA_HOME=$JAVA_HOME_21_X64 scripts/android-apk.sh "$PWD/build/android" "$PWD/android-llvm" \
-            ${{ matrix.abi }} -- \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cp build/android/stage/gradle/outputs/apk/debug/ScarletNX-debug.apk ScarletNX-android-${{ matrix.abi }}-${{ steps.commit.outputs.short }}.apk
+          if [ -n "$KEYSTORE" ]; then
+            printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/scarletnx.keystore"
+            echo "SNX_ANDROID_KEYSTORE=$RUNNER_TEMP/scarletnx.keystore" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No ANDROID_KEYSTORE secret: the runner's own debug key signs this APK, so it does not" \
+              "install over one the repository's key signed"
+          fi
+      # each ABI in a tree and stage of its own, so its APK holds it alone
+      - name: Build each ABI's native libraries and APK
+        env:
+          SNX_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          for abi in x86_64 arm64-v8a; do
+            JAVA_HOME=$JAVA_HOME_21_X64 scripts/android-apk.sh "$PWD/build/android-$abi" "$PWD/android-llvm" "$abi" -- \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            cp "build/android-$abi/stage/gradle/outputs/apk/debug/ScarletNX-debug.apk" \
+              "ScarletNX-android-$abi-${{ steps.commit.outputs.short }}.apk"
+          done
       - name: Trim the compiler cache
         run: |
           ccache --show-stats --verbose
@@ -560,56 +662,51 @@ jobs:
       - uses: actions/cache/save@v5
         with:
           path: .cache/ccache
-          key: ccache-${{ github.job }}-${{ matrix.abi }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Name the dependency builds
         id: deps-used
         run: |
           used=$(find build -path '*/snx-deps/*.dir' -exec cat {} + | sort -u)
           for d in .cache/deps/*; do grep -qxF "${d##*/}" <<<"$used" || rm -rf "$d"; done
-          echo "key=deps-${{ github.job }}-${{ matrix.abi }}-$(sha256sum <<<"$used" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "key=deps-${{ github.job }}-$(sha256sum <<<"$used" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - if: steps.deps-used.outputs.key != steps.deps.outputs.cache-matched-key
         uses: actions/cache/save@v5
         with:
           path: .cache/deps
           key: ${{ steps.deps-used.outputs.key }}
-      # Not zipped: the artifact is the APK itself, named after it
-      - uses: actions/upload-artifact@v7
-        with:
-          path: ScarletNX-android-${{ matrix.abi }}-${{ steps.commit.outputs.short }}.apk
-          archive: false
-          if-no-files-found: error
-      # What android-apk packs: the libraries, SDL's Java and the icon, without this APK's Gradle output
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ScarletNX-android-${{ matrix.abi }}-${{ steps.commit.outputs.short }}-stage
-          path: |
-            build/android/stage
-            !build/android/stage/gradle
-          if-no-files-found: error
-
-  android-apk:
-    name: Android APK
-    needs: android
-    runs-on: ubuntu-26.04
-    timeout-minutes: 20
-    steps:
-      # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
-      - name: Name the commit
-        id: commit
-        shell: bash
-        env:
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: ScarletNX-android-*-${{ steps.commit.outputs.short }}-stage
-          merge-multiple: true
-          path: stage
+      # both ABIs' libraries, SDL's Java and the icon in one stage, without each APK's Gradle output
       - name: Pack the APK of both ABIs
+        env:
+          SNX_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
-          JAVA_HOME=$JAVA_HOME_21_X64 gradle -p dist/android assembleDebug -Pscarletnx.stage="$PWD/stage"
+          mkdir stage
+          for abi in x86_64 arm64-v8a; do cp -a "build/android-$abi/stage/." stage/; done
+          rm -rf stage/gradle
+          JAVA_HOME=$JAVA_HOME_21_X64 gradle -p dist/android assembleDebug -Pscarletnx.stage="$PWD/stage" \
+            ${SNX_ANDROID_KEYSTORE:+"-Pscarletnx.keystore=$SNX_ANDROID_KEYSTORE"}
           cp stage/gradle/outputs/apk/debug/ScarletNX-debug.apk ScarletNX-android-universal-${{ steps.commit.outputs.short }}.apk
+      # the certificate it carries, in the log; with the repository's key, the one ANDROID_CERT_SHA256 (a variable) names
+      - name: Check the APK's signer
+        env:
+          EXPECTED: ${{ vars.ANDROID_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          apk=ScarletNX-android-universal-${{ steps.commit.outputs.short }}.apk
+          apksigner=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner
+          "$apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/certs.txt"
+          # "Signer #1 certificate ...", "V2 Signer: certificate ..." (apksigner 37) or, for a signer of some SDK
+          # versions, "Signer (minSdkVersion=...) certificate ..."
+          cert=$(sed -n -E 's/^(V[0-9.]+ )?Signer[^:]*:? certificate SHA-256 digest: //p' "$RUNNER_TEMP/certs.txt" |
+                 sort -u)
+          if [ -z "$cert" ] || [ "$(wc -l <<< "$cert")" != 1 ]; then
+            echo "::error::apksigner names no one certificate of $apk"
+            exit 1
+          fi
+          echo "signed by the certificate of SHA-256 $cert"
+          if [ -n "${SNX_ANDROID_KEYSTORE:-}" ] && [ -n "$EXPECTED" ] && [ "$cert" != "$EXPECTED" ]; then
+            echo "::error::signed by $cert, not the repository's key ($EXPECTED)"
+            exit 1
+          fi
       # A library that needs one Android 5.0 lacks fails to load there, and the app with it
       - name: Check the APK's libraries
         run: |
@@ -619,7 +716,7 @@ jobs:
           mkdir apk && unzip -q "$apk" 'lib/*' -d apk
           system=" libc.so libm.so libdl.so liblog.so libandroid.so libz.so libEGL.so libGLESv1_CM.so libGLESv2.so libOpenSLES.so "
           for abi in x86_64 arm64-v8a; do
-            for lib in libmain.so libscarletnx.so libscarletnx-run.so libhactool.so; do
+            for lib in libmain.so libscarletnx.so libscarletnx-run.so; do
               test -f "apk/lib/$abi/$lib" || { echo "$abi has no $lib" >&2; exit 1; }
               for needed in $("$readelf" -d "apk/lib/$abi/$lib" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
                 [[ "$system" == *" $needed "* || -f "apk/lib/$abi/$needed" ]] ||
@@ -632,132 +729,33 @@ jobs:
           path: ScarletNX-android-universal-${{ steps.commit.outputs.short }}.apk
           archive: false
           if-no-files-found: error
-
-  # macOS and iOS (docs/APPLE.md), on Apple silicon with Xcode's Clang and SDKs; FFmpeg, OpenSSL and SDL3 are built from
-  # the pinned sources as everywhere. Until both have built green once, a failure here does not fail the run
-  # (continue-on-error), which would hold back the nightly: they are new, and no Mac checked them before CI. Each app
-  # carries Ryujinx's MoltenVK (V380-Ori/Ryujinx.MoltenVK): mainline's lacks patches emulators' pipelines need. The
-  # release's tar, its SHA-256 the one GitHub lists for it
-  macos:
-    name: macOS (arm64)
-    runs-on: macos-26
-    timeout-minutes: 150
-    continue-on-error: true
-    env:
-      MOLTENVK_RELEASE: v1.4.1-ryujinx
-      MOLTENVK_SHA256: ea1c633808d0a61e86ee35af4bdc280f5f07f95633b95935f3e695dc5226e640
-    steps:
-      # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
-      - name: Name the commit
-        id: commit
-        shell: bash
-        env:
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v7
-      - uses: actions/cache@v5
-        with:
-          path: .cache/cpm
-          key: cpm-${{ github.job }}-${{ hashFiles('cmake/dependencies.cmake') }}
-      # LLVM's libraries for the Mac (scripts/apple-llvm.sh) with AArch64's code generator alone, the one the recompiler
-      # uses, built once per script and Xcode as the iOS job's. Saved as soon as they are built: actions/cache saves
-      # only a job that succeeds, and a later step's failure would build them again next run. Xcode's Clang builds
-      # everything, as a user's Mac does
-      - name: Name the Xcode
-        id: xcode
-        run: echo "version=$(xcodebuild -version | tr '\n' ' ' | tr -s ' ' '-')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v5
-        id: llvm
-        with:
-          path: apple-llvm
-          key: macos-llvm-${{ hashFiles('scripts/apple-llvm.sh') }}-${{ steps.xcode.outputs.version }}
-      - name: Install tools
-        run: brew install ninja ccache
-      - name: Build LLVM's libraries
-        if: steps.llvm.outputs.cache-hit != 'true'
-        run: scripts/apple-llvm.sh macos "$PWD/apple-llvm"
-      - if: steps.llvm.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: apple-llvm
-          key: ${{ steps.llvm.outputs.cache-primary-key }}
-      # ccache and the dependency builds, set up as in the linux job
-      - uses: actions/cache/restore@v5
-        with:
-          path: .cache/ccache
-          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ccache-${{ github.job }}-
-      - uses: actions/cache/restore@v5
-        id: deps
-        with:
-          path: .cache/deps
-          key: deps-${{ github.job }}-${{ github.run_id }}
-          restore-keys: deps-${{ github.job }}-
-      - name: Set up the caches
-        run: |
-          {
-            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.cache/ccache"
-            echo "CCACHE_BASEDIR=$GITHUB_WORKSPACE"
-            echo "CCACHE_NOHASHDIR=true"
-            echo "SNX_DEPS_CACHE=$GITHUB_WORKSPACE/.cache/deps"
-            echo "SNX_CCACHE_START=$(date +%s)"
-          } >> "$GITHUB_ENV"
-      - name: Build the runtime
-        run: |
-          cmake --preset macos -DLLVM_DIR="$PWD/apple-llvm/lib/cmake/llvm" \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          cmake --build --preset macos --parallel "$(getconf _NPROCESSORS_ONLN)"
-          cmake --install build/macos --prefix stage
-      - name: Trim the compiler cache
-        run: |
-          ccache --show-stats --verbose
-          ccache --evict-older-than "$(( $(date +%s) - SNX_CCACHE_START ))s"
-          ccache --zero-stats
-          du -sh "$CCACHE_DIR"
-      - uses: actions/cache/save@v5
-        with:
-          path: .cache/ccache
-          key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Name the dependency builds
-        id: deps-used
-        run: |
-          used=$(find build -path '*/snx-deps/*.dir' -exec cat {} + | sort -u)
-          for d in .cache/deps/*; do grep -qxF "${d##*/}" <<<"$used" || rm -rf "$d"; done
-          echo "key=deps-${{ github.job }}-$(shasum -a 256 <<<"$used" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-      - if: steps.deps-used.outputs.key != steps.deps.outputs.cache-matched-key
-        uses: actions/cache/save@v5
-        with:
-          path: .cache/deps
-          key: ${{ steps.deps-used.outputs.key }}
-      - name: Check the ABI helpers compile
-        run: clang -fsyntax-only -Wall -fno-strict-aliasing -fwrapv -I src src/common/cpu/aarch64/cpu_helpers.c
-      - name: Test native tooling and indexed filesystems
-        run: ctest --test-dir build/macos --output-on-failure --parallel 4
-      - name: Fetch MoltenVK
-        run: |
-          curl -fL -o moltenvk.tar \
-            "https://github.com/V380-Ori/Ryujinx.MoltenVK/releases/download/$MOLTENVK_RELEASE/MoltenVK-macos.tar"
-          echo "$MOLTENVK_SHA256  moltenvk.tar" | shasum -a 256 -c
-          mkdir moltenvk && tar -xf moltenvk.tar -C moltenvk
-      # ditto keeps the app's links and its signature, which zip would not
-      - name: Make the app
-        run: |
-          scripts/apple-app.sh macos stage app moltenvk
-          ditto -c -k --keepParent app/ScarletNX.app ScarletNX-macos-arm64-${{ steps.commit.outputs.short }}.zip
+      # Not zipped: each artifact is an APK itself, named after it
       - uses: actions/upload-artifact@v7
         with:
-          path: ScarletNX-macos-arm64-${{ steps.commit.outputs.short }}.zip
+          path: ScarletNX-android-x86_64-${{ steps.commit.outputs.short }}.apk
+          archive: false
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          path: ScarletNX-android-arm64-v8a-${{ steps.commit.outputs.short }}.apk
           archive: false
           if-no-files-found: error
 
-  ios:
-    name: iOS (arm64)
+  # macOS and iOS (docs/APPLE.md), both on one Apple silicon runner with Xcode's Clang and SDKs; FFmpeg, OpenSSL and
+  # SDL3 are built from the pinned sources as everywhere. Until both have built green once, a failure here does not
+  # fail the run (continue-on-error), which would hold back the nightly: they are new, and no Mac checked them before
+  # CI. iOS builds even when macOS failed, and each one's app is made from its own build alone. Each app carries
+  # Ryujinx's MoltenVK (V380-Ori/Ryujinx.MoltenVK): mainline's lacks patches emulators' pipelines need. The release's
+  # tars, their SHA-256 the ones GitHub lists for them
+  apple:
+    name: macOS and iOS (arm64)
     runs-on: macos-26
-    timeout-minutes: 150
+    timeout-minutes: 240
     continue-on-error: true
     env:
       MOLTENVK_RELEASE: v1.4.1-ryujinx
-      MOLTENVK_SHA256: 7cec48d4e73cf9eb89b60e8596758900caaf8398c49ae8abe4544295fb7e0c84
+      MOLTENVK_MACOS_SHA256: ea1c633808d0a61e86ee35af4bdc280f5f07f95633b95935f3e695dc5226e640
+      MOLTENVK_IOS_SHA256: 7cec48d4e73cf9eb89b60e8596758900caaf8398c49ae8abe4544295fb7e0c84
     steps:
       # Artifacts carry the commit they came from: the branch's head in a pull request, else the commit pushed
       - name: Name the commit
@@ -771,39 +769,59 @@ jobs:
         with:
           path: .cache/cpm
           key: cpm-${{ github.job }}-${{ hashFiles('cmake/dependencies.cmake') }}
-      # LLVM's libraries for iOS (scripts/apple-llvm.sh) with AArch64's code generator alone, built once per script and
-      # Xcode as Android's per NDK, and saved as soon as they are built (see the macos job)
+      # LLVM's libraries for each (scripts/apple-llvm.sh) with AArch64's code generator alone, the one the recompiler
+      # uses, built once per script and Xcode. Saved as soon as they are built: actions/cache saves only a job that
+      # succeeds, and a later step's failure would build them again next run. Xcode's Clang builds everything, as a
+      # user's Mac does
       - name: Name the Xcode
         id: xcode
         run: echo "version=$(xcodebuild -version | tr '\n' ' ' | tr -s ' ' '-')" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v5
-        id: llvm
+        id: macos-llvm
+        with:
+          path: apple-llvm
+          key: macos-llvm-${{ hashFiles('scripts/apple-llvm.sh') }}-${{ steps.xcode.outputs.version }}
+      - uses: actions/cache/restore@v5
+        id: ios-llvm
         with:
           path: ios-llvm
           key: ios-llvm-${{ hashFiles('scripts/apple-llvm.sh') }}-${{ steps.xcode.outputs.version }}
       - name: Install tools
         run: brew install ninja ccache
-      - name: Build LLVM's libraries
-        if: steps.llvm.outputs.cache-hit != 'true'
+      - name: Build LLVM's libraries for macOS
+        id: macos-llvm-build
+        if: steps.macos-llvm.outputs.cache-hit != 'true'
+        run: scripts/apple-llvm.sh macos "$PWD/apple-llvm"
+      - if: steps.macos-llvm.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: apple-llvm
+          key: ${{ steps.macos-llvm.outputs.cache-primary-key }}
+      - name: Build LLVM's libraries for iOS
+        id: ios-llvm-build
+        if: ${{ !cancelled() && steps.ios-llvm.outputs.cache-hit != 'true' }}
         run: scripts/apple-llvm.sh ios "$PWD/ios-llvm"
-      - if: steps.llvm.outputs.cache-hit != 'true'
+      - if: ${{ !cancelled() && steps.ios-llvm.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v5
         with:
           path: ios-llvm
-          key: ${{ steps.llvm.outputs.cache-primary-key }}
-      # ccache and the dependency builds, set up as in the linux job
+          key: ${{ steps.ios-llvm.outputs.cache-primary-key }}
+      # ccache and the dependency builds, set up as in the linux job: one of each for both, which compile apart
       - uses: actions/cache/restore@v5
+        if: ${{ !cancelled() }}
         with:
           path: .cache/ccache
           key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-${{ github.job }}-
       - uses: actions/cache/restore@v5
+        if: ${{ !cancelled() }}
         id: deps
         with:
           path: .cache/deps
           key: deps-${{ github.job }}-${{ github.run_id }}
           restore-keys: deps-${{ github.job }}-
       - name: Set up the caches
+        if: ${{ !cancelled() }}
         run: |
           {
             echo "CCACHE_DIR=$GITHUB_WORKSPACE/.cache/ccache"
@@ -812,46 +830,81 @@ jobs:
             echo "SNX_DEPS_CACHE=$GITHUB_WORKSPACE/.cache/deps"
             echo "SNX_CCACHE_START=$(date +%s)"
           } >> "$GITHUB_ENV"
-      - name: Build the app
+      - name: Build the runtime for macOS
+        id: macos-build
+        if: ${{ !cancelled() && steps.macos-llvm-build.outcome != 'failure' }}
+        run: |
+          cmake --preset macos -DLLVM_DIR="$PWD/apple-llvm/lib/cmake/llvm" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build --preset macos --parallel "$(getconf _NPROCESSORS_ONLN)"
+          cmake --install build/macos --prefix stage-macos
+      - name: Build the app for iOS
+        id: ios-build
+        if: ${{ !cancelled() && steps.ios-llvm-build.outcome != 'failure' }}
         run: |
           cmake --preset ios -DLLVM_DIR="$PWD/ios-llvm/lib/cmake/llvm" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build --preset ios --parallel "$(getconf _NPROCESSORS_ONLN)"
-          cmake --install build/ios --prefix stage
+          cmake --install build/ios --prefix stage-ios
       - name: Trim the compiler cache
+        if: ${{ !cancelled() }}
         run: |
           ccache --show-stats --verbose
           ccache --evict-older-than "$(( $(date +%s) - SNX_CCACHE_START ))s"
           ccache --zero-stats
           du -sh "$CCACHE_DIR"
       - uses: actions/cache/save@v5
+        if: ${{ !cancelled() }}
         with:
           path: .cache/ccache
           key: ccache-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Name the dependency builds
+        if: ${{ !cancelled() }}
         id: deps-used
         run: |
           used=$(find build -path '*/snx-deps/*.dir' -exec cat {} + | sort -u)
           for d in .cache/deps/*; do grep -qxF "${d##*/}" <<<"$used" || rm -rf "$d"; done
           echo "key=deps-${{ github.job }}-$(shasum -a 256 <<<"$used" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-      - if: steps.deps-used.outputs.key != steps.deps.outputs.cache-matched-key
+      - if: ${{ !cancelled() && steps.deps-used.outputs.key != steps.deps.outputs.cache-matched-key }}
         uses: actions/cache/save@v5
         with:
           path: .cache/deps
           key: ${{ steps.deps-used.outputs.key }}
-      - name: Fetch MoltenVK
+      - name: Check the ABI helpers compile
+        if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
+        run: clang -fsyntax-only -Wall -fno-strict-aliasing -fwrapv -I src src/common/cpu/aarch64/cpu_helpers.c
+      - name: Test native tooling and indexed filesystems
+        if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
+        run: ctest --test-dir build/macos --output-on-failure --parallel 4
+      # ditto keeps the app's links and its signature, which zip would not
+      - name: Make the macOS app
+        if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
         run: |
-          curl -fL -o moltenvk.tar \
-            "https://github.com/V380-Ori/Ryujinx.MoltenVK/releases/download/$MOLTENVK_RELEASE/MoltenVK-ios.tar"
-          echo "$MOLTENVK_SHA256  moltenvk.tar" | shasum -a 256 -c
-          mkdir moltenvk && tar -xf moltenvk.tar -C moltenvk
+          curl -fL -o moltenvk-macos.tar \
+            "https://github.com/V380-Ori/Ryujinx.MoltenVK/releases/download/$MOLTENVK_RELEASE/MoltenVK-macos.tar"
+          echo "$MOLTENVK_MACOS_SHA256  moltenvk-macos.tar" | shasum -a 256 -c
+          mkdir moltenvk-macos && tar -xf moltenvk-macos.tar -C moltenvk-macos
+          scripts/apple-app.sh macos stage-macos app-macos moltenvk-macos
+          ditto -c -k --keepParent app-macos/ScarletNX.app ScarletNX-macos-arm64-${{ steps.commit.outputs.short }}.zip
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
+        with:
+          path: ScarletNX-macos-arm64-${{ steps.commit.outputs.short }}.zip
+          archive: false
+          if-no-files-found: error
       # Unsigned: AltStore, SideStore or a developer account sign it for the device it goes on, with
       # dist/apple/ScarletNX.entitlements
       - name: Make the IPA
+        if: ${{ !cancelled() && steps.ios-build.outcome == 'success' }}
         run: |
-          scripts/apple-app.sh ios stage app moltenvk
-          mv app/ScarletNX.ipa ScarletNX-ios-arm64-${{ steps.commit.outputs.short }}.ipa
+          curl -fL -o moltenvk-ios.tar \
+            "https://github.com/V380-Ori/Ryujinx.MoltenVK/releases/download/$MOLTENVK_RELEASE/MoltenVK-ios.tar"
+          echo "$MOLTENVK_IOS_SHA256  moltenvk-ios.tar" | shasum -a 256 -c
+          mkdir moltenvk-ios && tar -xf moltenvk-ios.tar -C moltenvk-ios
+          scripts/apple-app.sh ios stage-ios app-ios moltenvk-ios
+          mv app-ios/ScarletNX.ipa ScarletNX-ios-arm64-${{ steps.commit.outputs.short }}.ipa
       - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && steps.ios-build.outcome == 'success' }}
         with:
           path: ScarletNX-ios-arm64-${{ steps.commit.outputs.short }}.ipa
           archive: false
@@ -886,7 +939,6 @@ jobs:
           name: ScarletNX-linux-${{ matrix.arch }}-${{ steps.commit.outputs.short }}.AppImage
           path: dist
       # Artifacts drop the executable bit
-      # --backend=gcc runs the AppImage's own as and ld: check-package.sh leaves the runner's binutils off PATH
       - name: Run the AppImage as a user would
         run: |
           chmod +x dist/*.AppImage
@@ -916,7 +968,6 @@ jobs:
         with:
           name: ScarletNX-windows-x86_64-${{ steps.commit.outputs.short }}
           path: package
-      # --backend=gcc with the zip's libgccjit, as and ld: check-package.sh leaves any binutils of the runner off PATH
       - name: Run the zip's scarletnx.exe as a user would
         run: bash source/scripts/check-package.sh package/bin/scarletnx.exe
 
@@ -948,7 +999,7 @@ jobs:
       - name: Install the runtime's libraries and lavapipe
         run: |
           for try in 1 2 3; do
-            pacman -Syu --noconfirm --needed python llvm-libs libgccjit sdl3 vulkan-icd-loader vulkan-swrast spirv-tools && break
+            pacman -Syu --noconfirm --needed python llvm-libs sdl3 vulkan-icd-loader vulkan-swrast spirv-tools && break
             [ "$try" = 3 ] && exit 1
             sleep 5
           done
@@ -1018,7 +1069,7 @@ jobs:
     if: >-
       !cancelled() && github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository
-    needs: [linux, appimage, windows, android-apk, macos, ios, edenprobe]
+    needs: [linux, appimage, windows, android, apple, edenprobe]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:

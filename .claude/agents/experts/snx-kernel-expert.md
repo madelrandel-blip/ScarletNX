@@ -13,7 +13,7 @@ object the emulation keeps needs host locking.
   `sync.c` mutexes, condition variables, arbitration, `WaitSynchronization`; `ipc.c`; `debug.c`; `kernel_int.h`),
   `src/nx/hle/svc/` (`svc.c` dispatch, `svc_mem.c` memory SVCs and `GetInfo`), `src/nx/memory/mem.c`, and
   `src/nx/runtime/platform/plat_posix.c` and `plat_win32.c` for host threads, locks, time and memory.
-- `g_klock` (`kernel.h`) is the kernel lock: every list a waiter or signaller touches is under it. Functions named
+- `g_hle.kernel.klock` (`hle/hle.h`, declared in `kernel_int.h`) is the kernel lock: every list a waiter or signaller touches is under it. Functions named
   `*_nl` expect it held.
 - Tests: `kernel_mutex`, `kernel_cores`, `memory_accounting` (`ctest --preset default -R NAME`). Behavior the game
   depends on is checked by running it (`snx-run`), and a hang by its `threads.txt` (`snx-crash`).

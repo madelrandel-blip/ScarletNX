@@ -25,6 +25,15 @@ SnxSplashDrawing* snx_splash_open(const SnxSplashSvg* svg);
 int snx_splash_draw(const SnxSplashDrawing* drawing, int side, void* pixels, int stride);
 void snx_splash_close(SnxSplashDrawing* drawing);
 
+/* the drawing named name (its file's, without .svg) filling a side x side square over white, as a JPEG of the
+   quality given (1 to 100), handed out through write in pieces; 0 when written */
+typedef void (*SnxSplashWrite)(void* closure, void* data, int size);
+int snx_splash_jpeg(const char* name, int side, int quality, SnxSplashWrite write, void* closure);
+
+/* a user's picture filling a side x side square of pixels, ARGB8888 with the alpha premultiplied, stride bytes a row:
+   the middle square of the JPEG (size bytes), or with none Wimsy in Fuddles' colours over white, as acc gives a game.
+   round: cut to the circle the square holds, the rest transparent. 0 when drawn; 1 for a JPEG that does not decode */
+int snx_splash_picture(const void* jpeg, size_t size, int side, int round, void* pixels, int stride);
 #ifdef __cplusplus
 }
 #endif

@@ -17,7 +17,7 @@ interface nn::settings::ISettingsServer is set {
     [5] GetAvailableLanguageCodes2(array<nn::settings::LanguageCode, 6> codes) -> i32 count;
     [6] GetAvailableLanguageCodeCount2() -> i32 count;
     [7] GetKeyCodeMap(buffer<nn::kpr::KeyCodeMap, 0x16> map);
-    @stub [8] GetQuestFlag() -> b8 quest;
+    [8] GetQuestFlag() -> b8 quest;
     [9] GetKeyCodeMap2(buffer<nn::kpr::KeyCodeMap, 0x16> map);
     [11] GetDeviceNickName(buffer<nn::settings::system::DeviceNickName, 0x16> name);
 }
@@ -25,13 +25,27 @@ interface nn::settings::ISettingsServer is set {
 interface nn::settings::ISystemSettingsServer is set:sys {
     [3] GetFirmwareVersion(buffer<nn::settings::system::FirmwareVersion, 0x1a> version);
     [4] GetFirmwareVersion2(buffer<nn::settings::system::FirmwareVersion, 0x1a> version);
-    @stub [23] GetColorSetId() -> i32 id;
+    # the settings below are kept for the run, from the console's defaults
+    [7] GetLockScreenFlag() -> b8 flag;
+    [8] SetLockScreenFlag(b8 flag);
+    [23] GetColorSetId() -> i32 id;
+    [24] SetColorSetId(i32 id);
+    [35] GetVibrationMasterVolume() -> f32 volume;
+    [36] SetVibrationMasterVolume(f32 volume);
     # no setting is there: the size is 0, and the value an empty one
     @stub [37] GetSettingsItemValueSize(buffer<nn::settings::SettingsName, 0x19> name,
                                         buffer<nn::settings::SettingsItemKey, 0x19> key) -> u64 size;
     [38] GetSettingsItemValue(buffer<nn::settings::SettingsName, 0x19> name,
                               buffer<nn::settings::SettingsItemKey, 0x19> key, buffer<u8, 6> value) -> u64 size;
+    [45] GetSpeakerAutoMuteFlag() -> b8 flag;
+    [46] SetSpeakerAutoMuteFlag(b8 flag);
+    [47] GetQuestFlag() -> b8 flag;
+    [48] SetQuestFlag(b8 flag);
     @stub [62] GetDebugModeFlag() -> b8 debug;
     @stub [90] GetMiiAuthorId() -> nn::util::Uuid id;
     @stub [91] SetShutdownRtcValue(i64 value);
+    [99] GetBatteryPercentageFlag() -> b8 flag;
+    [100] SetBatteryPercentageFlag(b8 flag);
+    [136] GetKeyboardLayout() -> u32 layout;
+    [137] SetKeyboardLayout(u32 layout);
 }

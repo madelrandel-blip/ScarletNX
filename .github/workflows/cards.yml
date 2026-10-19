@@ -42,6 +42,12 @@ env:
   DISCORD_WEBHOOK_PRS: ${{ secrets.DISCORD_WEBHOOK_PRS }}
   DISCORD_WEBHOOK_ISSUES: ${{ secrets.DISCORD_WEBHOOK_ISSUES }}
 
+# one card at a time for each pull request, issue or commit: a card is drawn from what GitHub says now
+# (scripts/discord-cards.py), so of a burst of events (labels added one by one, a body edited twice) the run going and
+# the newest waiting draw it, and those between are dropped
+concurrency:
+  group: cards-${{ github.event.pull_request.number || github.event.issue.number || github.sha }}
+
 jobs:
   card:
     name: Draw the card

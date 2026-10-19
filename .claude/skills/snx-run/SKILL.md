@@ -66,6 +66,15 @@ The game's log, `games/<id>/<id>.log` in a checkout (a data folder keeps it in i
 - `threads.txt`, next to the game's log: every guest thread's state and wait, rewritten every 15 s. A hang is read from here.
 - `diag=1` in the game's `.ini` saves the QMD and program of each new compute shader (the first 32) to
   `games/<id>/captures/compute/`. F5 writes every game thread's state to the log at any time.
+- RenderDoc (installed by the user): `SNX_RENDERDOC=$SCRATCH/cap SNX_RENDERDOC_FRAMES=500,800` captures those
+  presents (one guest frame each; `45s` is the first frame after 45 s on the `--script` clock, steadier on a loaded machine) to `$SCRATCH/cap_capture*.rdc`, and the log says `renderdoc: captured present N`.
+  Run it with `SDL_VIDEO_DRIVER=x11`: RenderDoc has no Wayland surface, and on Wayland `vkCreateInstance` fails with
+  VK_ERROR_EXTENSION_NOT_PRESENT. The capture layer slows the game (to about 20 fps in one test), so pick presents the run
+  reaches, and expect a few hundred MB per capture. Captures hold the game's textures and buffers: they stay local.
+  A capture stops the GPU thread for seconds. A game that waits only 1 s for its frame fences and then goes on can
+  crash a little after a capture (one test game's arena deleter lists were overwritten): that crash is the capture's.
+  Replay from scripts with RenderDoc's Python module (not in the Arch package): build it from the same tag with
+  `-DENABLE_QRENDERDOC=OFF -DENABLE_PYRENDERDOC=ON` outside the repo and put its `lib/` on `sys.path`.
 
 Crash reports are handled with the `snx-crash` skill.
 

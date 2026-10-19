@@ -10,8 +10,8 @@ description: "Build the ScarletNX runtime and recompile games correctly, avoidin
 1. `cmake --preset default -B build && cmake --build build`, into `build/` as the docs have it (without `-B` the
    preset builds into `build/default`). The configure fetches the
    third-party packages (`cmake/dependencies.cmake`) into `.cache/cpm` the first time, so a fresh clone needs the
-   network once. They build in the same tree as the runtime: hactool from our own CMake script (`cmake/hactool.cmake`, since
-   its own is a Makefile), FFmpeg with its own configure and make run by `cmake/ffmpeg.cmake` (logs in
+   network once. They build in the same tree as the runtime: FFmpeg with its own configure and make run by
+   `cmake/ffmpeg.cmake` (logs in
    `build/ffmpeg_build-prefix/src/ffmpeg_build-stamp/`), the others through their CMake.
    Clang only: any other compiler stops the configure. FFmpeg is required by the NX runtime. Configure also stops when
    the FFmpeg source path (the checkout, or `CPM_SOURCE_CACHE`) has a space in it, since FFmpeg's configure can't
@@ -19,7 +19,8 @@ description: "Build the ScarletNX runtime and recompile games correctly, avoidin
    toolchain (llvm-mingw, CMake, Ninja, NASM, Python, and w64devkit for the sh and GNU make FFmpeg needs) into
    `deps\tools` once, and `. scripts\env.ps1` puts it on PATH in a new PowerShell window. Windows' default execution
    policy runs no scripts, so run `Set-ExecutionPolicy -Scope Process Bypass` in that window first.
-2. `build/hactool` is what `build/scarletnx -x Game.xci` runs (the driver builds that target when it is missing).
+2. hactool is ours, in the tree (`src/nx/runtime/driver/hactool`, built by `cmake/hactool.cmake`), and runs inside
+   `build/scarletnx -x Game.xci`.
 3. The build's last step copies the runtime to `games/<id>/<id>` for every `games/<id>/<id>_code.so`, and to
    `games/<Game>` for an older version's `games/<Game>_code.so` (`cmake/deploy.cmake`). That is the binary that runs.
    The build prints `Runtime deployed to ...` for each: no line means no game got the new runtime.
@@ -89,13 +90,13 @@ the files under `src/common/cpu/aarch64/helpers/`. Other runtime changes normall
 only checks `SNX_ABI`: a module built before an ABI change that kept it still loads and runs the old code, and a
 bump makes the runtime refuse every module built before it. A recompile of
 a large game takes several minutes. A successful recompile removes its temporary objects. `--keep-ir` keeps the
-generated code (LLVM IR, libgccjit dumps) in `<outdir>/<id>/<id>_build/` for inspection.
+generated code (LLVM IR) in `<outdir>/<id>/<id>_build/` for inspection.
 
 ```bash
 build/scarletnx -r work/<Game>             # runtime and game module, both with Clang, into games/<id>/
 ```
 
-`scarletnx -r` uses the LLVM backend (`--backend=gcc`, libgccjit, is for DEC Alpha EV67 hosts). Its objects aren't
+`scarletnx -r` uses the LLVM backend, the only one. Its objects aren't
 cached: each recompile builds every unit again. A change to `a64_templates.inc`
 needs the matching change in `src/common/cpu/recompiler/llvm/ir_*.c` (`snx-test-llvm-differential` finds the
 difference).
@@ -105,7 +106,7 @@ difference).
 A `CPMAddPackage` in `cmake/dependencies.cmake` with the release archive's URL (a tag, or a commit for projects
 without one) and its `URL_HASH SHA256=`. Get the hash from the release asset's digest (`gh api
 repos/OWNER/REPO/releases/tags/TAG --jq '.assets[].digest'`) or by downloading the archive once, never by trusting
-the next configure. Prefer `DOWNLOAD_ONLY` plus our own targets for projects without CMake (FFmpeg, hactool) or
+the next configure. Prefer `DOWNLOAD_ONLY` plus our own targets for projects without CMake (FFmpeg) or
 with a CMake too old for CMake 4, `EXCLUDE_FROM_ALL YES` for the rest (not `SYSTEM`: a system copy of the headers
 found through an `-I` in CFLAGS would win over `-isystem` ones; SDL3 on Windows is the one exception, since there is
 no system copy to collide with), and `snx_quiet(target...)` on what it
@@ -123,7 +124,7 @@ packages. Inside an AppImage argv[0] points into its mount: anything that finds 
 through `g_exedir`, which `main.c` takes from `$APPIMAGE`.
 
 `cmake --install` puts the license files in `share/licenses/scarletnx`: `LICENSE`, then a folder per library or
-ported code built into the runtime or hactool (those with no license file of their own, like Open Sans and
+ported code built into the runtime or the driver (those with no license file of their own, like Open Sans and
 Ryujinx's default Miis, from `dist/licenses/`). The AppImage copies that folder and adds the licenses of
 the Arch packages it bundles, with their list in `share/licenses/bundled-packages.txt`, and the CI artifacts are the
 install tree. A new package means a new `install(...)` line for its license in `CMakeLists.txt`.

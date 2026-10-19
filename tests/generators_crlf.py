@@ -17,9 +17,6 @@ TEXT = [
     'src/nx/gpu/vk/ui_spv.h',
     'src/nx/gpu/vk/shaders/ui.vert',
     'src/nx/gpu/vk/shaders/ui.frag',
-    'scripts/build-vic-shader.py',
-    'src/nx/gpu/video/vic.comp',
-    'src/nx/gpu/video/vic_spv.h',
 ]
 
 
@@ -30,7 +27,7 @@ def main():
             (copy / name).parent.mkdir(parents=True, exist_ok=True)
             (copy / name).write_bytes((ROOT / name).read_bytes().replace(b'\r\n', b'\n').replace(b'\n', b'\r\n'))
         shutil.copy(ROOT / 'dist/controls/controls.png', copy / 'dist/controls/controls.png')
-        for script in ('scripts/build-controls.py', 'scripts/build-ui-shaders.py', 'scripts/build-vic-shader.py'):
+        for script in ('scripts/build-controls.py', 'scripts/build-ui-shaders.py'):
             subprocess.run([sys.executable, str(copy / script), '--check'], check=True)
     print('the generators check a CR LF checkout as an LF one')
 

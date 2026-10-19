@@ -2,6 +2,12 @@
 <!-- Copyright 2026 the ScarletNX contributors -->
 # Android
 
+## Index
+
+* [Keys](#keys)
+* [Building](#building)
+  * [Signing](#signing)
+
 The app is the [GUI](GUI.md) and the runtime, each in SDL's activity (`dist/android`): the menu extracts and
 recompiles on the phone, then the game opens.
 
@@ -85,6 +91,25 @@ Gradle 9 (`GRADLE`, default `gradle`) and a JDK 17 or newer (`JAVA_HOME`). Extra
 `android-apk.sh` installs each build into `<out>/stage` (the libraries, SDL's Java classes and the icon), which
 `dist/android/build.gradle` packs with the two activities; Gradle's own output goes there too. The CI does the same
 on every push (`.github/workflows/build.yml`): an APK per ABI, and one holding both.
+
+### Signing
+
+Android installs an APK over the app it has only when the same key signed both. One key signs every APK of the
+repository's own builds, so each installs over the one before: the CI takes it from the `ANDROID_KEYSTORE` secret (a
+keystore in base64), its password, the keystore's and the key's, from `ANDROID_KEYSTORE_PASSWORD`, and checks the APK's
+certificate against the `ANDROID_CERT_SHA256` variable. A fork's pull request has no secrets: its APKs carry the
+runner's own debug key, which its log says, and install only after the app is uninstalled. A local build takes the
+keystore from `SNX_ANDROID_KEYSTORE` and its password from `SNX_ANDROID_KEYSTORE_PASSWORD` (the key is `scarletnx`, or
+`SNX_ANDROID_KEY_ALIAS`); without them this machine's own debug key signs. The key is made once:
+
+```sh
+keytool -genkeypair -keystore scarletnx.keystore -alias scarletnx -keyalg RSA -keysize 4096 -validity 36500 \
+    -dname "CN=ScarletNX"
+keytool -exportcert -keystore scarletnx.keystore -alias scarletnx | sha256sum   # ANDROID_CERT_SHA256
+```
+
+An app installed from an APK another key signed has to be uninstalled once; what it keeps in `ScarletNX/` on the
+shared storage stays.
 
 The Android emulator runs it on an x86_64 image; `-gpu swiftshader_indirect` gives it SwiftShader's Vulkan 1.3. Its
 ARM translation runs the arm64 build too (an APK with arm64 alone, or an arm64 program from `adb shell`), slowly.

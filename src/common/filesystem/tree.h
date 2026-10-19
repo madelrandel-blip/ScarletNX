@@ -33,6 +33,7 @@ typedef struct FsNode {
     int fd;
     const uint8_t* map;
     unsigned refs; /* open handles; attached nodes are additionally owned by the tree */
+    char* host;    /* a graft's top (fs_tree_graft): the host folder its subtree is in, else NULL */
 } FsNode;
 
 typedef struct {
@@ -46,6 +47,9 @@ typedef struct {
    All other calls and direct node access require tree->lock to be held. Children are sorted by strcmp(name).
    Close open handles before destroy; retain/release keep removed entries alive while their handles exist. */
 FsTreeResult fs_tree_init(FsTree* tree, const char* directory);
+/* Startup only: name, a child of the data directory it doesn't have, indexed from another host directory, as
+   fs_tree_init indexes its own and with the same rejections, and readonly. The game's RomFS kept in tmpfs */
+FsTreeResult fs_tree_graft(FsTree* tree, const char* name, const char* directory);
 void fs_tree_destroy(FsTree* tree);
 /* With no scope, accepts drive:/path, /path (under root/), or paths relative to the data directory.
    A scope makes paths relative to that directory; drive prefixes and traversal above scope are rejected. */

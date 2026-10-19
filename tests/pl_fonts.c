@@ -4,6 +4,7 @@
    Sans once for slots 0 to 4 and the button glyphs in slot 5, each a TrueType font behind the obfuscated header the
    SDK decodes its size from; and a game folder's .ttf taken over the stand-in for its slot */
 #include "nx/hle/services/pl.c"
+#include "nx/hle/hle.c"
 
 static unsigned checks;
 #define CHECK(x)                                                                                                       \
@@ -54,8 +55,8 @@ u8* kshmem_ptr(KShmem* s) {
 }
 void out_copy_h(IpcCtx* c, u32 h) { (void)c, (void)h; }
 void svc_register(const char* name, SvcCtor ctor) { (void)name, (void)ctor; }
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t datasize) {
-    (void)name, (void)dispatch, (void)datasize;
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
+    (void)name, (void)dispatch;
     return NULL;
 }
 void pm_init(PMutex* m) { (void)m; }
@@ -72,7 +73,7 @@ static u32 header_size(u32 off) {
     u32 h0, h1, key = bswap32_(0x7f9a0218u ^ 0x36f81a1eu);
     memcpy(&h0, shm + off - 8, 4);
     memcpy(&h1, shm + off - 4, 4);
-    CHECK(h0 == bswap32_(0x36f81a1eu));
+    CHECK(h0 == bswap32_(0x7f9a0218u)); /* the decrypted magic, not the .bfttf's own */
     return bswap32_(h1 ^ key);
 }
 static int truetype(u32 off) { return !memcmp(shm + off, "\0\1\0\0", 4); }
@@ -84,23 +85,29 @@ static int contains(const u8* data, size_t size, const char* text) {
     return 0;
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+
 int main(void) {
+    hle_init();
     fonts_fill(shm, sizeof shm);
-    for (int i = 0; i < 5; i++) CHECK(pl.font_off[i] == pl.font_off[0] && pl.font_size[i] == snx_font_standard_size);
-    CHECK(!memcmp(shm + pl.font_off[0], snx_font_standard, snx_font_standard_size) && truetype(pl.font_off[0]));
-    CHECK(pl.font_size[5] == snx_font_extended_size && pl.font_off[5] != pl.font_off[0]);
-    CHECK(!memcmp(shm + pl.font_off[5], snx_font_extended, snx_font_extended_size) && truetype(pl.font_off[5]));
-    CHECK(header_size(pl.font_off[0]) == ((snx_font_standard_size + 3) & ~3u));
-    CHECK(header_size(pl.font_off[5]) == ((snx_font_extended_size + 3) & ~3u));
+    for (int i = 0; i < 5; i++) CHECK(g_hle.pl.font_off[i] == g_hle.pl.font_off[0] && g_hle.pl.font_size[i] == snx_font_standard_size);
+    CHECK(!memcmp(shm + g_hle.pl.font_off[0], snx_font_standard, snx_font_standard_size) && truetype(g_hle.pl.font_off[0]));
+    CHECK(g_hle.pl.font_size[5] == snx_font_extended_size && g_hle.pl.font_off[5] != g_hle.pl.font_off[0]);
+    CHECK(!memcmp(shm + g_hle.pl.font_off[5], snx_font_extended, snx_font_extended_size) && truetype(g_hle.pl.font_off[5]));
+    CHECK(header_size(g_hle.pl.font_off[0]) == ((snx_font_standard_size + 3) & ~3u));
+    CHECK(header_size(g_hle.pl.font_off[5]) == ((snx_font_extended_size + 3) & ~3u));
     /* Open Sans, as the font's name table says it */
     CHECK(contains(snx_font_standard, snx_font_standard_size, "OpenSans-Regular"));
 
     memset(shm, 0, sizeof shm);
-    memset(&pl, 0, sizeof pl);
+    memset(&g_hle.pl, 0, sizeof g_hle.pl);
     g_have = "fonts/FontKorean.ttf";
     fonts_fill(shm, sizeof shm);
-    CHECK(pl.font_size[4] == sizeof g_korean && !memcmp(shm + pl.font_off[4], g_korean, sizeof g_korean));
-    CHECK(pl.font_off[0] == pl.font_off[3] && pl.font_size[0] == snx_font_standard_size);
+    CHECK(g_hle.pl.font_size[4] == sizeof g_korean && !memcmp(shm + g_hle.pl.font_off[4], g_korean, sizeof g_korean));
+    CHECK(g_hle.pl.font_off[0] == g_hle.pl.font_off[3] && g_hle.pl.font_size[0] == snx_font_standard_size);
     printf("pl_fonts: %u checks passed\n", checks);
     return 0;
 }

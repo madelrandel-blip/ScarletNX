@@ -5,12 +5,12 @@
    is handed over. The rest of the kernel is stubbed: a wait returns at once with the thread still queued, so each
    step's priorities can be read */
 #include "nx/hle/kernel/sync.c"
+#include "nx/hle/hle.c"
 #include <stdarg.h>
 #include <stdio.h>
 
 u8* g_mem;
 int g_verbose;
-PMutex g_klock;
 void pm_lock(PMutex* m) { (void)m; }
 void pm_unlock(PMutex* m) { (void)m; }
 void logf_(int lvl, const char* fmt, ...) {
@@ -77,7 +77,7 @@ static const int start_prio[] = {46, 44, 45, 40, 50, 30};
 static KThread* reset(const int* prio) {
     memset(snx_kmt_thread, 0, sizeof snx_kmt_thread);
     memset(g_mem, 0, 0x1000);
-    g_mwait = NULL;
+    g_hle.sync.mwait = NULL;
     for (int i = 0; i < SNX_KMT_THREADS; i++) {
         snx_kmt_thread[i].o.type = KO_THREAD;
         snx_kmt_thread[i].prio = snx_kmt_thread[i].base_prio = prio[i];
@@ -93,7 +93,14 @@ static void lock(KThread* t, KThread* owner, u64 addr) {
     CHECK(svc_arbitrate_lock(t, handle(owner), addr, handle(t)) == 0, "lock");
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+void pm_init(PMutex* m) { (void)m; }
+
 int main(void) {
+    hle_init();
     g_mem = calloc(1, 0x1000);
     if (!g_mem) return 1;
     enum { SNX_KMT_M = 0x100, SNX_KMT_M2 = 0x200, SNX_KMT_CV = 0x300 };
@@ -193,7 +200,7 @@ int main(void) {
     g_slept = 0;
     u32 v = handle(a);
     memcpy(g_mem + SNX_KMT_M, &v, 4); /* no waiters bit: it was unlocked and taken again */
-    CHECK(svc_arbitrate_lock(b, handle(a), SNX_KMT_M, handle(b)) == 0 && !g_slept && !g_mwait, "word changed");
+    CHECK(svc_arbitrate_lock(b, handle(a), SNX_KMT_M, handle(b)) == 0 && !g_slept && !g_hle.sync.mwait, "word changed");
     v = 0xFFFF8000u | HANDLE_WAIT;
     memcpy(g_mem + SNX_KMT_M, &v, 4);
     CHECK(svc_arbitrate_lock(b, 0xFFFF8000u, SNX_KMT_M, handle(b)) == R_BADHANDLE && !g_slept, "pseudo-handle owner");
@@ -205,7 +212,7 @@ int main(void) {
     /* a condition variable waiter signalled into a mutex whose word names no thread is woken with InvalidState */
     t = reset(start_prio);
     a = &t[0], b = &t[1];
-    g_cvwait = NULL;
+    memset(g_hle.sync.cvwait, 0, sizeof g_hle.sync.cvwait);
     mine = handle(b);
     memcpy(g_mem + SNX_KMT_M, &mine, 4);
     CHECK(svc_wait_cv(b, SNX_KMT_M, SNX_KMT_CV, handle(b), -1) == 0, "wait on the condition variable");
@@ -213,7 +220,7 @@ int main(void) {
     memcpy(g_mem + SNX_KMT_M, &v, 4);
     b->woken = 0;
     svc_signal_cv(SNX_KMT_CV, 1);
-    CHECK(b->woken && b->wait_result == R_BADSTATE && !g_mwait, "woken with %x", b->wait_result);
+    CHECK(b->woken && b->wait_result == R_BADSTATE && !g_hle.sync.mwait, "woken with %x", b->wait_result);
 
     /* SignalToAddress type 2 (SignalAndModifyByWaitingCountIfEqual): the new value as the console computes it, by
        whether this signal leaves waiters behind */
@@ -226,7 +233,7 @@ int main(void) {
         for (unsigned i = 0; i < sizeof k / sizeof *k; i++) {
             u32 five = 5;
             t = reset(start_prio);
-            g_arbwait = NULL;
+            memset(g_hle.sync.arbwait, 0, sizeof g_hle.sync.arbwait);
             memcpy(g_mem + SNX_KMT_ARB, &five, 4);
             for (int w = 0; w < k[i].waiters; w++)
                 CHECK(svc_wait_addr(&t[w], SNX_KMT_ARB, 0, 6, -1) == 0, "waiter %d", w);
@@ -238,7 +245,7 @@ int main(void) {
         }
         u32 seven = 7;
         t = reset(start_prio);
-        g_arbwait = NULL;
+        memset(g_hle.sync.arbwait, 0, sizeof g_hle.sync.arbwait);
         memcpy(g_mem + SNX_KMT_ARB, &seven, 4);
         CHECK(svc_wait_addr(&t[0], SNX_KMT_ARB, 2, 7, -1) == 0, "wait if equal");
         t[0].woken = 0;

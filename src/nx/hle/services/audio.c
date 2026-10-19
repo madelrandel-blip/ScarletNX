@@ -11,6 +11,7 @@
    audio outs' buffers at 48 kHz as the console's DSP does. Games sync against that release (CRI's movie player
    waits for its buffers back), so it follows the clock whether or not the host has an audio device */
 #include "nx/hle/services/services_int.h"
+#include "nx/hle/hle.h"
 #include "nx/hle/services/audren_dsp.h"
 #include <math.h>
 #ifndef SNX_NO_H264
@@ -39,43 +40,14 @@
 
 #define AUDIO_RATE      48000u /* the DSP's, the only rate an audio out plays at */
 #define AUDIO_FRAME_NS  5000000 /* the DSP's frame */
-#define AUDOUT_BUFFERS  64      /* appended and released buffers an audio out holds */
 #define AUDIO_REVISION  15      /* the newest renderer revision understood (Eden's CurrentRevision) */
 #define AUDIO_NAME_SIZE 0x100   /* an AudioDeviceName */
 
 static const char audout_name[] = "DeviceOut";
 static const char device_name[] = "AudioTvOutput";
 
-/* an IAudioOut: its buffers in one ring, the released ones first, oldest to newest, then the ones still queued */
-typedef struct AudOut {
-    struct AudOut* next; /* in audio.outs */
-    PAudio* output;      /* NULL without a host device: the buffers are still played on the clock */
-    KEvent* ev;          /* the buffer event: a buffer released */
-    u32 channels, started;
-    float volume;
-    u64 tag[AUDOUT_BUFFERS];
-    u32 frames[AUDOUT_BUFFERS];
-    u32 first, nreleased, nqueued;
-    u32 head_played; /* frames of the first queued buffer already played */
-    u64 t0;          /* when the clock started counting the queued buffers */
-    u64 t0_frames;   /* frames played since t0 */
-    u64 played;      /* GetAudioOutPlayedSampleCount */
-} AudOut;
-
-/* an IAudioRenderer. Its play state is the object's u[0] (SNX_AUDREN_STARTED or SNX_AUDREN_STOPPED), which the clock
-   reads in audren_tick; audren.c keeps its state in u[1] */
-typedef struct {
-    nn_audio_detail_AudioRendererParameterInternal params;
-    u32 limit;
-    float voice_drop; /* as the game set it, read back: no voice is dropped here */
-    u32 manual;       /* OpenAudioRendererForManualExecution: no system event */
-} AudRen;
-
-static struct {
-    PMutex lk;    /* the audio outs */
-    KEvent* ev;   /* the renderers' system event, every frame */
-    AudOut* outs; /* every open audio out, for the clock */
-} audio = {PMUTEX_INIT, NULL, NULL};
+/* the objects' data (AudOut, AudRen, AudDevice, HwOpus), their pools, and the outs the clock plays: g_hle.audio
+   (services_int.h) */
 
 /* ============================================================ helpers */
 /* whether [addr, addr + size) is guest memory with perm, block by block */
@@ -158,13 +130,13 @@ static u32 audout_release_all(AudOut* q) {
 static void audout_destroy(SvcObj* o) {
     AudOut* q = o->data;
     AudOut** p;
-    pm_lock(&audio.lk);
-    for (p = &audio.outs; *p; p = &(*p)->next)
+    pm_lock(&g_hle.audio.lk);
+    for (p = &g_hle.audio.outs; *p; p = &(*p)->next)
         if (*p == q) {
             *p = q->next;
             break;
         }
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
     plat_audio_close(q->output);
     kobj_unref(&q->ev->o);
 }
@@ -172,16 +144,16 @@ static void audout_destroy(SvcObj* o) {
 /* the clock's turn: every started out played up to now */
 static void audout_tick(u64 now) {
     AudOut* q;
-    pm_lock(&audio.lk);
-    for (q = audio.outs; q; q = q->next)
+    pm_lock(&g_hle.audio.lk);
+    for (q = g_hle.audio.outs; q; q = q->next)
         if (audout_advance(q, now)) kevent_signal(q->ev);
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
 }
 
 /* the out's state brought up to now under the lock, which the caller then holds */
 static AudOut* audout_lock(SvcObj* self) {
     AudOut* q = self->data;
-    pm_lock(&audio.lk);
+    pm_lock(&g_hle.audio.lk);
     if (audout_advance(q, plat_ns())) kevent_signal(q->ev);
     return q;
 }
@@ -189,19 +161,22 @@ static AudOut* audout_lock(SvcObj* self) {
 static int nn_audio_detail_IAudioOut_GetAudioOutState(SvcObj* self, u32* state) {
     AudOut* q = audout_lock(self);
     *state = q->started ? 0 : 1;
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
+/* an out already started is refused, as Eden's and Ryujinx's are */
 static int nn_audio_detail_IAudioOut_Start(SvcObj* self) {
     AudOut* q = audout_lock(self);
-    if (!q->started) {
-        q->started = 1;
-        q->t0 = plat_ns();
-        q->t0_frames = 0;
-        plat_audio_start(q->output, 1);
+    if (q->started) {
+        pm_unlock(&g_hle.audio.lk);
+        R_THROW(AUDIO_OPERATION_FAILED);
     }
-    pm_unlock(&audio.lk);
+    q->started = 1;
+    q->t0 = plat_ns();
+    q->t0_frames = 0;
+    plat_audio_start(q->output, 1);
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
@@ -214,7 +189,7 @@ static int nn_audio_detail_IAudioOut_Stop(SvcObj* self) {
         audout_release_all(q);
         kevent_signal(q->ev);
     }
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
@@ -231,7 +206,7 @@ static int audout_append(SvcObj* self, u64 tag, IpcBuf b) {
     if (n >= 0x20) memcpy(&d, GP(b.addr), (size_t)n);
     q = audout_lock(self);
     if (q->nreleased + q->nqueued >= AUDOUT_BUFFERS) {
-        pm_unlock(&audio.lk);
+        pm_unlock(&g_hle.audio.lk);
         R_THROW(AUDIO_BUFFER_COUNT_FULL);
     }
     if (q->started && !q->nqueued) { /* idle until now */
@@ -251,7 +226,7 @@ static int audout_append(SvcObj* self, u64 tag, IpcBuf b) {
         WARN_LIMIT(4, "audout: buffer %#llx (%llu bytes at offset %llu) isn't readable, played as silence\n",
                    (unsigned long long)d.buffer, (unsigned long long)d.data_size,
                    (unsigned long long)d.data_offset);
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
@@ -280,7 +255,7 @@ static int audout_released(SvcObj* self, IpcBuf b, u32* count) {
         q->first = (q->first + 1) % AUDOUT_BUFFERS;
         q->nreleased--;
     }
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
     *count = n;
     R_SUCCEED();
 }
@@ -298,48 +273,51 @@ static int nn_audio_detail_IAudioOut_ContainsAudioOutBuffer(SvcObj* self, u64 ta
     u32 i;
     for (i = 0; i < q->nreleased + q->nqueued; i++)
         if (q->tag[(q->first + i) % AUDOUT_BUFFERS] == tag) *contains = 1;
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
 static int nn_audio_detail_IAudioOut_GetAudioOutBufferCount(SvcObj* self, u32* count) {
     AudOut* q = audout_lock(self);
     *count = q->nqueued;
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
 static int nn_audio_detail_IAudioOut_GetAudioOutPlayedSampleCount(SvcObj* self, u64* count) {
     AudOut* q = audout_lock(self);
     *count = q->played;
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
+/* a stopped out keeps what was appended until it starts: only a started one is flushed, and says so */
 static int nn_audio_detail_IAudioOut_FlushAudioOutBuffers(SvcObj* self, u8* flushed) {
     AudOut* q = audout_lock(self);
-    if (audout_release_all(q)) kevent_signal(q->ev);
-    q->t0 = plat_ns();
-    q->t0_frames = 0;
-    pm_unlock(&audio.lk);
-    *flushed = 1;
+    *flushed = (u8)q->started;
+    if (q->started) {
+        if (audout_release_all(q)) kevent_signal(q->ev);
+        q->t0 = plat_ns();
+        q->t0_frames = 0;
+    }
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
 static int nn_audio_detail_IAudioOut_SetAudioOutVolume(SvcObj* self, float volume) {
     AudOut* q = self->data;
-    pm_lock(&audio.lk);
+    pm_lock(&g_hle.audio.lk);
     q->volume = volume;
-    plat_audio_volume(q->output, volume);
-    pm_unlock(&audio.lk);
+    plat_audio_volume(q->output, volume * g_hle.audio.device_volume);
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
 static int nn_audio_detail_IAudioOut_GetAudioOutVolume(SvcObj* self, float* volume) {
     AudOut* q = self->data;
-    pm_lock(&audio.lk);
+    pm_lock(&g_hle.audio.lk);
     *volume = q->volume;
-    pm_unlock(&audio.lk);
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 
@@ -368,7 +346,7 @@ static int open_out(const nn_audio_AudioOutParameter* params, IpcBuf name, IpcBu
         if (guest_ok(name.addr, n, PERM_R)) memcpy(want, GP(name.addr), n);
     }
     if (want[0] && strcmp(want, audout_name)) R_THROW(AUDIO_NOT_FOUND);
-    o = nn_audio_detail_IAudioOut_new(sizeof(AudOut));
+    o = nn_audio_detail_IAudioOut_new_data(g_hle.audio.outs_pool, g_hle.audio.out_next, "audio outs");
     q = o->data;
     switch (params->channel_count) {
         case 1:
@@ -381,10 +359,11 @@ static int open_out(const nn_audio_AudioOutParameter* params, IpcBuf name, IpcBu
     q->ev = owned_event("IAudioOut");
     q->output = plat_audio_open(AUDIO_RATE, q->channels);
     o->destroy = audout_destroy;
-    pm_lock(&audio.lk);
-    q->next = audio.outs;
-    audio.outs = q;
-    pm_unlock(&audio.lk);
+    pm_lock(&g_hle.audio.lk);
+    q->next = g_hle.audio.outs;
+    g_hle.audio.outs = q;
+    plat_audio_volume(q->output, q->volume * g_hle.audio.device_volume);
+    pm_unlock(&g_hle.audio.lk);
     write_name(name_out, audout_name);
     *sample_rate = AUDIO_RATE;
     *channel_count = q->channels;
@@ -409,19 +388,19 @@ static int nn_audio_detail_IAudioOutManager_OpenAudioOutAuto(SvcObj* self, const
     return open_out(params, name, name_out, sample_rate, channel_count, sample_format, state, out);
 }
 
-SvcObj* new_audout(void) { return nn_audio_detail_IAudioOutManager_new(0); }
+SvcObj* new_audout(void) { return nn_audio_detail_IAudioOutManager_new(); }
 
 /* ============================================================ the audio renderer */
 static int nn_audio_detail_IAudioRenderer_GetSampleRate(SvcObj* self, u32* sample_rate) {
-    *sample_rate = ((AudRen*)self->data)->params.sample_rate;
+    *sample_rate = ((AudRen*)self->data)->sample_rate;
     R_SUCCEED();
 }
 static int nn_audio_detail_IAudioRenderer_GetSampleCount(SvcObj* self, u32* sample_count) {
-    *sample_count = ((AudRen*)self->data)->params.sample_count;
+    *sample_count = ((AudRen*)self->data)->sample_count;
     R_SUCCEED();
 }
 static int nn_audio_detail_IAudioRenderer_GetMixBufferCount(SvcObj* self, u32* mix_buffer_count) {
-    *mix_buffer_count = ((AudRen*)self->data)->params.mix_buffer_count;
+    *mix_buffer_count = ((AudRen*)self->data)->mix_buffer_count;
     R_SUCCEED();
 }
 static int nn_audio_detail_IAudioRenderer_GetState(SvcObj* self, u32* state) {
@@ -448,7 +427,7 @@ static int nn_audio_detail_IAudioRenderer_Stop(SvcObj* self) {
 /* the event the clock signals after each frame; a renderer the game executes by itself has none */
 static int nn_audio_detail_IAudioRenderer_QuerySystemEvent(SvcObj* self, u32* event) {
     R_UNLESS(!((AudRen*)self->data)->manual, AUDIO_NOT_SUPPORTED);
-    *event = ev_handle(audio.ev);
+    *event = ev_handle(g_hle.audio.ev);
     R_SUCCEED();
 }
 static int nn_audio_detail_IAudioRenderer_SetRenderingTimeLimit(SvcObj* self, u32 percent) {
@@ -515,9 +494,11 @@ static int open_renderer(const nn_audio_detail_AudioRendererParameterInternal* p
     AudRen* r;
     R_UNLESS(revision_number(params->revision) <= AUDIO_REVISION, AUDIO_INVALID_REVISION);
     R_UNLESS(process, AUDIO_INVALID_HANDLE);
-    o = nn_audio_detail_IAudioRenderer_new(sizeof(AudRen));
+    o = nn_audio_detail_IAudioRenderer_new_data(g_hle.audio.rens, g_hle.audio.ren_next, "audio renderers");
     r = o->data;
-    r->params = *params;
+    r->sample_rate = params->sample_rate;
+    r->sample_count = params->sample_count;
+    r->mix_buffer_count = params->mix_buffer_count;
     r->limit = 100;
     r->voice_drop = 1.0f;
     r->manual = (u32)manual;
@@ -555,10 +536,8 @@ static int nn_audio_detail_IAudioRendererManager_GetWorkBufferSize(
 }
 
 /* ------------------------------------------------------------ IAudioDevice: the TV output, two channels */
-/* its system, input and output events, signaled when the device is made (the game reads the device then) */
-typedef struct {
-    KEvent* ev[3];
-} AudDevice;
+/* its system, input and output events, signaled when the device is made (the game reads the device then): an
+   AudDevice (services_int.h) */
 static void device_destroy(SvcObj* o) {
     int i;
     for (i = 0; i < 3; i++) kobj_unref(&((AudDevice*)o->data)->ev[i]->o);
@@ -566,7 +545,7 @@ static void device_destroy(SvcObj* o) {
 
 static SvcObj* new_device(void) {
     static const char* const names[3] = {"IAudioDevice system", "IAudioDevice input", "IAudioDevice output"};
-    SvcObj* o = nn_audio_detail_IAudioDevice_new(sizeof(AudDevice));
+    SvcObj* o = nn_audio_detail_IAudioDevice_new_data(g_hle.audio.devices, g_hle.audio.device_next, "audio devices");
     int i;
     for (i = 0; i < 3; i++) {
         ((AudDevice*)o->data)->ev[i] = owned_event(names[i]);
@@ -597,9 +576,33 @@ static int nn_audio_detail_IAudioDevice_ListAudioDeviceName(SvcObj* self, IpcBuf
 static int nn_audio_detail_IAudioDevice_ListAudioDeviceNameAuto(SvcObj* self, IpcBuf names, i32* count) {
     return nn_audio_detail_IAudioDevice_ListAudioDeviceName(self, names, count);
 }
+/* whether a device name a game sends is the output device's */
+static int is_device(IpcBuf name) {
+    u64 n = name.size < AUDIO_NAME_SIZE ? name.size : AUDIO_NAME_SIZE;
+    if (!name.addr || n < sizeof device_name || !guest_ok(name.addr, n, PERM_R)) return 0;
+    return !memcmp(GP(name.addr), device_name, sizeof device_name);
+}
+/* the output device keeps the volume a game sets, and plays every audio out and renderer that much louder or softer;
+   any other name has 1 */
+static int nn_audio_detail_IAudioDevice_SetAudioDeviceOutputVolume(SvcObj* self, IpcBuf name, float volume) {
+    AudOut* q;
+    (void)self;
+    if (!is_device(name)) R_SUCCEED();
+    pm_lock(&g_hle.audio.lk);
+    g_hle.audio.device_volume = volume;
+    for (q = g_hle.audio.outs; q; q = q->next) plat_audio_volume(q->output, q->volume * volume);
+    audren_volume(volume);
+    pm_unlock(&g_hle.audio.lk);
+    R_SUCCEED();
+}
+static int nn_audio_detail_IAudioDevice_SetAudioDeviceOutputVolumeAuto(SvcObj* self, IpcBuf name, float volume) {
+    return nn_audio_detail_IAudioDevice_SetAudioDeviceOutputVolume(self, name, volume);
+}
 static int nn_audio_detail_IAudioDevice_GetAudioDeviceOutputVolume(SvcObj* self, IpcBuf name, float* volume) {
-    (void)self, (void)name;
-    *volume = 1.0f;
+    (void)self;
+    pm_lock(&g_hle.audio.lk);
+    *volume = is_device(name) ? g_hle.audio.device_volume : 1.0f;
+    pm_unlock(&g_hle.audio.lk);
     R_SUCCEED();
 }
 static int nn_audio_detail_IAudioDevice_GetAudioDeviceOutputVolumeAuto(SvcObj* self, IpcBuf name, float* volume) {
@@ -641,10 +644,10 @@ static int nn_audio_detail_IAudioDevice_QueryAudioDeviceOutputEvent(SvcObj* self
     R_SUCCEED();
 }
 
-SvcObj* new_audren(void) { return nn_audio_detail_IAudioRendererManager_new(0); }
+SvcObj* new_audren(void) { return nn_audio_detail_IAudioRendererManager_new(); }
 
 /* ============================================================ the clock */
-void audio_init(void) { audio.ev = owned_event("IAudioRenderer"); }
+void audio_init(void) { g_hle.audio.ev = owned_event("IAudioRenderer"); }
 
 /* every 5 ms of host time: the renderers' frames, their event, the audio outs' buffers. Behind by more than a few
    frames (the host stalled), it starts over from now instead of rendering the backlog at once */
@@ -653,7 +656,7 @@ void audio_clock(void* arg) {
     (void)arg;
     for (;;) {
         audren_tick();
-        kevent_signal(audio.ev);
+        kevent_signal(g_hle.audio.ev);
         now = plat_ns();
         audout_tick(now);
         next += AUDIO_FRAME_NS;
@@ -664,20 +667,8 @@ void audio_clock(void* arg) {
 
 /* ============================================================ hwopus */
 /* a decoder: FFmpeg's, at 48 kHz, its output brought down to the decoder's rate through a low-pass filter keeping
-   every step-th sample, and kept in a queue so that every reply is exactly the packet's duration */
-typedef struct {
-    u32 rate, channels, step;
-    PMutex lk;
-#ifndef SNX_NO_H264
-    AVCodecContext* dec;
-    AVPacket* pkt;
-    AVFrame* frame;
-#endif
-    i16* queue;   /* channels * cap samples, interleaved, at the decoder's rate */
-    float* taps;  /* the filter's ntaps coefficients (none at 48 kHz) */
-    float* hist;  /* the last ntaps samples of each channel at 48 kHz, a ring at hpos */
-    u32 queued, cap, phase, ntaps, hpos;
-} HwOpus;
+   every step-th sample, and kept in a queue so that every reply is exactly the packet's duration (HwOpus,
+   services_int.h) */
 /* the queue starts with this much silence at 48 kHz: what FFmpeg's resampler may hold back of the first packets
    (libswresample's most), so that later replies come from the queue instead of silence put in front */
 #define HWOPUS_LEAD 24
@@ -742,14 +733,13 @@ static void hwopus_filter(HwOpus* h) {
 }
 #endif
 
-/* the firmware keeps 24 decoders and refuses the next with OutOfOpusDecoders, which sends the SDK to its software
-   decoder; a game that opens decoders until refused depends on that answer */
-#define SNX_HWOPUS_MAX_DECODERS 24
-static u32 hwopus_live; /* decoders open, across every hwopus session */
+/* the firmware keeps SNX_HWOPUS_MAX_DECODERS (services_int.h) decoders and refuses the next with OutOfOpusDecoders,
+   which sends the SDK to its software decoder; a game that opens decoders until refused depends on that answer.
+   g_hle.audio.hwopus_live counts those open, across every hwopus session */
 
 static void hwopus_destroy(SvcObj* o) {
     hwopus_free(o->data);
-    __atomic_sub_fetch(&hwopus_live, 1, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&g_hle.audio.hwopus_live, 1, __ATOMIC_RELAXED);
 }
 
 /* opens h for rate and channels: one stream (mapping NULL), or streams of them with stereo_streams coupled and
@@ -968,16 +958,16 @@ static int work_size(u32 rate, u32 channels, u32 streams, u32 stereo_streams, in
 static int open_decoder(u32 rate, u32 channels, u32 streams, u32 stereo_streams, const u8* mapping,
                         SvcObj** decoder) {
     SvcObj* o;
-    if (__atomic_add_fetch(&hwopus_live, 1, __ATOMIC_RELAXED) > SNX_HWOPUS_MAX_DECODERS) {
-        __atomic_sub_fetch(&hwopus_live, 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&g_hle.audio.hwopus_live, 1, __ATOMIC_RELAXED) > SNX_HWOPUS_MAX_DECODERS) {
+        __atomic_sub_fetch(&g_hle.audio.hwopus_live, 1, __ATOMIC_RELAXED);
         R_THROW(OPUS_OUT_OF_DECODERS);
     }
-    o = nn_codec_detail_IHardwareOpusDecoder_new(sizeof(HwOpus));
+    o = nn_codec_detail_IHardwareOpusDecoder_new_data(g_hle.audio.opus, g_hle.audio.opus_next, "hwopus decoders");
     if (!hwopus_open(o->data, rate, channels, streams, stereo_streams, mapping)) {
         WARN_LIMIT(4, "hwopus: can't open a decoder of %lu channels at %lu Hz\n", (unsigned long)channels,
                    (unsigned long)rate);
         svcobj_unref(o);
-        __atomic_sub_fetch(&hwopus_live, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&g_hle.audio.hwopus_live, 1, __ATOMIC_RELAXED);
         R_THROW(OPUS_OUT_OF_DECODERS);
     }
     o->destroy = hwopus_destroy;
@@ -1066,4 +1056,4 @@ static int nn_codec_detail_IHardwareOpusDecoderManager_OpenHardwareOpusDecoderFo
     return open_multi(params, 1, decoder);
 }
 
-SvcObj* new_hwopus(void) { return nn_codec_detail_IHardwareOpusDecoderManager_new(0); }
+SvcObj* new_hwopus(void) { return nn_codec_detail_IHardwareOpusDecoderManager_new(); }

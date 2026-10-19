@@ -232,7 +232,7 @@ static void emit_semantic_fixture(FILE* out) {
     };
     size_t i;
     char function[32];
-    fputs("#include \"cpu.h\"\n#include \"cpu_helpers.c\"\n#include <stdio.h>\nGuestFn snx_interp_entry;\n", out);
+    fputs("#include \"cpu.h\"\n#include \"cpu_helpers.c\"\n#include <stdio.h>\n", out);
     for (i = 0; i < sizeof(words) / sizeof(words[0]); ++i) {
         sprintf(function, "step_%lu", (unsigned long)i);
         snx_a64_static_step(out, words[i], 0x1000, function);
@@ -366,6 +366,59 @@ done:
     free(output);
 }
 
+/* the C snx_codegen_emit writes for function, read back from a file in directory */
+static char* emit_text(const char* directory, SnxCodegen* codegen, const SnxFunction* function) {
+    char* path = snx_path_join(directory, "hook.c");
+    FILE* file = path ? snx_fopen(path, "wb") : NULL;
+    char* text = NULL;
+    size_t size;
+    if (file) {
+        snx_codegen_emit(file, codegen, function);
+        if (!fclose(file)) text = (char*)snx_read_file(path, &size);
+    }
+    free(path);
+    return text;
+}
+
+/* --hook-direct-calls: a BL to a recompiled function becomes a call through CPU.disp (CALLDYN), where runtime wrappers
+   can see it; without the option it stays a direct call of the function */
+static void hook_test(const char* directory) {
+    static const SnxU32 words[] = {0x94000002UL,  /* BL +8 */
+                                   0xD65F03C0UL,  /* RET */
+                                   0xD65F03C0UL}; /* RET: the called function */
+    unsigned char image[sizeof(words)];
+    SnxProgram program;
+    SnxModuleImage module;
+    SnxCodegen codegen;
+    SnxFde range;
+    const SnxFunction* function;
+    char *direct, *hooked, call[64], dispatch[64];
+    size_t i;
+    for (i = 0; i < sizeof(words) / sizeof(words[0]); ++i) put32(image, i * 4, words[i]);
+    setup_program(&program, &module, image, sizeof(image));
+    range.start = 0;
+    range.size = 8;
+    module.fde = &range;
+    module.fde_count = 1;
+    /* the call site's two forms; the entry check (CALLDYN(e)) and the dispatcher (CALLDYN(c->pc)) dispatch too, so the
+       target's literal tells the call apart */
+    sprintf(call, "F_%lX(c,", (unsigned long)(SNX_CODE_BASE + 8));
+    sprintf(dispatch, "CALLDYN(%lu)", (unsigned long)(SNX_CODE_BASE + 8));
+    check(!snx_nx_codegen_analyze(&codegen, &program, NULL, 0, 1), "analyze the hooked call");
+    function = snx_codegen_function(&codegen, SNX_CODE_BASE);
+    check(function && snx_codegen_function(&codegen, SNX_CODE_BASE + 8), "caller and callee are functions");
+    if (function) {
+        direct = emit_text(directory, &codegen, function);
+        codegen.hook_direct_calls = 1;
+        hooked = emit_text(directory, &codegen, function);
+        check(direct && strstr(direct, call) && !strstr(direct, dispatch), "a direct call stays direct");
+        check(hooked && strstr(hooked, dispatch) && !strstr(hooked, call), "a hooked call goes through CPU.disp");
+        free(direct);
+        free(hooked);
+    }
+    snx_codegen_free(&codegen);
+}
+
 /* A loop of generated code runs with CPU.poll set: its backward branch calls rt->poll, the runtime's chance to take
    the core from a thread that makes no SVC, and the loop still runs to its end. The same loop through the
    interpreter, as a loop the recompiler never found runs, polls on its taken branch. */
@@ -404,7 +457,7 @@ static void poll_test(const char* compiler, const char* repo, const char* direct
     file = function ? snx_fopen(source, "wb") : NULL;
     check(file != NULL, "open the poll fixture");
     if (!file) goto done;
-    fputs("#include \"cpu.h\"\n#include \"cpu_helpers.c\"\n#include <stdio.h>\nGuestFn snx_interp_entry;\n", file);
+    fputs("#include \"cpu.h\"\n#include \"cpu_helpers.c\"\n#include <stdio.h>\n", file);
     snx_codegen_emit(file, &codegen, function);
     snx_a64_interp(file, 0);
     fputs("static int polls;\nstatic void poll(CPU* c){ ++polls; __atomic_store_n(&c->poll,0,__ATOMIC_RELAXED); }\n",
@@ -419,7 +472,7 @@ static void poll_test(const char* compiler, const char* repo, const char* direct
     /* the loop's words in guest memory at 0x1000, no dispatch table: every lookup lands in the interpreter */
     fputs("static int interp(u64 count, u32 flag){ static u32 mem[0x1000]; CPU c; RtAPI rt;\n"
           " memset(&c,0,sizeof c); memset(&rt,0,sizeof rt); mem[0x400]=0xF1000400u; mem[0x401]=0x54FFFFE1u;\n"
-          " mem[0x402]=0xD65F03C0u; snx_interp_entry=snx_interp; rt.poll=poll; c.rt=&rt; c.mem=(u8*)mem;\n"
+          " mem[0x402]=0xD65F03C0u; rt.miss=snx_interp; rt.poll=poll; c.rt=&rt; c.mem=(u8*)mem;\n"
           " c.x[0]=count; c.x[30]=0x2000; c.poll=flag; polls=0; snx_interp(&c,0x1000);\n"
           " return c.x[0]==0 && c.pc==0x2000 ? polls : -1; }\n",
           file);
@@ -483,6 +536,7 @@ int main(int argc, char** argv) {
     address_taken_test();
     address_taken_shifted_test();
     large_range_test();
+    hook_test(directory);
     semantics_test(argv[1], argv[2], directory);
     poll_test(argv[1], argv[2], directory);
     check(!snx_remove_tree(directory), "remove codegen test directory");

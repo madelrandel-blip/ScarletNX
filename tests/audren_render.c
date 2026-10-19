@@ -4,6 +4,7 @@
    (revision 4, 48 kHz, 240 samples a frame), frames rendered, and what the aux, the circular buffer sinks and the
    voices' counters show. Levels are one bin of a Fourier transform over a frame of whole periods */
 #include "nx/hle/services/audren_dsp.c"
+#include "nx/hle/hle.c"
 #include <math.h>
 #include <stdio.h>
 
@@ -1104,7 +1105,14 @@ static void update_voice_rev14(void) {
     audren_state_free(state);
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+void pm_init(PMutex* m) { (void)m; }
+
 int main(void) {
+    hle_init();
     u32 nch;
     int set;
     g_mem = calloc(1, SNX_ART_G_ARENA);

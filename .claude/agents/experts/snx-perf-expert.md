@@ -33,7 +33,7 @@ kernel and services, and a GPU thread that drives Vulkan.
   builds on the same scene.
 - **Contention and waiting**: `perf c2c` for false sharing (RFC #142 rule 4 puts atomics that different threads
   write on their own cache lines), off-CPU time with `perf sched` or a bpftrace probe on `futex` waits,
-  `g_klock` hold times, and threads spinning versus sleeping.
+  `g_hle.kernel.klock` hold times, and threads spinning versus sleeping.
 - **Memory**: heaptrack for allocation counts on hot paths (per-draw and per-frame allocations show up as
   millions), page faults from first-touch guest memory, huge pages for the guest's large mappings.
 - **Code generation**: `llvm-objdump -d` on a hot function of `_code.so` or the runtime, `llvm-mca` on its loop to

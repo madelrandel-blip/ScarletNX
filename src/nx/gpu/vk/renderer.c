@@ -19,6 +19,7 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/gpu/vk/vk.h"
+#include "nx/gpu/vk/pending_pages.h"
 #include "nx/gpu/renderer.h"
 
 static VkSemaphore g_acquired[VK_FRAMES];
@@ -36,6 +37,16 @@ static void vkr_before_write(u64 gva, u64 size) {
         vk_gfx_image_land();
     vk_compute_before_write(gva, size);
     vk_rt_before_write(gva, size);
+}
+/* pending compute and graphics results and queued releases all count their pages in g_pend_any (pending_pages.h);
+   storage images don't, so any of them pending answers yes */
+static int vkr_mem_pending(u64 gva, u64 size) {
+    int hit;
+    if (g_gfx_img_any) return 1;
+    vk_lock();
+    hit = pend_hit(&g_pend_any, gva, size);
+    vk_unlock();
+    return hit;
 }
 static void vkr_gfx_mem_need(u64 gva, u64 size) {
     vk_buf_mem_need(gva, size);
@@ -80,7 +91,10 @@ static int vkr_start(void) {
 
 /* ------------------------------------------------------------ the front end's calls */
 /* a new epoch: the caches that trust what they checked in this one (buffers, constant buffers, shaders) check again */
-static void vkr_mem_may_have_changed(void) { __atomic_add_fetch(&g_vk_epoch, 1, __ATOMIC_RELAXED); }
+static void vkr_mem_may_have_changed(void) {
+    __atomic_add_fetch(&g_vk_epoch, 1, __ATOMIC_RELAXED);
+    vk_ww_new_epoch();
+}
 static void vkr_draw_texture(GpuChannel* ch) {
     vk_lock();
     vk_render_draw_texture(ch);
@@ -114,30 +128,24 @@ static int vkr_samples_report(GpuChannel* ch, u64 gva, u32 len, u64 ticks) {
     return r;
 }
 static void vkr_method_barrier(int kind) {
+    /* Nothing for TILED_CACHE_BARRIER (kind 1) or the sampler and texture header cache invalidations (kind 3), as in
+       Eden: a target sampled afterwards gets its barrier when it is bound (vk_surf_use), and headers and samplers are
+       read from guest memory at each bind. Nor does any invalidation expire the cached textures: their checks see the
+       CPU's writes through the epoch each submission and stream wait starts, and the GPU's through write generations.
+       Expiring them at each texture cache invalidation, about a hundred a frame in TotK, had every texture bound after
+       one check its memory again */
+    if (kind == 1 || kind == 3) return;
     vk_lock();
-    if (kind == 3) {
-        /* The TIC/TSC words are read from guest memory on each bind. Expire cached texture backing as well. */
-        vk_tex_invalidate_all();
-        __atomic_add_fetch(&g_vk_epoch, 1, __ATOMIC_RELAXED);
-    } else {
-        vk_render_end();
-        /* The GPU queue orders work across this barrier, including WAIT_FOR_IDLE. CPU-visible releases
-           are gated on GPU completion by the release path instead of stalling this command stream. */
-        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                               .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                               .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-                               .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                               .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
-        VkDependencyInfo di = {
-            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-        vkCmdPipelineBarrier2(vk_cmd(), &di);
-        if (kind == 2) {
-            /* Texture invalidation orders later reads after earlier GPU writes. The release path handles
-               CPU-visible results; waiting for every invalidation stalls games that issue them per draw. */
-            vk_tex_invalidate_all();
-            __atomic_add_fetch(&g_vk_epoch, 1, __ATOMIC_RELAXED);
-        }
-    }
+    vk_render_end();
+    /* The GPU queue orders work across this barrier, including WAIT_FOR_IDLE. CPU-visible releases are gated on GPU
+       completion by the release path instead of stalling this command stream. */
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    rec_CmdPipelineBarrier2(vk_cmd(), &di);
     vk_unlock();
 }
 static int vkr_blit(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, double sx, double sy, double sdx,
@@ -224,7 +232,7 @@ static Surf* cpu_frame(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout, u32 bh
                 VK_ACCESS_2_TRANSFER_WRITE_BIT);
     VkBufferImageCopy c = {
         .bufferOffset = off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
-    vkCmdCopyBufferToImage(cb, buf, g_cpu_img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    rec_CmdCopyBufferToImage(cb, buf, g_cpu_img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     return g_cpu_img;
 }
 
@@ -307,7 +315,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             VkClearColorValue black = {{0, 0, 0, 1}};
             VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+            rec_CmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
             vk_barrier(cb, sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
                        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -337,7 +345,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
                                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                     .dstOffsets = {{dx, dy, 0}, {dx + (i32)dw, dy + (i32)dh, 1}}};
                 flip_src(&blit, transform); /* render targets stay in guest order */
-                vkCmdBlitImage(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc,
+                rec_CmdBlitImage(cb, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sc,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
             }
             {
@@ -351,22 +359,93 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
             VK_OK(r);
     }
     if (game) {
+        /* the time from the last present, for the stats line: frames slower than 50 ms (a hitch at any pace a game
+           runs at) and the slowest, since the last line */
+        static u64 last_present_ns, slow_frames, slowest_ns;
+        /* the counters as of the last present: a slow frame says what it did, which names what a hitch waited for */
+        static u64 was[10];
+        u64 now_ns = plat_ns(), is[10];
+        vk_pipeline_stats(&is[0], &is[1], &is[2], &is[3], &is[4], &is[5]);
+        vk_tex_stats(&is[6], &is[7]);
+        is[8] = vk_rt_made();
+        is[9] = g_vk_finish_ns / 1000000;
+        if (last_present_ns) {
+            u64 d = now_ns - last_present_ns;
+            if (d > 50000000) {
+                slow_frames++;
+                LOG_LIMIT(200,
+                          "vulkan: a %llu ms frame: %llu shaders translated (%llu ms), %llu pipelines made (%llu ms waited "
+                          "for), %llu render targets made, %llu texture uploads (%llu KB), %llu ms in finishes\n",
+                          (unsigned long long)(d / 1000000), (unsigned long long)(is[4] - was[4]),
+                          (unsigned long long)(is[5] - was[5]), (unsigned long long)(is[0] - was[0]),
+                          (unsigned long long)(is[3] - was[3]), (unsigned long long)(is[8] - was[8]),
+                          (unsigned long long)(is[6] - was[6]), (unsigned long long)((is[7] - was[7]) >> 10),
+                          (unsigned long long)(is[9] - was[9]));
+            }
+            if (d > slowest_ns) slowest_ns = d;
+        }
+        memcpy(was, is, sizeof was);
+        last_present_ns = now_ns;
         g_vk_present++;
         if (g_last) g_last->last_used = g_vk_present; /* what screenshots read stays */
         vk_tex_frame();
         vk_buf_frame();
         if (g_vk_present % 600 == 0) {
-            LOG("vulkan: %llu draws, %llu skipped; %llu dispatches in %llu batches (%llu ms waiting), %llu skipped; "
-                "%llu finishes (%llu ms)\n",
-                (unsigned long long)g_vk_drawn, (unsigned long long)g_vk_skipped, (unsigned long long)g_vk_dispatches,
+            LOG("vulkan: %llu draws, %llu skipped (%llu for pipelines being made); %llu dispatches in %llu batches (%llu ms waiting), %llu skipped; "
+                "%llu finishes (%llu ms); %llu reads past queued releases; %llu descriptor sets written, %llu reused\n",
+                (unsigned long long)g_vk_drawn, (unsigned long long)g_vk_skipped,
+                (unsigned long long)vk_pipelines_skipped(), (unsigned long long)g_vk_dispatches,
                 (unsigned long long)g_vk_cs_batches,
                 (unsigned long long)(__atomic_load_n(&g_vk_cs_wait_ns, __ATOMIC_RELAXED) / 1000000),
                 (unsigned long long)g_vk_cs_skipped, (unsigned long long)g_vk_finishes,
-                (unsigned long long)(g_vk_finish_ns / 1000000));
+                (unsigned long long)(g_vk_finish_ns / 1000000),
+                (unsigned long long)__atomic_load_n(&g_vk_release_forwards, __ATOMIC_RELAXED),
+                (unsigned long long)g_vk_dset_new, (unsigned long long)g_vk_dset_reused);
+            {
+                u64 pipes, hits, make_ms, pipe_ms, shaders, shader_ms, uploads, upload_bytes;
+                vk_pipeline_stats(&pipes, &hits, &make_ms, &pipe_ms, &shaders, &shader_ms);
+                vk_tex_stats(&uploads, &upload_bytes);
+                LOG("vulkan: %llu shaders translated (%llu ms), %llu pipelines made (%llu from the cache, %llu ms "
+                    "making, %llu ms waited for), %llu render targets made, %llu texture uploads (%llu MB); %llu "
+                    "frames over 50 ms in the last 600, the slowest %llu ms\n",
+                    (unsigned long long)shaders, (unsigned long long)shader_ms, (unsigned long long)pipes,
+                    (unsigned long long)hits, (unsigned long long)make_ms, (unsigned long long)pipe_ms,
+                    (unsigned long long)vk_rt_made(), (unsigned long long)uploads,
+                    (unsigned long long)(upload_bytes >> 20), (unsigned long long)slow_frames,
+                    (unsigned long long)(slowest_ns / 1000000));
+                slow_frames = slowest_ns = 0;
+                u64 early_made, early_hits, early_left;
+                vk_pipeline_prewarm_stats(&early_made, &early_hits, &early_left);
+                if (early_made || early_left)
+                    LOG("vulkan: %llu pipelines of earlier runs made in the background (%llu from the cache), %llu "
+                        "still to make\n",
+                        (unsigned long long)early_made, (unsigned long long)early_hits,
+                        (unsigned long long)early_left);
+            }
+            {
+                /* each memory heap's use by this process and the driver's budget for it (VK_EXT_memory_budget): past
+                   the budget the driver moves memory, and the heap the CPU maps (the BAR window) is the one to watch */
+                VmaBudget b[VK_MAX_MEMORY_HEAPS];
+                const VkPhysicalDeviceMemoryProperties* mp;
+                char line[256];
+                size_t at = 0;
+                vmaGetHeapBudgets(g_vk.vma, b);
+                vmaGetMemoryProperties(g_vk.vma, &mp);
+                for (u32 q = 0; q < mp->memoryHeapCount && at < sizeof line; q++)
+                    at += (size_t)snprintf(line + at, sizeof line - at, "%s heap %u %llu of %llu MB", q ? "," : "", q,
+                                           (unsigned long long)(b[q].usage >> 20),
+                                           (unsigned long long)(b[q].budget >> 20));
+                LOG("vulkan: memory used and budgeted:%s\n", line);
+            }
+            LOG("vulkan: %llu draws sampled a target they render to in place (%llu barriers in passes, %llu passes "
+                "begun again), %llu through a copy\n",
+                (unsigned long long)g_vk_fb_draws, (unsigned long long)g_vk_fb_barriers,
+                (unsigned long long)g_vk_fb_restarts, (unsigned long long)g_vk_rt_copies);
         }
     }
     /* Offscreen frames still submit and advance the frame ring. g_last remains available for readback. */
     vk_submit(wait, VK_PIPELINE_STAGE_2_CLEAR_BIT, signal);
+    if (game) vk_renderdoc_present(g_vk_present);
     vk_frame_next(); /* every show used this frame's slot and acquire semaphore, the menu's own too */
     if (signal) {
         VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -375,6 +454,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
                                .swapchainCount = 1,
                                .pSwapchains = &g_vk.swapchain,
                                .pImageIndices = &idx};
+        vk_rec_queue(g_vk.gfx); /* the present waits on the frame's submission's semaphore */
         VkResult r = vkQueuePresentKHR(g_vk.gfx, &pi);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && !g_vk.sc_turned))
             recreate = 1;
@@ -487,20 +567,20 @@ static u64 surf_save(Surf* s, u32 x, u32 y, u32 w, u32 h, u32 transform, const c
                         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                         .dstOffsets = {{0, 0, 0}, {(i32)w, (i32)h, 1}}};
     flip_src(&blit, transform); /* screenshots show the window's transform, offscreen and headless presents too */
-    vkCmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+    rec_CmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tmp, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                    &blit, VK_FILTER_NEAREST);
     vk_barrier(cb, tmp, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy c = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
-    vkCmdCopyImageToBuffer(cb, tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+    rec_CmdCopyImageToBuffer(cb, tmp, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                            .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
                            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
                            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
                            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-    vkCmdPipelineBarrier2(cb, &di);
+    rec_CmdPipelineBarrier2(cb, &di);
     vk_finish();
     vk_readback_ready();
     vmaDestroyImage(g_vk.vma, tmp, tmem);
@@ -546,11 +626,13 @@ const Renderer vk_renderer = {
     .rt_reload = vkr_rt_reload,
     .dispatch = vkr_dispatch,
     .cs_mem_need = vk_compute_mem_need,
+    .mem_pending = vkr_mem_pending,
     .gfx_mem_need = vkr_gfx_mem_need,
     .before_syncwait = vkr_before_syncwait,
     .stream_incr = vkr_stream_incr,
     .release_write = vk_release_write,
     .release_need = vk_release_need,
+    .release_read = vk_release_read,
     .release_value = vk_release_value,
     .release_retire = vk_release_retire,
     .samples_reset = vkr_samples_reset,

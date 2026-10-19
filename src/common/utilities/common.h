@@ -34,10 +34,15 @@ int snx_path_exists(const char* path);
 int snx_mkdirs(const char* path);
 int snx_remove_tree(const char* path);
 int snx_copy_file(const char* src, const char* dst);
+/* size bytes of src from offset into a new dst, in pieces: never the whole range in memory */
+int snx_copy_file_range(const char* src, SnxU64 offset, SnxU64 size, const char* dst);
 int snx_copy_tree(const char* src, const char* dst);
 /* dst a second name of the file src, on the same disk: nonzero when dst is there already, or the disk or system takes
    none (another volume, FAT), for the caller to copy instead */
 int snx_link_file(const char* src, const char* dst);
+/* link a symbolic link to target, which it names as given: nonzero when it cannot be made (on Windows, without the
+   right to make one: developer mode or an administrator) */
+int snx_symlink(const char* target, const char* link);
 int snx_path_within(const char* path, const char* parent);
 int snx_replace(const char* src, const char* dst);
 int snx_list_dir(const char* path, char*** names, size_t* count);
@@ -46,6 +51,11 @@ unsigned char* snx_read_file(const char* path, size_t* size);
 int snx_write_file(const char* path, const void* data, size_t size);
 int snx_write_changed(const char* path, const void* data, size_t size);
 char* snx_temp_dir(const char* parent);
+/* the system's folder for temporary files: TMPDIR, else /tmp; on Windows GetTempPath's */
+char* snx_temp_root(void);
+/* Extract to tmpfs: where a game's extraction goes, <temp root>/scarletnx/work/<title ID as snx_title_text writes it>,
+   and its RomFS is read from when the game's data folder has none. NULL for a title ID that is no game's own */
+char* snx_tmpfs_work(SnxU64 title);
 char* snx_user_data_dir(void);
 /* Systems that follow the XDG Base Directory spec, where settings, state and caches have folders of their own */
 #if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
@@ -83,7 +93,7 @@ char* snx_menu_dir(const char* folder, int kind);
 /* 1 while what an older build left at old is still there, for the caller to say each run where it is and that this
    build keeps it at now. Nothing is moved: the player does that */
 int snx_left_behind(const char* old, const char* now);
-/* 1 for a name the program has as the launcher, not as a game's copy: scarletnx, a model's (scarletnx-mariko), the
+/* 1 for a name the program has as the launcher, not as a game's copy: scarletnx, scarletnx-switch, the
    AppImage's (ScarletNX-x86_64), in any case, without .exe or .AppImage. Started bare under another name it is a
    game's copy, which says what is missing and never opens the menu */
 int snx_launcher_name(const char* name);
@@ -123,11 +133,23 @@ SnxU64 snx_free_space(const char* path);
 /* 1 when a and b are on one disk (one file system), each a folder or one still to be made under the nearest folder
    there: what goes into one takes the other's free space */
 int snx_same_disk(const char* a, const char* b);
+/* a and b name the same file, through links: 1, else 0 (one of them missing too) */
+int snx_same_file(const char* a, const char* b);
 SnxU64 snx_file_size(const char* path);
 int snx_make_executable(const char* path);
 unsigned snx_cpu_count(void);
 /* seconds on a monotonic clock, for durations */
 double snx_seconds(void);
+/* Address space for code the process writes and then runs: reserved without access, then given access in whole pages.
+   snx_vm_protect commits the pages it makes accessible and decommits them with SNX_VM_NONE on Windows. 0 or -1 */
+enum { SNX_VM_NONE, SNX_VM_READ, SNX_VM_READ_WRITE, SNX_VM_READ_EXECUTE };
+size_t snx_vm_page_size(void);
+void* snx_vm_reserve(size_t size); /* NULL when the system refuses */
+int snx_vm_protect(void* p, size_t size, int access);
+void snx_vm_release(void* p, size_t size);
+/* Makes instructions written to [p, p + size) visible to instruction fetch, once the pages are executable. Another
+   core needs nothing more when the pages were never executable before: it cannot hold old instructions for them */
+void snx_vm_flush_code(void* p, size_t size);
 void snx_tool_console(void);
 char* snx_find_tool(const char* name);
 /* argv is NULL terminated. No shell. Captured output is heap-owned by caller.
@@ -142,6 +164,8 @@ int snx_run_stage(const char* const* argv, const char* cwd, const char* stage);
 /* As above, but intentional debugger stops do not abort the game. */
 int snx_run_debug_stage(const char* const* argv, const char* cwd, const char* stage);
 FILE* snx_fopen(const char* path, const char* mode);
+/* f to offset from its start, past 2 GiB too (fseek takes a long, 32 bits on Windows); 0, or nonzero */
+int snx_seek(FILE* f, SnxU64 offset);
 
 /* The game's name in a control.nacp: American English's, else the first language's that has one, in UTF-8 without
    control characters. 1 when it has one, else 0 and "" */

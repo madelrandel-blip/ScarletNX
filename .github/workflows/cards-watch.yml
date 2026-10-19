@@ -24,6 +24,15 @@ env:
   DISCORD_WEBHOOK_NIGHTLY: ${{ secrets.DISCORD_WEBHOOK_NIGHTLY }}
   DISCORD_WEBHOOK_PRS: ${{ secrets.DISCORD_WEBHOOK_PRS }}
 
+# following a build takes a runner for as long as the build: a pull request's newer build cancels the older one
+# (build.yml), and its follower goes with it. main's builds are followed each
+concurrency:
+  group: >-
+    cards-watch-${{ github.event.workflow_run.event == 'pull_request'
+    && format('{0}:{1}', github.event.workflow_run.head_repository.full_name, github.event.workflow_run.head_branch)
+    || github.event.workflow_run.id }}
+  cancel-in-progress: true
+
 jobs:
   watch:
     name: Follow the build

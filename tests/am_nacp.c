@@ -10,9 +10,9 @@ extern const u8* g_test_nacp;
 extern u64 g_test_nacp_size;
 
 static void nacp_reset(void) {
-    free(am.nacp);
-    am.nacp = NULL;
-    am.nacp_read = 0;
+    free(g_hle.am.nacp);
+    g_hle.am.nacp = NULL;
+    g_hle.am.nacp_read = 0;
 }
 
 int main(void) {
@@ -21,6 +21,8 @@ int main(void) {
     u64 v;
     nn_oe_DisplayVersion version;
     i64 normal = 0, journal = 0, required;
+    hle_init(); /* am_service_main runs it again, which keeps what this left (the NACP reset) */
+    g_hle.kernel.title_id = 0x0100BF00112C0000ull; /* the title am_service.c was written for */
     /* the system's language when the game has it (flags 0: every one), else the first fallback ns tries */
     CHECK(am_desired_language(1, 0) == 1);           /* American English */
     CHECK(am_desired_language(0, 1u << 2) == 0);     /* Japanese, which the game has */
@@ -66,7 +68,7 @@ int main(void) {
     CHECK(normal == 0x5000000 && journal == 0x1400000);
     nacp_reset();
     g_test_nacp = NULL;
-    am.save_extended[0] = am.save_extended[1] = 0; /* a program just started, without a NACP: nothing extended yet */
+    g_hle.am.save_extended[0] = g_hle.am.save_extended[1] = 0; /* a program just started, without a NACP: nothing extended yet */
     CHECK(nn_am_service_IApplicationFunctions_GetDisplayVersion(NULL, &version) == 0);
     CHECK(!strcmp((char*)version.v, "1.0.0"));
     CHECK(nn_am_service_IApplicationFunctions_GetSaveDataSize(NULL, 1, NULL, &normal, &journal) == 0);

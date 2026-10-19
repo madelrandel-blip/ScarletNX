@@ -10,6 +10,7 @@
 * [Headless Vulkan / lavapipe](#headless-vulkan--lavapipe)
 * [AppImage / display](#appimage--display)
 * [Folders](#folders)
+* [Users](#users)
 * [Settings / input](#settings--input)
   * [On-screen controls](#on-screen-controls)
 
@@ -25,12 +26,22 @@ Pass a single XCI, NSP, DXCI or DNSP to extract, recompile and play:
 ```
 
 The driver runs each step as a child process and starts the game with its folder, `games/<id>/`, as its working
-directory. The game is named by its title ID, an NRO by its name; `games/` and `work/` are the data folder's, from a
-build tree too ([Folders](#folders)). Its extraction in `work/` is named after the dump stem, retaining letters,
-digits, UTF-8, spaces, hyphens and underscores.
+directory. The game is named by its title ID, read from the dump's NCA headers before anything is extracted, an NRO by
+its name (a dump without a title ID of its own by its stem); `games/` is the data folder's, from a build tree too
+([Folders](#folders)). The dump is extracted straight into the game's folder, `games/<id>/<id>_data/` (`exefs/`,
+`romfs/`, `control.nacp`), and the game made from it there: there is no second copy. `<id>.extracting` stays in the
+game's folder while an extraction is unfinished, and a stopped one is redone on the next run, the game's saves kept.
 `--repo DIR` and `--build-dir DIR` may precede the dump. Keys use the usual discovery paths below.
-`--outdir DIR` puts the game's folder in DIR and `--out DIR` the dump's extraction at DIR, as `-r` and `-x` take
-them, in place of the data folder's `games/` and `work/<dump stem>`; an NRO has no extraction to name.
+`--outdir DIR` puts the game's folder in DIR in place of the data folder's `games/`, as `-r` takes it. `--out DIR`
+keeps the dump's extraction at DIR instead, as `-x` takes it, the game made from a copy of it; an NRO has no
+extraction to name.
+`--tmpfs` extracts to tmpfs instead: `<temp>/scarletnx/work/<title ID>` (`$TMPDIR`, else `/tmp`; the temporary
+folder on Windows), where the game reads its RomFS from while its ExeFS and saves stay in `games/<id>/<id>_data/`.
+The game's folder gets `<id>.source`, a link to the dump, in either mode, and `<id>.tmpfs` while its RomFS is in
+tmpfs. A run extracts the RomFS again from the link when the system emptied tmpfs, and moves it between tmpfs and
+the game's folder when `--tmpfs` is given or left out. Without the link (a game made before, or Windows without the right to
+make one) it says *Can't be extracted to tmpfs due to missing symlink*. `-r --tmpfs` on an extraction leaves its
+RomFS where it is.
 `-H` (`--headless`) can precede or follow the dump and is passed to the game only.
 Omitting it starts the game with a window.
 `-x` means `--extract`, and `-r` means `--recomp` (the old `--recompile` spelling was removed).
@@ -63,11 +74,8 @@ the game's `.ini` keeps `controls`. Any other `--key=value` of the game's
 `.ini` is forwarded as well, for that run (`scarletnx --settings` lists them all), and so are the timed-run ones
 (`--seconds=`, `--shot=`...); any other key stops the run with `unknown option`.
 The game's own executable also takes `-v`, the same as `--log=2`.
-`--backend=gcc` selects libgccjit instead of the default LLVM backend when preparing
-a dump. An explicit `--backend=llvm|gcc` forces recompilation rather than reusing a
-cached executable built by another compiler.
-It assembles and links with GNU binutils' `as` and `ld`: the AppImage and the Windows zip carry theirs, elsewhere
-they come from PATH, and without them it stops and says so.
+LLVM is the only backend. `--backend=llvm`, which older scripts give, is accepted and changes nothing, and any
+other `--backend` stops with an error.
 Use the separate commands for updates, custom keys or other compiler options.
 
 DXCI and DNSP with decrypted content need no keys. Containers are identified by their headers,
@@ -143,11 +151,12 @@ Remaining examples: POSIX.
   (`%USERPROFILE%\.switch` on Windows).
   Common NSP tickets supplement title keys. Fully decrypted content needs neither key file.
 - **Extraction:** defaults to the data folder's `work/<dump stem>`; `--name`/`--out DIR` override. Refuses existing
-  `exefs`; a build tree's driver builds a missing hactool in its checkout.
-  [Temp cleanup/key filtering](../src/nx/runtime/driver/extract.c).
+  `exefs`. hactool runs inside the driver and reads each NCA where it lies in the XCI or NSP, so the ExeFS and RomFS
+  are written straight into the output and nothing is unpacked beside it
+  ([key filtering and cleanup](../src/nx/runtime/driver/extract.c)).
   Sparse and compressed NCAs, updates with large relocation tables and gamecard dumps that start with the card's key
-  area all extract, through what [`cmake/hactool-libhac.patch`](../cmake/hactool-libhac.patch) ports from LibHac.
-- **Recompile:** AOT → module (LLVM, or `--backend=gcc` for libgccjit on DEC Alpha EV67 hosts) →
+  area all extract, through what [`storage.c`](../src/nx/runtime/driver/hactool/storage.c) ports from LibHac.
+- **Recompile:** AOT → module (LLVM) →
   final runtime deployment, for this machine's CPU. Shaders compile directly to SPIR-V at runtime.
   `-O 0..3,s,z` sets the optimization level.
   `--target auto|linux|win64` takes only this host's own system: modules are built for the machine that builds
@@ -156,7 +165,9 @@ Remaining examples: POSIX.
   `--keep-c` is the deprecated spelling of `--keep-ir`.
 - **Codegen:** `--no-build` stages data/INI only; `--interp-only` omits AOT functions.
   `--chunk N` sets instructions per code unit. Nothing is cached between runs.
-  `--keep-ir` saves the generated code (LLVM IR, libgccjit dumps) in `<outdir>/<NAME>/<NAME>_build/`.
+  `--keep-ir` saves the generated code (LLVM IR) in `<outdir>/<NAME>/<NAME>_build/`.
+  `--hook-direct-calls` sends calls and branches between guest functions through the dispatch table too, so
+  `SNX_NVN_TRACE` also counts calls made by direct branch. The game runs slower, so use it only for investigating.
 - **Data updates:** ExeFS refreshes; `<id>_data/romfs` is reused.
   Replace cached RomFS after asset changes; preserve `<id>_data/save/`.
 
@@ -169,6 +180,7 @@ With `--out work/Game` and `--outdir games` as above (without them, see [Folders
 | `games/<id>/<id>_data/`, `<id>.ini` | Data/saves (and `control.nacp`) + settings |
 | `games/<id>/<id>_build/` | Generated code, only with `--keep-ir` |
 | `games/<id>/shader_cache/vk_pipelines.bin` | Vulkan pipeline cache |
+| `games/<id>/shader_cache/<id>.vkshaders` | Translated shaders and the pipelines made, made again at the next start |
 
 ## GDB (UNIX only)
 
@@ -279,10 +291,12 @@ list). The user's data folder and a portable copy's keep each kind of file apart
 | the menu's `recent.txt`, `last-run.log` | - | `~/.local/state/scarletnx/` | `state/` |
 | the menu's Share log, `scarletnx.log` | - | `~/.local/state/scarletnx/` | `state/` |
 | `prod.keys`, read before `~/.switch` | the folder | `~/.local/share/scarletnx/` | the folder |
+| the console's users, `users.ini` and `<uid>.jpg` ([Users](#users)), and `online.ini`, an Eden room's password (`room`) | `users/` of the user's data folder | `~/.local/share/scarletnx/users/` | `users/` |
 
 The menu works in the user's data folder or a portable copy's, unless its Settings > App > Folders picks a data
 folder, a games folder or an extractions folder ([GUI](GUI.md)): it passes them to the driver as `--repo`, `--outdir`
-and `--out` (to the 3DS driver as `--repo` and `--output`), and its own files stay where they are. On Android they
+and `--out` (an extractions folder picked keeps a Switch dump's extraction there, the game made from a copy; to the
+3DS driver as `--repo` and `--output`), and its own files stay where they are. On Android they
 are in its data folder's `config/` and `state/`, in the app's own storage, which needs no permission. `~/.local/share`, `~/.config`, `~/.local/state` and `~/.cache` are the
 defaults of `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME`, `$XDG_STATE_HOME` and `$XDG_CACHE_HOME` (a relative one is ignored).
 
@@ -293,10 +307,37 @@ none of it: as long as it is there, the menu lists each folder and where it goes
 and an older game runs where it is, its run saying where its folder goes.
 [DEPRECATIONS](DEPRECATIONS.md) says how to move them.
 
+## Users
+
+The console's users are in `users/users.ini` of the data folder ([Folders](#folders)), every game's: up to 8, each a
+section in the console's order. Without the file there is one, `Player`. User 1 is always that first user, by the uid it
+has always had, so its saves stay its own; each other one needs a uid of 32 hex digits of its own (not zero) and a
+nickname. A nickname is 4 to 20 letters, digits, spaces, `.`, `_` or `-`, the names Eden's rooms take; any other
+stops the game and says why:
+
+```ini
+[user1]
+nickname=Aogo
+[user2]
+uid=5f3c0d9e8a7b41c2963e0f1a2b3c4d5e
+nickname=Xuji
+```
+
+`uid` (user 1's, if written, is `0123456789abcdeffedcba9876543210`) and `nickname` are the keys; any
+other key, a section out of order or twice, or a line that is no key stops the game and says why. A user's picture is
+`users/<uid>.jpg`, a JPEG of at most 128 KiB (256x256 as the console's), read when the game starts; without one it is
+Wimsy. The game plays as the user its `.ini`'s `user` names (`--user=N` for one run): with one user, the game picks it
+on its own; with more, the game's user selector gets that user. Each user's Account saves are `save/user.<uid>` in the
+game's `<id>_data/`; the first user's that an older version left in `save/user` are played there until you move them
+([DEPRECATIONS](DEPRECATIONS.md)). The game's menu (Home, F2) shows the user playing in a box at its head's right, their
+nickname and picture, and the launcher the one its Settings' `user` names, where a click picks another
+([GUI](GUI.md)); a users.ini that lists no users is said in the launcher's foot.
+
 ## Settings / input
 
 `Game.ini`: help rewritten at startup, most settings hot-reload. `--key=value` overrides one run.
-Restart for `docked`, `fullscreen`, `language`, `resolution`, `anisotropy`, `memory_gb`, `heap_max_mb`, `profile`.
+Restart for `docked`, `fullscreen`, `language`, `resolution`, `anisotropy`, `memory_gb`, `heap_max_mb`, `airplane_mode`,
+`ldn`, `room`, `profile`, `jit_threads`.
 `scarletnx --settings` prints each setting the launcher's Settings offer, one a line: its section, key, default,
 type, range and help, tab-separated.
 
@@ -312,7 +353,12 @@ type, range and help, tab-separated.
 | `fps_limit` | `game` | The pace the game asks for, as on the console: 60 FPS, or 30 for a game made for 30. `0` is unlimited, and `10` to `1000` is that many FPS |
 | `memory_gb` | `0` | Memory the game sees. Below `6` it is the console's 3.2 GB, `6` gives 4.8 GB and `8` gives 6.8 GB. Games that run out of memory on 3.2 GB, like Tears of the Kingdom, need `6` |
 | `heap_max_mb` | `0` | The most heap the game can allocate, in MB. `0` is as much as the memory allows |
-| `network` | `0` | `0` reports offline and lets the game reach only loopback, which is not a network sandbox. `1` uses the computer's connection, and the resolver blocks known console service domains |
+| `jit_threads` | `0` | Threads compiling the game code the recompiler missed, which a thread waits for when it reaches it. `0` uses every CPU the game may run on but two, at most 8. They run below the game's threads |
+| `network` | `0` | `0` reports offline and lets the game reach only loopback, which is not a network sandbox. `1` uses the computer's connection, and the resolver blocks known console service domains. Local wireless works either way (`ldn`) |
+| `airplane_mode` | `0` | `1` is the console in airplane mode: offline whatever `network` says, no local wireless, as the game hears it, and in no Eden room |
+| `ldn` | `lan` | Local wireless. `lan` is over the LAN with ldn_mitm's protocol, with another ScarletNX, a Ryujinx or a console running ldn_mitm: with `network=1` the console is the computer's address, with `0` it is `127.0.0.N`, one per ScarletNX on the machine, so two of them play together through loopback. `room` is through the Eden room `room` names, with the Edens and ScarletNXs in it. `off` is local wireless disabled, as the game hears it. Another word stops the game |
+| `room` | empty | The Eden room `ldn=room` joins at start: `host` or `host:port` (`24872` without one); empty with `ldn=room`, or with a space in it, stops the game. The console is there as the user playing, by its nickname ([Users](#users)), at the address the room gives it (`192.168.x.y`), which nifm gives the game too, and the game's datagrams go through the room. A room with a password takes it from `users/online.ini` ([Folders](#folders)), a file only you may read (`chmod 600`, not checked on Windows) that holds `room_password=...` alone: another key or a section stops the game. A room that refuses stops the game and says why |
+| `user` | `1` | The console's user the game plays as, `1` to `8`, as [Users](#users) lists them. A number with no user stops the game |
 | `touch` | `2` | The game's touch screen: `2` fingers and the mouse's left button, `1` fingers, `0` off |
 | `controls` | `1` on Android, else `0` | The [on-screen controls](#on-screen-controls) shown |
 | `controls_snap`, `controls_scale`, `controls_opacity`, `controls_rel_center`, `controls_dpad_slide`, `controls_haptics` | `0`, `50`, `100`, `1`, `1`, `1` | As [On-screen controls](#on-screen-controls) describes them. `controls_scale` runs from `0` to `100` for 50% to 150% |

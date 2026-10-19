@@ -80,17 +80,28 @@
 /* ============================================================ messages */
 static void log_stderr(const char* m) { fputs(m, stderr); }
 static void (*g_log)(const char*) = log_stderr;
+static void (*g_warn)(const char*) = log_stderr;
 void snx_net_set_log(void (*log)(const char* message)) { g_log = log ? log : log_stderr; }
-void snx_net_log(const char* fmt, ...) {
+void snx_net_set_warn(void (*warn)(const char* message)) { g_warn = warn ? warn : log_stderr; }
+static void say(void (*to)(const char*), const char* fmt, va_list ap) {
     char m[512];
-    va_list ap;
-    va_start(ap, fmt);
     int n = vsnprintf(m, sizeof m - 1, fmt, ap);
-    va_end(ap);
     if (n < 0) return;
     size_t len = strlen(m);
     if (!len || m[len - 1] != '\n') strcat(m, "\n");
-    g_log(m);
+    to(m);
+}
+void snx_net_log(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    say(g_log, fmt, ap);
+    va_end(ap);
+}
+void snx_net_warn(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    say(g_warn, fmt, ap);
+    va_end(ap);
 }
 
 /* ============================================================ locks, threads, time, notifiers */

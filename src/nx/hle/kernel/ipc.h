@@ -22,6 +22,24 @@ struct SvcObj;
 
 /* One request, parsed from the client's message (TLS's 0x100 bytes, or SendSyncRequestWithUserBuffer's buffer), and
    the reply the handler builds */
+/* an entry of the crash report's ring of requests (ipc.c): what became of one, formatted only when a report prints it.
+   name is the service object's, which lives as long as the process (sm.c keeps the names of its stand-ins), and what
+   a literal */
+enum {
+    IPC_REC_RUNNING,
+    IPC_REC_SERVED,
+    IPC_REC_ANSWERED,       /* sf answered it without the service, for the reason in what */
+    IPC_REC_CLOSE_OBJECT,   /* a domain's Close, the object in cmd */
+    IPC_REC_NOT_SESSION,    /* the handle in cmd */
+    IPC_REC_SESSION_CLOSED,
+    IPC_REC_KERNEL_REFUSED, /* the kernel's result in rc */
+    IPC_REC_TYPE_CLOSED     /* a message type sf doesn't serve closed the session */
+};
+typedef struct {
+    const char *name, *what;
+    u32 kind, type, cmd, in[2], rc;
+} IpcRec;
+
 typedef struct IpcCtx {
     u8* msg;
     u64 msg_size;
@@ -64,7 +82,8 @@ typedef struct SvcObj {
     void (*destroy)(struct SvcObj* self);
     int refs;
     u32 ptrbuf; /* the server's pointer buffer size, which QueryPointerBufferSize answers (0x8000 unless set) */
-    void* data;
+    void* data;   /* a slot of its service's pool in g_hle (svcobj_new_data), or NULL */
+    u32 datasize; /* the slot's size, zeroed as the object goes */
     u64 u[8];
 } SvcObj;
 
@@ -88,7 +107,15 @@ typedef struct Domain {
 
 typedef SvcObj* (*SvcCtor)(void);
 
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t datasize);
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*));
+/* an object whose data is a slot of a pool in g_hle (hle.h), count slots of size bytes at base, searched from *next.
+   The data's type starts with a u32 the object's pool index plus 1 is written to (non-zero, so the slot is taken, as
+   hle.h's pools require), and the pool is guarded by ipc.c's lock: the object takes the slot zeroed but for it, and
+   zeroes it as it goes, after its destroy */
+SvcObj* svcobj_new_data(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), void* base, size_t size, u32 count,
+                        u32* next, const char* what);
+#define SVCOBJ_NEW_DATA(name, dispatch, arr, next, what)                                                               \
+    svcobj_new_data((name), (dispatch), (arr), sizeof *(arr), (u32)(sizeof(arr) / sizeof *(arr)), &(next), (what))
 void svcobj_ref(SvcObj* o);
 void svcobj_unref(SvcObj* o);
 u32 session_new(SvcObj* obj);
@@ -168,7 +195,45 @@ static inline int ipc_counts(const IpcCtx* c, int pid, int na, int nb, int nx, i
 /* a domain request carries exactly the objects the command declares */
 static inline int ipc_objects(const IpcCtx* c, int nobj) { return !c->is_domain || c->nin_objs == nobj; }
 
-/* the last 32 requests, for crash reports: how many there have been, and request seq's entry (seq & 31) */
+/* the last 32 requests, for crash reports: how many there have been, and request seq's entry (seq & 31) as text */
 u32 ipc_ring_count(void);
-const char* ipc_ring_entry(u32 seq);
+void ipc_ring_text(u32 seq, char* out, size_t n);
+/* ---- HLE state in g_hle (hle.h) */
+/* Service objects, sessions and domains each live in a pool (hle.h) */
+#define SVCOBJ_MAX  8192 /* sessions' objects, domains', and those services keep (am's storages) */
+#define SESSION_MAX (H_MAX + THREAD_MAX + 1) /* each is made with a handle, and only a request in flight outlives it */
+#define DOMAIN_MAX  64 /* one per session that called ConvertCurrentObjectToDomain, shared by its clones */
+#define WARN_PAIRS  512 /* the (service, command) pairs ipc_warn_once counts */
+/* the names sm hands out: the runtime registers about a hundred (services.c), and 256 leaves room for more */
+#define SVCREG_MAX  256
+
+/* a name sm hands out, with the constructor of a new object for every session */
+typedef struct {
+    const char* name;
+    SvcCtor ctor;
+} SvcReg;
+
+/* ipc.c's. lk guards the pools (taking and freeing, and every domain's objects), every service's pool of object data
+   (svcobj_new_data), the warned pairs and the registry: none of them is held long */
+typedef struct {
+    PMutex lk;
+    SvcObj svcobjs[SVCOBJ_MAX];
+    KSession sessions[SESSION_MAX];
+    Domain domains[DOMAIN_MAX];
+    u32 svcobj_next, session_next, domain_next;
+    /* ipc_warn_once's (service, command) pairs */
+    struct {
+        char name[128];
+        u32 cmd;
+        int n;
+    } seen[WARN_PAIRS];
+    int nseen;
+    /* the service registry, a slot array: a live entry has a name, and none is ever freed. Registering more asserts */
+    SvcReg reg[SVCREG_MAX];
+    u32 reg_next;
+    /* the crash report's ring of the last 32 requests: ring_n counts every request, on every thread */
+    IpcRec ring[32];
+    char apart[64];
+    u32 ring_n;
+} HleIpc;
 #endif

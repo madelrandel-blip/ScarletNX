@@ -7,7 +7,7 @@
 
 /* Every page under 2^40 (all GPU and guest addresses) in a two-level table like the GMMU's: leaves of 4096 pages
    (16 MiB) made at the first write in them, each with its latest generation so a lookup skips the leaves nothing wrote
-   since. Zeroed is empty. Not locked: the caller serializes */
+   since. Zeroed is empty. Writers are serialized by the caller; readers take no lock (write_pages.c) */
 typedef struct WritePageLeaf WritePageLeaf;
 typedef struct {
     WritePageLeaf* leaf[1u << 16];

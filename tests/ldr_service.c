@@ -4,8 +4,10 @@
    No game assets, RSA keys or precompiled NRO host libraries are required. */
 #include "nx/hle/services/services_int.h"
 #include "nx/gpu/gpu.h"
+#include "nx/hle/hle.c"
 #include <openssl/evp.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -22,17 +24,32 @@
 #define NRR   (HEAP_BASE + 0x5000)
 #define SRC2  (HEAP_BASE + 0x8000)
 static int fail_commit;
-u64 g_title_id = 0x0100000000001000ull;
 void (*g_gpu_mapping_begin)(u64, u64, int);
 void (*g_gpu_mapping_end)(void);
 int g_verbose;
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
 void pm_init(PMutex* m) { CHECK(!pthread_mutex_init(&m->l, NULL)); }
 void pm_lock(PMutex* m) { CHECK(!pthread_mutex_lock(&m->l)); }
 void pm_unlock(PMutex* m) { CHECK(!pthread_mutex_unlock(&m->l)); }
+/* this host's pages, or SNX_HOST_PAGE's larger ones (ldr_service_64k_pages), as plat_posix.c */
+u64 plat_vm_page(void) {
+    u64 page = (u64)sysconf(_SC_PAGESIZE);
+    const char* forced = getenv("SNX_HOST_PAGE");
+    if (forced) {
+        CHECK(strtoull(forced, NULL, 0) > page);
+        page = strtoull(forced, NULL, 0);
+    }
+    return page;
+}
+/* aligned to plat_vm_page, a page more reserved for that */
 u8* plat_vm_reserve(u64 size) {
-    void* p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return p == MAP_FAILED ? NULL : p;
+    u64 page = plat_vm_page();
+    void* p = mmap(NULL, size + page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : (u8*)(((uintptr_t)p + page - 1) & ~(uintptr_t)(page - 1));
 }
 int plat_vm_commit(u8* p, u64 size) {
     if (fail_commit) {
@@ -44,6 +61,20 @@ int plat_vm_commit(u8* p, u64 size) {
 void plat_vm_decommit(u8* p, u64 size) {
     CHECK(!madvise(p, size, MADV_DONTNEED));
     CHECK(!mprotect(p, size, PROT_NONE));
+}
+/* runtime/guest_jit.c: what ldr:ro tells the JIT. -1: no JIT here, the NRO stays the interpreter's */
+static u64 jit_base, jit_text, jit_removed_base;
+static int jit_added, jit_removed;
+int jit_code_added(u64 base, u64 text_size, u64 size) {
+    (void)size;
+    jit_base = base;
+    jit_text = text_size;
+    ++jit_added;
+    return -1;
+}
+void jit_code_removed(u64 base) {
+    jit_removed_base = base;
+    ++jit_removed;
 }
 /* no alias pool here: views are copies (memory_alias tests the pool) */
 int plat_alias_init(u64 size) {
@@ -90,20 +121,19 @@ void fatal(const char* fmt, ...) {
 static KObj process = {.type = KO_PROCESS};
 KObj* h_get_ref(u32 h, int type) { return h == 0xFFFF8001u && type == KO_PROCESS ? &process : NULL; }
 void kobj_unref(KObj* p) { CHECK(p == &process); }
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t size) {
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
     SvcObj* o = calloc(1, sizeof *o);
     CHECK(o != NULL);
     o->name = name;
     o->dispatch = dispatch;
     o->refs = 1;
-    o->data = calloc(1, size);
-    CHECK(o->data != NULL);
     return o;
 }
+#include "svcobj_data.h"
 void svcobj_unref(SvcObj* o) {
     if (--o->refs) return;
     if (o->destroy) o->destroy(o);
-    free(o->data);
+    test_svcobj_data_free(o);
     free(o);
 }
 void ipc_out_overflow(IpcCtx* c) {
@@ -190,7 +220,7 @@ static void fixture(void) {
     gw64(SRC + 0x2000, 0x80);
     memset(GP(BSS), 0xa5, 0x1000); /* map preserves caller's BSS backing, as Eden does */
     memcpy(GP(NRR), "NRR0", 4);
-    gw64(NRR + 0x330, g_title_id);
+    gw64(NRR + 0x330, g_hle.kernel.title_id);
     gw32(NRR + 0x338, 0x1000);
     gw32(NRR + 0x340, 0x350);
     gw32(NRR + 0x344, 1);
@@ -220,10 +250,11 @@ static void execute(u64 base) {
     cpu.disp = dispatch;
     cpu.code_lo = 0;
     cpu.code_hi = 4;
-    const RtAPI rt = {0};
+    /* RtAPI.miss: the reference interpreter (ldr_interp.c), standing in for the runtime JIT */
+    const RtAPI rt = {.miss = snx_interp};
     cpu.rt = &rt;
     cpu.x[30] = 0x1234;
-    CHECK(snx_lookup(&cpu, base + 0x80) == snx_interp_entry);
+    CHECK(snx_lookup(&cpu, base + 0x80) == snx_interp);
     snx_lookup(&cpu, base + 0x80)(&cpu, base + 0x80);
     CHECK(cpu.x[0] == 42 && cpu.pc == 0x1234);
     /* NRO -> AOT dispatch -> NRO -> caller, with a saved link register. */
@@ -344,12 +375,7 @@ static void limits(void) {
     CHECK(!mem_heap_set(0x10000, 0x200000));
 }
 int main(void) {
-    /* guest memory is mapped and protected in the Switch's 4 KiB pages, which a host with bigger ones (16 KiB on
-       Apple silicon) can't do: what plat_posix.c stops the runtime for there (docs/APPLE.md) */
-    if (sysconf(_SC_PAGESIZE) != 4096) {
-        printf("skipped: this host's pages are %ld bytes, and guest memory needs 4 KiB ones\n", sysconf(_SC_PAGESIZE));
-        return 77;
-    }
+    hle_init();
     mem_init();
     CHECK(!mem_heap_set(0x10000, 0x10000));
     fixture();
@@ -409,7 +435,7 @@ int main(void) {
     gw32(NRR + 0x340, 0x350);
     gw64(NRR + 0x330, 1);
     CHECK(call(o) == RO(6));
-    gw64(NRR + 0x330, g_title_id);
+    gw64(NRR + 0x330, g_hle.kernel.title_id);
     CHECK(!call(o)); /* RegisterModuleInfo has no process handle: the session's RegisterProcessHandle gave it */
     /* Hash list is a snapshot. */
     memset(GP(NRR + 0x350), 0, 32);
@@ -432,6 +458,7 @@ int main(void) {
     GP(SRC + 0x180)[0] = 0;
     u64 base = load(o);
     CHECK(base != SRC && !memcmp(GP(base), GP(SRC), 0x3000));
+    CHECK(jit_added == 1 && jit_base == base && jit_text == 0x1000 && !jit_removed); /* its text joins the JIT */
     CHECK(gr64(base + 0x2000) == 0x80 && GP(base + 0x3000)[0] == 0xa5);
     block_is(base, MS_ALIASCODE, PERM_RX, 0);
     block_is(base + 0x1000, MS_ALIASCODE, PERM_R, 0);
@@ -456,6 +483,7 @@ int main(void) {
     CHECK(!call(o)); /* unloading NRR must not unload NRO */
     request(1, base, 0, 0, 0);
     CHECK(!call(o));
+    CHECK(jit_removed == 1 && jit_removed_base == base); /* before the unmap */
     CHECK(call(o) == RO(1028));
     block_is(base, MS_FREE, PERM_NONE, 0);
     block_is(SRC, MS_NORMAL, PERM_RW, 0);
@@ -467,6 +495,7 @@ int main(void) {
     CHECK(!call(o));
     base = load(o);
     svcobj_unref(o);
+    CHECK(jit_removed == 2 && jit_removed_base == base); /* the session's end unmaps it, and tells the JIT first */
     block_is(base, MS_FREE, PERM_NONE, 0);
     block_is(BSS, MS_NORMAL, PERM_RW, 0);
     o = new_ro1();

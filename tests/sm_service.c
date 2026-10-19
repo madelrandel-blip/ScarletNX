@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "nx/hle/services/sm.c"
+#include "nx/hle/hle.c"
 
 u8* g_mem;
 int g_verbose;
@@ -34,14 +35,14 @@ u32 session_new(SvcObj* obj) {
     (void)obj;
     return 0x1234;
 }
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t size) {
-    static u8 data[16];
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
     static SvcObj o;
-    (void)dispatch, (void)size;
+    (void)dispatch;
     o.name = name;
-    o.data = data;
     return &o;
 }
+void pm_lock(PMutex* m) { (void)m; }
+void pm_unlock(PMutex* m) { (void)m; }
 void out_move_h(IpcCtx* c, u32 handle) {
     (void)c, (void)handle;
 }
@@ -69,7 +70,14 @@ static nn_sm_ServiceName name_of(const char* s, size_t n) {
     return name;
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+void pm_init(PMutex* m) { (void)m; }
+
 int main(void) {
+    hle_init();
     nn_sm_ServiceName name;
     u32 handle = 0, port = 0;
 

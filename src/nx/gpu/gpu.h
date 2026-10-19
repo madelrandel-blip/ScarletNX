@@ -66,6 +66,13 @@ typedef struct GpuChannel {
        parameters of (0xE00 up): a call runs at its batch's last word */
     u32 mme_code[0x2000];
     u32 mme_start[0x80];
+    /* a macro's native implementation is chosen by the hash of its code from its start to the end of the upload batch
+       that wrote it (mme.c): the batch each code word came in (0 never uploaded; batches count 0x45 writes), and per
+       slot 0 when not chosen since the code or the starts changed, 1 for the interpreter, else a native one's index + 2 */
+    u32 mme_batch;
+    u32 mme_code_batch[0x2000];
+    u8 mme_choice[0x80];
+    u64 mme_hash[0x80]; /* the hash mme_choose found for each slot, for the interpreted calls' statistics */
     u32 mme_upload, mme_start_ptr;
     u32 mme_params[0x10000];
     u32 mme_nparams;
@@ -134,7 +141,8 @@ typedef struct VicSlot {
 } VicSlot;
 typedef struct VicJob {
     u32 fmt, sw, sh;
-    u32 tx0, ty0, tw, th; /* the target rectangle the background colour fills, in the surface; tw 0: none */
+    u32 tx0, ty0, tw, th; /* the target rectangle the background colour fills, in the surface; tw 0: none. The
+                             slots lie inside it (vic.c's slot_resolve clips them) */
     u32 bg[4];            /* the background colour: R, G, B, A, 10 bit */
     VicPlane oy, oc;      /* oc.p is NULL when the format has no chroma */
     VicSlot slots[8];

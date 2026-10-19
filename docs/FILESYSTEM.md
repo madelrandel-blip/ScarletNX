@@ -24,8 +24,11 @@ Top-level directories are drives; global lookup accepts data-relative paths:
 | `/file` | `root/file` |
 
 `IFileSystem`: mount-relative `/`; reject drive prefixes and escaping `..`. Normalize separators/`.`; case-sensitive.
-Missing `root/` is virtual until mutation. Saves use `save/<type>`; Account save adopts nonempty `save/system`
-if `save/user` is absent.
+Missing `root/` is virtual until mutation. Saves use `save/<type>`, and an Account save its user's
+`save/user.<uid>` (32 hex digits, `users/users.ini`'s, [USAGE](USAGE.md#users)). The first user's, while it has no
+folder, is played where an older version left it: `save/user`, the one Account save before there were users, else a
+nonempty `save/system` ([DEPRECATIONS](DEPRECATIONS.md)). With `save/user` and its folder both there the game stops
+and leaves both, for the player to keep one.
 
 Init rejects scan/stat errors, symlinks/junctions, regular-file hardlinks, special files and invalid names.
 Tree limits: 4096-byte path buffers including NUL, 256 directory levels below the data root.

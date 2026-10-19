@@ -6,10 +6,13 @@
 #include "nx/runtime/main.h"
 #include "common/utilities/common.h"
 #include "nx/gpu/gpu.h"
+#include "nx/gpu/nvn_trace.h"
 #include "nx/gpu/renderer.h"
 #include "nx/hle/filesystem/fs.h"
+#include "nx/hle/hle.h"
 #include "nx/hle/kernel/kernel.h"
 #include "nx/hle/services/hid.h"
+#include "nx/runtime/guest_jit.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/hle/services/services.h"
 #include "nx/hle/services/vi.h"
@@ -40,7 +43,6 @@ volatile int g_quit;
 int (*snx_menu)(const char* self);
 const SnxModule* g_mod;
 GuestFn* g_disp;
-GuestFn snx_interp_entry; /* the module's interpreter, for an address nothing was compiled for (cpu.h's lookup) */
 
 /* A build that links a game's code into the runtime defines it; none does yet (src/nx/CMakeLists.txt) */
 const SnxModule* snx_module_static(void) __attribute__((weak));
@@ -164,7 +166,6 @@ static void dispatch_init(void) {
     u64 words, i;
     g_code_lo = g_mod->code_lo;
     g_code_hi = g_mod->code_hi;
-    snx_interp_entry = g_mod->interp;
     if (g_code_hi <= g_code_lo) return;
     words = (g_code_hi - g_code_lo) / 4;
     if (words > ((size_t)-1) / sizeof *g_disp) fatal("The game's code range is too large");
@@ -236,13 +237,14 @@ static void read_npdm(void) {
         free(d);
         return;
     }
-    g_sysres_size = rd32le(d + 0x14);
+    g_hle.kernel.sysres_size = rd32le(d + 0x14);
     aci = rd32le(d + 0x70);
     aci_size = rd32le(d + 0x74);
     if (aci < size && aci_size >= 0x38 && aci_size <= size - aci && !memcmp(d + aci, "ACI0", 4)) {
         caps = rd32le(d + aci + 0x30);
         caps_size = rd32le(d + aci + 0x34);
         for (i = 0; caps < aci_size && caps_size <= aci_size - caps && i + 4 <= caps_size; i += 4) {
+        nvn_trace_report();
             u32 cap = rd32le(d + aci + caps + i), lowest, highest, min_core, max_core;
             if ((cap & 0xF) != 0x7) continue; /* ThreadInfo: three ones, then a zero */
             lowest = cap >> 4 & 63;
@@ -253,13 +255,13 @@ static void read_npdm(void) {
                 WARN("npdm: its thread capability %08x is not one the kernel takes, the defaults apply\n", cap);
                 break;
             }
-            g_core_mask = (((u64)2 << max_core) - 1) & ~(((u64)1 << min_core) - 1);
-            g_prio_mask = (lowest == 63 ? ~(u64)0 : ((u64)2 << lowest) - 1) & ~(((u64)1 << highest) - 1);
+            g_hle.svcmem.core_mask = (((u64)2 << max_core) - 1) & ~(((u64)1 << min_core) - 1);
+            g_hle.svcmem.prio_mask = (lowest == 63 ? ~(u64)0 : ((u64)2 << lowest) - 1) & ~(((u64)1 << highest) - 1);
             break;
         }
     }
-    LOG("npdm: system resource %llu MB, cores %llx, priorities %llx\n", (unsigned long long)(g_sysres_size >> 20),
-        (unsigned long long)g_core_mask, (unsigned long long)g_prio_mask);
+    LOG("npdm: system resource %llu MB, cores %llx, priorities %llx\n", (unsigned long long)(g_hle.kernel.sysres_size >> 20),
+        (unsigned long long)g_hle.svcmem.core_mask, (unsigned long long)g_hle.svcmem.prio_mask);
     free(d);
 }
 
@@ -272,6 +274,8 @@ void snx_save_before_exit(void) {
     if (!saved) {
         save_hints();
         if (g_renderer && g_renderer->save) g_renderer->save();
+        svc_core_exit();
+        jit_report();
         saved = 1;
     }
     pm_unlock(&lock);
@@ -351,6 +355,7 @@ int snx_main(int argc, char** argv) {
     const char *game, *title;
     const SnxModule* mod;
     int status, i;
+    hle_init(); /* before anything, the options included, touches g_hle */
     status = snx_startup_options(argc, argv);
     if (status) return status;
     if (argc == 2 && !strcmp(argv[1], "--settings")) {
@@ -373,7 +378,7 @@ int snx_main(int argc, char** argv) {
     kind_dir(g_statedir, sizeof g_statedir, SNX_USER_STATE, "log and threads.txt");
     kind_dir(g_cachedir, sizeof g_cachedir, SNX_USER_CACHE, "caches");
     if (g_arm_mod) mem_layout32(g_arm_mod->aspace); /* before anything sizes or reads guest memory */
-    if (mod->title_id) g_title_id = mod->title_id;
+    if (mod->title_id) g_hle.kernel.title_id = mod->title_id;
     /* this run's settings: each --key=value before a "--" (-v is log=2); -f and --fullscreen=0|1 through startup.c's
        record of the last given, which a --fullscreen=... here would only repeat */
     for (i = 1; i < argc && strcmp(argv[i], "--"); i++) {
@@ -407,6 +412,10 @@ int snx_main(int argc, char** argv) {
     load_hints();
     if (loader_load()) fatal("Could not load the game executables. See the .log for details.");
     kernel_load_symbols();
+    nvn_trace_init();
+    /* after the trace, which says whether calls must go through the slots it wraps. The JIT compiles A64: a 32-bit
+       game's blocks are arm.c's, and its hints are A32 block keys the JIT must not warm-compile */
+    if (!g_arm_mod) jit_init();
     read_npdm();
     svc_core_init();
     svc_fs_init();

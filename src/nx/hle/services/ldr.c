@@ -2,32 +2,18 @@
    Copyright 2026 the ScarletNX contributors */
 /* ldr:ro / ro:1, IRoInterface. Behavioral reference: Eden's service/ro/ro.cpp and
    cmif_serialization.h (see docs/LDR_RO.md). The guest nn::ro linker, not this service, resolves symbols,
-   applies relocations and calls constructors. NRO code runs through the existing interpreter fallback;
-   fixed-address AOT functions cannot safely be rebased by changing their dispatch entries. */
+   applies relocations and calls constructors. NRO code is the runtime JIT's (runtime/guest_jit.c: its text joins the
+   JIT's images while it is mapped), and the interpreter's without a JIT; fixed-address AOT functions cannot safely be
+   rebased by changing their dispatch entries. */
 #include "nx/hle/services/services_int.h"
+#include "nx/hle/hle.h"
 #include "hle/services/ldr.swipc.inc"
+#include "nx/runtime/guest_jit.h"
 #include <openssl/evp.h>
 
 #define RO_ERROR(d) RC(22, d)
-#define RO_LIMIT    64
 
-typedef struct {
-    MemCodeMap map;
-    u8 id[32];
-} RoNro;
-typedef struct {
-    u64 address;
-    u32 count;
-    u8* hashes;
-} RoNrr;
-typedef struct {
-    int initialized, kind;
-    RoNro nro[RO_LIMIT];
-    RoNrr nrr[RO_LIMIT];
-} RoState;
-/* Also serializes cloned/domain sessions and initialization across ldr:ro and ro:1. */
-static PMutex ro_lock = PMUTEX_INIT;
-static RoState* ro_owner;
+/* each session's RoState, the lock and the session that initialized: g_hle.ldr (services_int.h) */
 
 static u32 ro_u32(const u8* p) { return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 | (u32)p[3] << 24; }
 static u64 ro_u64(const u8* p) { return ro_u32(p) | (u64)ro_u32(p + 4) << 32; }
@@ -67,7 +53,7 @@ static int ro_register_nrr(RoState* s, u64 a, u64 size, int kind) {
     u8 header[0x350];
     memcpy(header, GP(a), sizeof header);
     u32 off = ro_u32(header + 0x340), count = ro_u32(header + 0x344);
-    if (memcmp(header, "NRR0", 4) || ro_u32(header + 0x338) != size || ro_u64(header + 0x330) != g_title_id ||
+    if (memcmp(header, "NRR0", 4) || ro_u32(header + 0x338) != size || ro_u64(header + 0x330) != g_hle.kernel.title_id ||
         off < sizeof header || off > size || count > (size - off) / 32)
         R_THROW(RO_ERROR(6));
     R_UNLESS(header[0x33c] == kind, RO_ERROR(10));
@@ -147,8 +133,8 @@ static int ro_load_nro(RoState* s, u64 source, u64 size, u64 bss, u64 bss_size, 
     slot->map = m;
     memcpy(slot->id, GP(m.base + 0x40), 32);
     *address = m.base;
-    LOG("ldr:ro: mapped NRO at %llx (%llu bytes, interpreter)\n", (unsigned long long)m.base,
-        (unsigned long long)(m.size + m.bss_size));
+    LOG("ldr:ro: mapped NRO at %llx (%llu bytes, %s)\n", (unsigned long long)m.base,
+        (unsigned long long)(m.size + m.bss_size), jit_code_added(m.base, text, m.size) ? "interpreter" : "JIT");
     R_SUCCEED();
 }
 static int ro_unload_nro(RoState* s, u64 base) {
@@ -156,6 +142,7 @@ static int ro_unload_nro(RoState* s, u64 base) {
     for (int i = 0; i < RO_LIMIT; i++) {
         RoNro* n = &s->nro[i];
         if (!n->map.base || n->map.base != base) continue;
+        jit_code_removed(base); /* before its memory goes: a compile may be reading it */
         R_UNLESS(!mem_unmap_code(&n->map), RO_ERROR(1027));
         memset(n, 0, sizeof *n);
         R_SUCCEED();
@@ -188,9 +175,9 @@ static int nn_ro_detail_IRoInterface_UnregisterModuleInfo(SvcObj* self, u64 pid,
 static int nn_ro_detail_IRoInterface_RegisterProcessHandle(SvcObj* self, u64 pid, u32 process) {
     RoState* s = self->data;
     R_UNLESS(pid == K_PROCESS_ID && ro_process_handle(process), RO_ERROR(1031));
-    R_UNLESS(!s->initialized && !ro_owner, RO_ERROR(1030));
+    R_UNLESS(!s->initialized && !g_hle.ldr.owner, RO_ERROR(1030));
     s->initialized = 1;
-    ro_owner = s;
+    g_hle.ldr.owner = s->obj;
     R_SUCCEED();
 }
 static int nn_ro_detail_IRoInterface_RegisterProcessModuleInfo(SvcObj* self, u64 pid, u64 nrr_address, u64 nrr_size,
@@ -201,24 +188,25 @@ static int nn_ro_detail_IRoInterface_RegisterProcessModuleInfo(SvcObj* self, u64
     return ro_register_nrr(s, nrr_address, nrr_size, s->kind);
 }
 static int ro_dispatch(SvcObj* o, IpcCtx* c) {
-    pm_lock(&ro_lock);
+    pm_lock(&g_hle.ldr.lock);
     int r = nn_ro_detail_IRoInterface_dispatch(o, c);
-    pm_unlock(&ro_lock);
+    pm_unlock(&g_hle.ldr.lock);
     return r;
 }
 static void ro_destroy(SvcObj* o) {
     RoState* s = o->data;
-    pm_lock(&ro_lock);
+    pm_lock(&g_hle.ldr.lock);
     for (int i = 0; i < RO_LIMIT; i++) {
         free(s->nrr[i].hashes);
+        if (s->nro[i].map.base) jit_code_removed(s->nro[i].map.base);
         if (s->nro[i].map.base && mem_unmap_code(&s->nro[i].map))
             WARN("ldr:ro: could not release NRO on session close\n");
     }
-    if (ro_owner == s) ro_owner = NULL;
-    pm_unlock(&ro_lock);
+    if (g_hle.ldr.owner == s->obj) g_hle.ldr.owner = 0;
+    pm_unlock(&g_hle.ldr.lock);
 }
 static SvcObj* ro_new(const char* name, int kind) {
-    SvcObj* o = svcobj_new(name, ro_dispatch, sizeof(RoState));
+    SvcObj* o = SVCOBJ_NEW_DATA(name, ro_dispatch, g_hle.ldr.states, g_hle.ldr.state_next, "ldr:ro sessions");
     ((RoState*)o->data)->kind = kind;
     o->destroy = ro_destroy;
     return o;

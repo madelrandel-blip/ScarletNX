@@ -7,6 +7,7 @@
 #include "nx/runtime/platform/vpad.h"
 #include "gui_theme_colors.h"
 #include "common/utilities/pad_screen.h"
+#include "common/utilities/users.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,10 +55,9 @@ static const char* const PADS[P_COUNT] = {SNX_GAMEPAD_PLAYERS,
                                           "Back"};
 static int shown, page, focus, top; /* top: the first item showing */
 static int pad_player;              /* the player the gamepads' page shows: 0 every player's, 1 to SNX_GAMEPADS */
-/* the YoRHa menu's colours, from its theme.ini (gui_theme_colors.h), as R G B A bytes; the page lets the game show
-   through a little */
+/* the YoRHa menu's colours, from its theme.ini (gui_theme_colors.h), as R G B A bytes; the page hides the game under
+   it, whose text would show through its letters */
 #define SNX_OVERLAY_RGBA(rgb, a) ((u32)(a) << 24 | ((rgb) & 0xFFu) << 16 | ((rgb) & 0xFF00u) | ((rgb) >> 16 & 0xFFu))
-#define PAGE_RGBA                SNX_OVERLAY_RGBA(SNX_GUI_THEME_YORHA_PAGE, 0xF2u)
 #define INK                      SNX_OVERLAY_RGBA(SNX_GUI_THEME_YORHA_INK, 0xFFu)
 #define SOFT                     SNX_OVERLAY_RGBA(SNX_GUI_THEME_YORHA_SOFT, 0xFFu)
 #define LIGHT                    SNX_OVERLAY_RGBA(SNX_GUI_THEME_YORHA_PAGE, 0xFFu)
@@ -136,15 +136,17 @@ static void label(int i, char* text, size_t size, char* value, size_t vsize) {
 static SnxPadScreen map;
 static SnxPadDrawing map_drawing; /* as last drawn: what a tap lands on */
 static int map_swallow;           /* the press the page took: no menu key */
-/* the first pad's name, its labels and what it holds */
+/* the pad the page is for: the player's, or with every player's the first one; its name, its labels and what it
+   holds (with every player's, what any holds) */
 static void map_pad(void) {
-    const char* name = gamepad_name(0);
+    int i = pad_player ? gamepad_of_player(pad_player - 1) : 0;
+    const char* name = i >= 0 ? gamepad_name(i) : NULL;
     snprintf(map.pad, sizeof map.pad, "%s", name ? name : "");
-    if (!gamepad_layout(0, map.labels, &map.symmetric)) {
+    if (i < 0 || !gamepad_layout(i, map.labels, &map.symmetric)) {
         memset(map.labels, 0, sizeof map.labels);
         map.symmetric = 0;
     }
-    map.held = gamepad_held();
+    map.held = i < 0 ? 0 : gamepad_held(pad_player ? i : -1);
 }
 static void map_open(void) {
     SnxGamepadConfig* g = gamepad_config();
@@ -191,6 +193,7 @@ static void disc(SnxUiList* l, float x, float y, float w, float h, u32 rgba) {
         ui_fill(l, cx - half, y0, 2 * half, 2 * r / n, rgba);
     }
 }
+static void user_draw(SnxUiList* l, float left, float right, float y, int s);
 static void map_draw(SnxUiList* l, int sw, int sh) {
     const u32 box = SNX_OVERLAY_RGBA(SNX_GUI_THEME_YORHA_SOFT, 0x40u); /* a panel: the page a little darker */
     int px, py, s, i;
@@ -203,14 +206,17 @@ static void map_draw(SnxUiList* l, int sw, int sh) {
     w = (float)sw - 2 * cw;
     h = (float)sh - 2 * ch;
     map_pad();
-    ui_fill(l, x, y, w, h, LIGHT); /* the whole picture: the game no longer shows through, as on the small pages */
+    ui_fill(l, x, y, w, h, LIGHT); /* the whole picture */
     ui_fill(l, x, y, w, ch, INK);
-    if (pad_player) { /* the player's own */
+    {
         char title[48];
-        snprintf(title, sizeof title, "SCARLETNX  /  PLAYER %d  /  BUTTON MAP", pad_player);
+        if (pad_player) /* the player's own */
+            snprintf(title, sizeof title, "SCARLETNX  /  PLAYER %d  /  BUTTON MAP", pad_player);
+        else
+            snprintf(title, sizeof title, "SCARLETNX  /  BUTTON MAP");
         ui_text(l, x + cw, y, s, title, LIGHT);
-    } else
-        ui_text(l, x + cw, y, s, "SCARLETNX  /  BUTTON MAP", LIGHT);
+        user_draw(l, x + cw * (float)(strlen(title) + 2), x + w - cw, y, s);
+    }
     snx_pad_screen_lay(&map, x, y + ch, w, h - ch, cw, ch, &map_drawing);
     for (i = 0; i < map_drawing.n; ++i) {
         const SnxPadShape* p = &map_drawing.shape[i];
@@ -319,6 +325,7 @@ typedef struct {
 } DialogPara;
 typedef struct {
     const char* title;
+    int user; /* the user playing at the head's right, by their nickname: the menu's pages */
     DialogPara para[DIALOG_PARAS];
     int paras;
     const char* label[VISIBLE];   /* the items showing, from top on */
@@ -329,6 +336,27 @@ typedef struct {
     SnxOverlayRect box, link, item[VISIBLE];
     int cols, scale;
 } DialogDrawn;
+/* the user playing on the head's band, against right, past left: a box framed as the launcher's are, in the band's
+   colours swapped, holding their nickname and their picture at its right, two of the box's pixels in. Without room
+   for the nickname, the picture alone; without room for that, nothing. None when the theme shows no picture */
+static void user_draw(SnxUiList* l, float left, float right, float y, int s) {
+    const char* name = g_user_count ? snx_users_selected()->nickname : "";
+    float cw = 8.0f * (float)s, ch = 16.0f * (float)s, edge = (float)s, side = ch - 4 * edge;
+    float box = cw + cw * (float)strlen(name) + cw + side + 2 * edge, x = right - box;
+    if (!g_user_count || !SNX_GUI_THEME_YORHA_PICTURE) return;
+    if (x < left) { /* the picture alone */
+        box = side + 4 * edge;
+        x = right - box;
+        name = "";
+    }
+    if (x < left) return;
+    ui_picture(l, right - 2 * edge - side, y + 2 * edge, side);
+    if (*name) ui_text(l, x + cw, y, s, name, LIGHT);
+    ui_fill(l, x, y, box, edge, LIGHT);
+    ui_fill(l, x, y + ch - edge, box, edge, LIGHT);
+    ui_fill(l, x, y, edge, ch, LIGHT);
+    ui_fill(l, x + box - edge, y, edge, ch, LIGHT);
+}
 /* the rows paragraphs wrap into: each thread that lays a dialog out has its own */
 typedef char DialogRows[DIALOG_PARAS][DIALOG_LINES][FATAL_ROW];
 /* d on a picture sw x sh, into l (NULL: only where it all goes, in out): the head, each paragraph after a blank row,
@@ -369,9 +397,10 @@ static void dialog_draw(SnxUiList* l, int sw, int sh, const Dialog* d, DialogRow
     out->cols = cols;
     out->scale = s;
     if (l) {
-        ui_fill(l, x, y, w, ch * (float)total, PAGE_RGBA);
+        ui_fill(l, x, y, w, ch * (float)total, LIGHT);
         ui_fill(l, x, y, w, ch, INK);
         ui_text(l, x + cw, y, s, d->title, LIGHT);
+        if (d->user) user_draw(l, x + cw * (float)(strlen(d->title) + 2), x + w - cw, y, s);
     }
     row = 1;
     for (k = 0, last = -1; k < d->paras; ++k) {
@@ -500,6 +529,7 @@ static void menu_dialog(Dialog* d, char (*text)[OVERLAY_COLS_MAX + 1], char (*va
     int r, n = items();
     memset(d, 0, sizeof *d);
     d->title = titles[page];
+    d->user = 1;
     d->para[0].text = page == PAGE_PADS ? pads_hint(pads, size) : hints[page];
     d->para[0].rgba = SOFT;
     d->paras = 1;

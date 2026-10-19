@@ -15,6 +15,7 @@ int unattended_ini(const char* k, const char* v);
 int unattended_known(const char* k);
 /* the moment seconds and the millisecond presses of script count from */
 void unattended_start(void);
+u64 unattended_ms(void); /* milliseconds since then */
 /* 1 when seconds or frames limits the run */
 int unattended_active(void);
 /* The buttons the options press now, as HidNpadButton bits, plus bits 40 to 47 for stick directions (see

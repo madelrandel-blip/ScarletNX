@@ -14,6 +14,7 @@
    has no name for. Eden's ssl.cpp forces the verify option to 0 and swaps SetOption's arguments; neither is done
    here. */
 #include "nx/hle/services/network/network.h"
+#include "nx/hle/hle.h"
 #include "hle/services/network/ssl.swipc.inc"
 #include <limits.h>
 #ifdef _WIN32
@@ -69,7 +70,7 @@ enum {
     OPT_GET_SERVER_CERT_CHAIN = 1,
     OPT_SKIP_DEFAULT_VERIFY = 2,
     OPT_ENABLE_ALPN = 3,
-    OPT_COUNT = 4,
+    OPT_COUNT = SSL_OPT_COUNT,
     CONTEXT_CRL_IMPORT_DATE_CHECK = 1,
     CERT_PEM = 1,
     CERT_DER = 2,
@@ -79,9 +80,9 @@ enum {
     ALPN_NO_SUPPORT = 0,
     ALPN_NEGOTIATED = 1,
     ALPN_NO_OVERLAP = 2,
-    MAX_CONNECTIONS = 8,   /* per context: Switchbrew, from ISslContextForSystem's CreateConnectionEx allowing 10 */
+    MAX_CONNECTIONS = SSL_CONTEXT_CONNECTIONS,
     MAX_SERVER_CERTS = 71, /* per ImportServerPki */
-    HOST_MAX = 0xFF,       /* SetHostName's buffer, at most (libnx) */
+    HOST_MAX = SSL_HOST_MAX,
     BLOCKING_MS = 300000,  /* a Blocking connection's timeout, NSS's 5 minutes (libnx) */
     CERT_INFO_SIZE = 0x18, /* BuiltInCertificateInfo {u32 id, u32 status, u64 size, u64 offset} */
     CIPHER_NAME_SIZE = 0x40,
@@ -90,49 +91,13 @@ enum {
 /* the GetServerCertChain buffer's header: "CertChMN" */
 #define CERT_CHAIN_MAGIC 0x4E4D684374726543ull
 
-typedef struct SslContext {
-    PMutex lk;
-    SSL_CTX* ctx;
-    X509_STORE* store; /* the host's roots, and what ImportServerPki added: what connections verify against */
-    EVP_PKEY* client_key;
-    X509* client_cert;
-    STACK_OF(X509) * client_chain;
-    u64 client_id; /* ImportClientPki's or RegisterInternalPki's id, 0 before: a context takes one */
-    u64 last_id;
-    u64 pid; /* the process whose bsd descriptors the connections take */
-    i32 crl_date_check;
-    u32 connections;
-} SslContext;
-
-typedef struct SslConn {
-    PMutex lk; /* OpenSSL takes one thread at a time on an SSL: conn_disp holds it around every command */
-    SSL* ssl;
-    SnxSocket* s;      /* the duplicate of the game's socket, NULL before SetSocketDescriptor */
-    SvcObj* context;   /* the ISslContext, referenced */
-    i32 fd;            /* the game's descriptor, for GetSocketDescriptor */
-    u32 verify;        /* VerifyOption */
-    u32 io_mode;       /* IoMode */
-    u32 cache_mode;    /* SessionCacheMode, kept for Get: no session is resumed */
-    u32 renegotiation; /* RenegotiationMode */
-    int verify_error;  /* the Result of the failed certificate check, until GetVerifyCertError */
-    int sock_err;      /* the stack's error (SNX_E*) under the last TLS call */
-    int alert;         /* the fatal alert the server sent during it, -1 for none */
-    u8 option[OPT_COUNT];
-    char host[HOST_MAX + 1];
-} SslConn;
-
-static int g_contexts; /* GetContextCount */
+/* SslContext and SslConn, the objects' data, are in network.h, with the pools */
 
 /* ============================================================ the host's roots, once */
 /* The console trusts the CAs of its system archive, the runtime the host's. This OpenSSL is the build's own, whose
    OPENSSLDIR is not the system's, so the default paths find nothing: the roots are read from SSL_CERT_FILE and
    SSL_CERT_DIR when they are set (OpenSSL's variables), else from the first bundle where distributions keep it, else
    the hashed directory /etc/ssl/certs, and on Windows from the system's ROOT store. Each context's store gets them */
-static PMutex g_init_lk = PMUTEX_INIT;
-static int g_init_done;
-static STACK_OF(X509) * g_roots; /* from a bundle file or the Windows store */
-static char g_roots_dir[4096];   /* a hashed directory (or a list), which OpenSSL reads as it needs */
-static BIO_METHOD* g_bio;
 
 static STACK_OF(X509) * load_bundle(const char* path) {
     X509_STORE* st = X509_STORE_new();
@@ -151,11 +116,11 @@ static const char* system_roots(void) {
     HCERTSTORE h = CertOpenSystemStoreW(0, L"ROOT");
     PCCERT_CONTEXT cc = NULL;
     if (!h) return "nowhere";
-    g_roots = sk_X509_new_null();
-    while (g_roots && (cc = CertEnumCertificatesInStore(h, cc)) != NULL) {
+    g_hle.ssl.roots = sk_X509_new_null();
+    while (g_hle.ssl.roots && (cc = CertEnumCertificatesInStore(h, cc)) != NULL) {
         const unsigned char* p = cc->pbCertEncoded;
         X509* x = d2i_X509(NULL, &p, (long)cc->cbCertEncoded);
-        if (x && !sk_X509_push(g_roots, x)) X509_free(x);
+        if (x && !sk_X509_push(g_hle.ssl.roots, x)) X509_free(x);
     }
     CertCloseStore(h, 0);
     return "the system's ROOT store";
@@ -171,9 +136,9 @@ static const char* system_roots(void) {
     };
     size_t i;
     for (i = 0; i < sizeof bundles / sizeof bundles[0]; i++)
-        if ((g_roots = load_bundle(bundles[i])) != NULL) return bundles[i];
-    strcpy(g_roots_dir, "/etc/ssl/certs");
-    return g_roots_dir;
+        if ((g_hle.ssl.roots = load_bundle(bundles[i])) != NULL) return bundles[i];
+    strcpy(g_hle.ssl.roots_dir, "/etc/ssl/certs");
+    return g_hle.ssl.roots_dir;
 }
 #endif
 
@@ -183,27 +148,27 @@ static long bio_ctrl(BIO* b, int cmd, long num, void* ptr);
 static int bio_create(BIO* b);
 static void ssl_init(void) {
     const char *file, *dir, *from = "nowhere";
-    pm_lock(&g_init_lk);
-    if (g_init_done) {
-        pm_unlock(&g_init_lk);
+    pm_lock(&g_hle.ssl.init_lk);
+    if (g_hle.ssl.init_done) {
+        pm_unlock(&g_hle.ssl.init_lk);
         return;
     }
     file = getenv("SSL_CERT_FILE");
     dir = getenv("SSL_CERT_DIR");
-    if (file && *file && (g_roots = load_bundle(file)) != NULL) from = file;
-    if (dir && *dir && strlen(dir) < sizeof g_roots_dir) {
-        strcpy(g_roots_dir, dir);
+    if (file && *file && (g_hle.ssl.roots = load_bundle(file)) != NULL) from = file;
+    if (dir && *dir && strlen(dir) < sizeof g_hle.ssl.roots_dir) {
+        strcpy(g_hle.ssl.roots_dir, dir);
         from = dir;
     }
-    if (!(file && *file) && !g_roots_dir[0]) from = system_roots();
+    if (!(file && *file) && !g_hle.ssl.roots_dir[0]) from = system_roots();
     ERR_clear_error();
-    LOG("ssl: root certificates from %s (%d read)\n", from, g_roots ? sk_X509_num(g_roots) : 0);
-    g_bio = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "snx socket");
-    if (!g_bio || !BIO_meth_set_write_ex(g_bio, bio_write) || !BIO_meth_set_read_ex(g_bio, bio_read) ||
-        !BIO_meth_set_ctrl(g_bio, bio_ctrl) || !BIO_meth_set_create(g_bio, bio_create))
+    LOG("ssl: root certificates from %s (%d read)\n", from, g_hle.ssl.roots ? sk_X509_num(g_hle.ssl.roots) : 0);
+    g_hle.ssl.bio = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "snx socket");
+    if (!g_hle.ssl.bio || !BIO_meth_set_write_ex(g_hle.ssl.bio, bio_write) || !BIO_meth_set_read_ex(g_hle.ssl.bio, bio_read) ||
+        !BIO_meth_set_ctrl(g_hle.ssl.bio, bio_ctrl) || !BIO_meth_set_create(g_hle.ssl.bio, bio_create))
         fatal("ssl: OpenSSL can't make a BIO method\n");
-    g_init_done = 1;
-    pm_unlock(&g_init_lk);
+    g_hle.ssl.init_done = 1;
+    pm_unlock(&g_hle.ssl.init_lk);
 }
 /* a context's store: the roots, with any certificate in it an anchor (PARTIAL_CHAIN), since the console's
    ImportServerPki takes CAs and servers' own certificates alike */
@@ -211,8 +176,8 @@ static X509_STORE* roots_store(void) {
     X509_STORE* st = X509_STORE_new();
     int i;
     if (!st) return NULL;
-    for (i = 0; i < sk_X509_num(g_roots); i++) X509_STORE_add_cert(st, sk_X509_value(g_roots, i));
-    if (g_roots_dir[0]) X509_STORE_load_path(st, g_roots_dir);
+    for (i = 0; i < sk_X509_num(g_hle.ssl.roots); i++) X509_STORE_add_cert(st, sk_X509_value(g_hle.ssl.roots, i));
+    if (g_hle.ssl.roots_dir[0]) X509_STORE_load_path(st, g_hle.ssl.roots_dir);
     X509_STORE_set_flags(st, X509_V_FLAG_PARTIAL_CHAIN);
     ERR_clear_error();
     return st;
@@ -458,7 +423,7 @@ static int nn_ssl_sf_ISslConnection_SetSocketDescriptor(SvcObj* self, i32 fd, i3
         snx_socket_unref(s);
         R_THROW(SSLSRV_RC(SSLSRV_NO_CONNECTION));
     }
-    bio = BIO_new(g_bio);
+    bio = BIO_new(g_hle.ssl.bio);
     if (!bio) {
         snx_socket_unref(s);
         R_THROW(SSLSRV_RC(SSLSRV_INSUFFICIENT_MEMORY));
@@ -725,7 +690,8 @@ static int nn_ssl_sf_ISslContext_CreateConnection(SvcObj* self, SvcObj** connect
     R_UNLESS(x->connections < MAX_CONNECTIONS, SSLSRV_RC(SSLSRV_INSUFFICIENT_MEMORY));
     ssl = SSL_new(x->ctx);
     R_UNLESS(ssl, SSLSRV_RC(SSLSRV_INSUFFICIENT_MEMORY));
-    o = svcobj_new("nn::ssl::sf::ISslConnection", conn_disp, sizeof(SslConn));
+    o = SVCOBJ_NEW_DATA("nn::ssl::sf::ISslConnection", conn_disp, g_hle.ssl.conns, g_hle.ssl.conn_next,
+                        "ssl connections");
     c = o->data;
     pm_init(&c->lk);
     c->ssl = ssl;
@@ -851,7 +817,7 @@ static void ctx_destroy(SvcObj* o) {
     EVP_PKEY_free(x->client_key);
     X509_free(x->client_cert);
     sk_X509_pop_free(x->client_chain, X509_free);
-    __atomic_sub_fetch(&g_contexts, 1, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&g_hle.ssl.contexts, 1, __ATOMIC_RELAXED);
 }
 
 /* ============================================================ ISslService */
@@ -892,7 +858,7 @@ static int nn_ssl_sf_ISslService_CreateContext(SvcObj* self, nn_ssl_sf_SslVersio
     SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, verify_cb);
     set_versions(ctx, ssl_version);
-    o = svcobj_new("nn::ssl::sf::ISslContext", ctx_disp, sizeof(SslContext));
+    o = SVCOBJ_NEW_DATA("nn::ssl::sf::ISslContext", ctx_disp, g_hle.ssl.ctxs, g_hle.ssl.ctx_next, "ssl contexts");
     x = o->data;
     pm_init(&x->lk);
     x->ctx = ctx;
@@ -900,13 +866,13 @@ static int nn_ssl_sf_ISslService_CreateContext(SvcObj* self, nn_ssl_sf_SslVersio
     x->pid = pid;
     x->crl_date_check = 1; /* libnx: 1 when the context is made */
     o->destroy = ctx_destroy;
-    __atomic_add_fetch(&g_contexts, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_hle.ssl.contexts, 1, __ATOMIC_RELAXED);
     LOG("ssl: CreateContext(version %#x)\n", (unsigned)ssl_version);
     *context = o;
     R_SUCCEED();
 }
 static int nn_ssl_sf_ISslService_GetContextCount(SvcObj* self, u32* count) {
-    *count = (u32)__atomic_load_n(&g_contexts, __ATOMIC_RELAXED);
+    *count = (u32)__atomic_load_n(&g_hle.ssl.contexts, __ATOMIC_RELAXED);
     R_SUCCEED();
 }
 /* No system archive, so no built-in certificates: the buffer holds just the terminating entry {-1, -1, 0, 0} */
@@ -921,4 +887,4 @@ static int nn_ssl_sf_ISslService_GetCertificateBufSize(SvcObj* self, IpcBuf ids,
     *size = CERT_INFO_SIZE;
     R_SUCCEED();
 }
-SvcObj* new_ssl(void) { return nn_ssl_sf_ISslService_new(0); }
+SvcObj* new_ssl(void) { return nn_ssl_sf_ISslService_new(); }

@@ -15,20 +15,36 @@ void gui_place(const GuiPlaceIn* in, GuiPlace* out) {
     int mx = in->cw, gap = in->ch / 2, width = in->width - 2 * mx, y = gap, bottom, foot_y, cols;
     GuiRect content;
     memset(out, 0, sizeof *out);
-    /* the head: the tabs at its left, the title after them against its right when both fit, else under them */
-    if (in->title && in->title_beside && in->tabs && in->tabs_w + 2 * in->cw + in->title_w <= width) {
+    /* the head: the tabs at its left, the title after them against its right when both fit, else under them; the user
+       against the right of the title's row, two columns past it as the title is past the tabs, or of the tabs' when there is no title; on a row of its
+       own when it does not fit there */
+    int badge = in->badge && in->badge_w ? in->badge_w + 2 * in->cw : 0;
+    if (in->title && in->title_beside && in->tabs && in->tabs_w + 2 * in->cw + in->title_w + badge <= width) {
         int row = in->tabs > in->title ? in->tabs : in->title;
+        if (badge && in->badge > row) row = in->badge;
         out->tabs = gui_rect(mx, y + row - in->tabs, in->tabs_w, in->tabs);
-        out->title = gui_rect(mx + width - in->title_w, y + row - in->title, in->title_w, in->title);
+        out->title = gui_rect(mx + width - badge - in->title_w, y + row - in->title, in->title_w, in->title);
+        if (badge) out->badge = gui_rect(mx + width - in->badge_w, y + row - in->badge, in->badge_w, in->badge);
         y += row + gap;
     } else {
+        int beside = in->tabs && !in->title && in->tabs_w + badge <= width;
         if (in->tabs) {
-            out->tabs = gui_rect(mx, y, in->tabs_w, in->tabs);
-            y += in->tabs + gap;
+            int row = beside && in->badge > in->tabs ? in->badge : in->tabs;
+            out->tabs = gui_rect(mx, y + row - in->tabs, in->tabs_w, in->tabs);
+            if (beside && badge)
+                out->badge = gui_rect(mx + width - in->badge_w, y + row - in->badge, in->badge_w, in->badge);
+            y += row + gap;
         }
         if (in->title) {
-            out->title = gui_rect(mx, y, width, in->title);
-            y += in->title + gap;
+            int room = badge && in->title_w + badge <= width, row = in->title;
+            if (room && in->badge > row) row = in->badge;
+            out->title = gui_rect(mx, y + row - in->title, room ? width - badge : width, in->title);
+            if (room) out->badge = gui_rect(mx + width - in->badge_w, y + row - in->badge, in->badge_w, in->badge);
+            y += row + gap;
+        }
+        if (badge && !out->badge.h) { /* too narrow beside either: its own row, or none */
+            if (in->badge_w <= width) out->badge = gui_rect(mx + width - in->badge_w, y, in->badge_w, in->badge);
+            if (out->badge.h) y += in->badge + gap;
         }
     }
     out->head = gui_rect(mx, gap, width, y - 2 * gap);

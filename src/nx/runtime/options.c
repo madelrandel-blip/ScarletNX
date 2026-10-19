@@ -6,6 +6,7 @@
 #include "nx/runtime/options.h"
 #include "common/utilities/common.h"
 #include "common/utilities/ini_lines.h"
+#include "nx/hle/hle.h"
 #include "nx/hle/kernel/kernel.h"
 #include "nx/hle/services/services.h"
 #include "nx/memory/mem.h"
@@ -25,6 +26,8 @@
 int g_opt_fullscreen, g_opt_docked = 1, g_opt_lang = 1, g_opt_fps = SNX_FPS_GAME, g_opt_diag, g_opt_shadows = 1;
 int g_opt_prof, g_opt_auto_stub_ipc = 1, g_opt_network, g_opt_vsync = 1, g_opt_aniso;
 float g_opt_resf = 1;
+int g_opt_user = 1;
+int g_opt_jit_threads, g_opt_async_pipes = 0;
 
 /* ---- the runtime's own settings ---- */
 
@@ -64,6 +67,28 @@ void fps_limit_text(int fps, char* out, size_t n) {
         snprintf(out, n, "game");
     else
         snprintf(out, n, "%d", fps);
+}
+
+int g_opt_ldn = SNX_OPT_LDN_LAN, g_opt_airplane;
+char g_opt_room[256];
+/* lan, room or off. Both keys are read once, at start: a value they don't take stops the game there, as a player
+   who wrote ldn=rooom would otherwise play alone thinking they were in the room */
+static void ldn_set(const IniOpt* o, const char* v) {
+    static const char* const words[] = {"lan", "room", "off"};
+    int i;
+    (void)o;
+    for (i = 0; i < 3; i++)
+        if (!strcmp(v, words[i])) {
+            g_opt_ldn = i;
+            return;
+        }
+    fatal("settings: ldn=%s is not lan, room or off", v);
+}
+static void room_set(const IniOpt* o, const char* v) {
+    (void)o;
+    if (strlen(v) >= sizeof g_opt_room || v[strcspn(v, " \t\r")])
+        fatal("settings: room=%.64s is not host or host:port", v);
+    strcpy(g_opt_room, v);
 }
 
 /* MB: below 1 no cap but the heap region's own, which also caps a larger one */
@@ -106,6 +131,10 @@ static const IniOpt g_graphics[] = {
      INI_INT, 0, &g_opt_vsync, 0, 1, NULL, "VSync", "Off|On", 0, 0},
     {"anisotropy", "0", "0 = textures filtered as the game asks, 2 to 16 = sharper surfaces seen at an angle", INI_INT,
      INI_STARTUP, &g_opt_aniso, 0, 16, NULL, "Anisotropic filtering", "Game's|#x", 0, 0},
+    {"async_pipelines", "0",
+     "1 = a draw whose shaders the GPU driver is still compiling is skipped until they are ready (the thing shows a\n"
+     "moment late); 0 = the game waits for them, and stutters the first time it shows something new",
+     INI_INT, 0, &g_opt_async_pipes, 0, 1, NULL, "Asynchronous shaders", "Off|On", 0, 0},
     END_ROW};
 static const IniOpt g_performance[] = {
     {"fps_limit", "game",
@@ -115,15 +144,38 @@ static const IniOpt g_performance[] = {
     {"memory_gb", "0",
      "The memory the game sees: below 6 the console's 3.2 GB, 6 = 4.8 GB, 8 = 6.8 GB. A game that runs out on\n"
      "the console's amount needs 6",
-     INI_INT, INI_STARTUP, &g_opt_mem_gb, 0, 8, NULL, "Memory (GB)", NULL, 0, 0},
+     INI_INT, INI_STARTUP, &g_hle.svcmem.opt_mem_gb, 0, 8, NULL, "Memory (GB)", NULL, 0, 0},
     {"heap_max_mb", "0", "The most heap the game can allocate, in MB; 0 = as much as its memory allows", INI_TEXT,
      INI_STARTUP, NULL, 0, 0, heap_max_set, "Heap limit (MB)", NULL, 0, 0},
+    {"jit_threads", "0",
+     "Threads compiling the code the recompiler missed: 0 = every CPU the game may use but two (at most 8).\n"
+     ";   They yield to the game",
+     INI_INT, INI_STARTUP, &g_opt_jit_threads, 0, 8, NULL, "JIT threads", "Auto|#", 0, 0}, /* SNX_JIT_THREADS */
     END_ROW};
 static const IniOpt g_network[] = {
     {"network", "0",
      "1 = the game uses the computer's connection (known console service domains stay blocked); 0 = offline,\n"
      "with loopback only (not a sandbox)",
      INI_INT, 0, &g_opt_network, 0, 1, NULL, "Network", "Offline|Online", 0, 0},
+    {"airplane_mode", "0",
+     "1 = the console is in airplane mode: no network, whatever network says, and no local wireless (the game hears\n"
+     "both are off)",
+     INI_INT, INI_STARTUP, &g_opt_airplane, 0, 1, NULL, "Airplane mode", "Off|On", 0, 0},
+    {"ldn", "lan",
+     "Local wireless: lan = over the LAN with ldn_mitm's protocol (another ScarletNX, Ryujinx, a console running\n"
+     "ldn_mitm); room = through the Eden room that room names (Eden, another ScarletNX); off = the game hears it\n"
+     "is off",
+     INI_TEXT, INI_STARTUP, NULL, 0, 0, ldn_set, "Local wireless", "lan=LAN|room=Eden room|off=Off", 0, 0},
+    {"room", "",
+     "The Eden room ldn=room joins: host or host:port (port 24872 without one). The nickname there is the user's,\n"
+     "and a room's password is room_password in users/online.ini",
+     INI_TEXT, INI_STARTUP, NULL, 0, 0, room_set, "Eden room", NULL, 0, 0},
+    END_ROW};
+static const IniOpt g_user[] = {
+    {"user", "1",
+     "The console's user the game plays as: 1 to 8, as users/users.ini of the data folder lists them (1, \"Player\",\n"
+     "without one). A number with no user stops the game",
+     INI_INT, INI_STARTUP, &g_opt_user, 1, SNX_USERS_MAX, NULL, NULL, NULL, 0, 0},
     END_ROW};
 static const IniOpt g_debug[] = {
     {"log", "1", "The log's detail, 0 to 2: 2 logs everything, which slows the game down", INI_INT, 0, &g_verbose, 0,
@@ -159,6 +211,7 @@ static const Section g_sections[] = {
      {g_gamepad_ini, g_gamepad_map_ini, g_gamepad_players_ini},
      {NULL, SNX_GAMEPAD_MAP, SNX_GAMEPAD_PLAYERS}},
     {"Network", 1, {g_network, NULL, NULL}, {NULL, NULL, NULL}},
+    {"User", 1, {g_user, NULL, NULL}, {NULL, NULL, NULL}},
     {"Debug", 1, {g_debug, NULL, NULL}, {NULL, NULL, NULL}}};
 #define SECTIONS ((int)(sizeof g_sections / sizeof *g_sections))
 
@@ -537,6 +590,10 @@ static void list_help(const char* help) {
 static void list_values(const IniOpt* o) {
     int step = o->step > 0 ? o->step : 1, v, first = 1;
     char word[64];
+    if (o->type == INI_TEXT && o->words) { /* value=word already */
+        printf("%s", o->words);
+        return;
+    }
     if (o->type != INI_INT) return;
     if (!o->words && (o->lo < 0 || (o->hi - o->lo) / step + 1 > 16)) return; /* typed */
     for (v = (int)o->lo; v <= (int)o->hi; v += step) {

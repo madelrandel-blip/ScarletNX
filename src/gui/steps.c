@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include "gui/steps.h"
+#include "gui/i18n.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -46,31 +47,25 @@ static void line(GuiSteps* steps, const char* s, uint64_t now) {
         sscanf(block, "compiled block %u/%u", &value, &total) == 2) {
         last->value = value;
         last->total = total;
-    } else if (last &&
-               ((!strcmp(last->label, "UNPACK") && sscanf(s, " unpacked %u of %u MB", &value, &total) == 2) ||
-                (!strcmp(last->label, "EXTRACT") && sscanf(s, " extracted %u of %u MB", &value, &total) == 2))) {
+    } else if (last && !strcmp(last->label, "EXTRACT") && sscanf(s, " extracted %u of %u MB", &value, &total) == 2) {
         /* the driver's row a second, over itself: the step's own line shows it, no note under it */
         last->value = value;
         last->total = total;
         last->megabytes = 1;
         return;
-    } else if (prefix(s, "Unpacking "))
-        begin(steps, "UNPACK", s + 10, strlen(s + 10), now);
-    else if (prefix(s, "Extracting "))
-        begin(steps, "EXTRACT", s + 11, strlen(s + 11), now);
-    else if (prefix(s, "Building hactool"))
-        begin(steps, "TOOLS", "hactool", 7, now);
+    } else if (prefix(s, "Extracting ")) /* the labels show translated */
+        begin(steps, SNX_TR_NOOP("EXTRACT"), s + 11, strlen(s + 11), now);
     else if (prefix(s, "Recompiling ")) {
         const char* name = s + 12;
         const char* end = strstr(name, " (");
-        begin(steps, "RECOMPILE", name, end ? (size_t)(end - name) : strlen(name), now);
+        begin(steps, SNX_TR_NOOP("RECOMPILE"), name, end ? (size_t)(end - name) : strlen(name), now);
     } else if (prefix(s, "Built ")) {
-        begin(steps, "BUILT", s + 6, strlen(s + 6), now);
+        begin(steps, SNX_TR_NOOP("BUILT"), s + 6, strlen(s + 6), now);
         current(steps)->state = GUI_STEP_DONE;
     } else if (prefix(s, "ScarletNX - "))
-        begin(steps, "LAUNCH", s + 12, strlen(s + 12), now);
+        begin(steps, SNX_TR_NOOP("LAUNCH"), s + 12, strlen(s + 12), now);
     else if (prefix(s, "Ready "))
-        begin(steps, "READY", s + 6, strlen(s + 6), now);
+        begin(steps, SNX_TR_NOOP("READY"), s + 6, strlen(s + 6), now);
     else if (prefix(s, "vulkan: ") && !steps->gpu && strstr(s, ", Vulkan ")) {
         /* the first device line: "vulkan: <device> [(<driver>)], Vulkan <version>, ..."; a later "(" is not the
            device's */
@@ -78,7 +73,7 @@ static void line(GuiSteps* steps, const char* s, uint64_t now) {
         const char* end = strstr(device, ", Vulkan ");
         const char* paren = strstr(device, " (");
         if (paren && paren < end) end = paren;
-        begin(steps, "GPU", device, (size_t)(end - device), now);
+        begin(steps, SNX_TR_NOOP("GPU"), device, (size_t)(end - device), now);
         steps->gpu = 1;
     }
     if (steps->serial == before) note(steps, s, now); /* not a step of its own: a line of the current one */
@@ -111,7 +106,7 @@ int gui_steps_percent(const GuiSteps* steps) {
         const GuiStep* s = &steps->step[i];
         if (!strcmp(s->label, "RECOMPILE"))
             percent = s->state == GUI_STEP_DONE ? 100 : s->total ? (int)(s->value * 100ull / s->total) : 0;
-        else if (!strcmp(s->label, "UNPACK") || !strcmp(s->label, "EXTRACT"))
+        else if (!strcmp(s->label, "EXTRACT"))
             percent = s->state == GUI_STEP_DONE ? 100 : s->total ? (int)(s->value * 100ull / s->total) : -1;
         else if (!strcmp(s->label, "BUILT") || !strcmp(s->label, "LAUNCH") || !strcmp(s->label, "READY"))
             percent = 100;
@@ -125,14 +120,14 @@ void gui_step_progress(const GuiStep* s, int how, uint64_t now, char* out, size_
     else if (how == GUI_PROGRESS_PERCENT)
         snprintf(out, size, "%u%%", (unsigned)(done * 100 / s->total));
     else if (how == GUI_PROGRESS_TIME && (!done || spent < 1000))
-        snprintf(out, size, "--:-- left");
+        snprintf(out, size, "%s", snx_tr("--:-- left"));
     else if (how == GUI_PROGRESS_TIME) {
         left = (spent * (s->total - done) / done + 999) / 1000;
         if (left >= 3600)
-            snprintf(out, size, "%u:%02u:%02u left", (unsigned)(left / 3600), (unsigned)(left / 60 % 60),
+            snprintf(out, size, snx_tr("%u:%02u:%02u left"), (unsigned)(left / 3600), (unsigned)(left / 60 % 60),
                      (unsigned)(left % 60));
         else
-            snprintf(out, size, "%02u:%02u left", (unsigned)(left / 60), (unsigned)(left % 60));
+            snprintf(out, size, snx_tr("%02u:%02u left"), (unsigned)(left / 60), (unsigned)(left % 60));
     } else if (s->megabytes && s->total >= 1024)
         snprintf(out, size, "%.1f / %.1f GB", s->value / 1024.0, s->total / 1024.0);
     else

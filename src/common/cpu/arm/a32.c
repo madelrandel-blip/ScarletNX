@@ -10,8 +10,6 @@
 #include "common/cpu/arm/arm.h"
 #include "common/cpu/arm/simd.h"
 
-SnxArmExit snx_arm_gccjit_stub(void) { return SNX_ARM_BACKEND_UNSUPPORTED; }
-
 SnxA32Kind snx_a32_decode(uint32_t w) {
     unsigned n = (w >> 16) & 15, d = (w >> 12) & 15, m = w & 15;
     unsigned s = (w >> 8) & 15, op, load, wb;

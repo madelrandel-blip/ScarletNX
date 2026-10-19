@@ -32,7 +32,7 @@ efficient.
   scissors; `renderer.c` letterboxing and scaled render targets; `surface.c` and `format.c` format conversion;
   `texture.c` samplers, LOD and anisotropy), and `src/nx/gpu/maxwell/` for the engine state it reads.
 - **Textures**: `src/nx/gpu/texture/` (`astc.c`, `etc2.c`, `depth.c`), `src/nx/gpu/vk/astc.c` on the GPU.
-- **Video**: `src/nx/gpu/video/vic.c` and `vic.comp` (color matrix, soft clamp, scaling), `nvdec.c`.
+- **Video**: `src/nx/gpu/video/vic.c` and `vic_compose.glsl` (color matrix, soft clamp, scaling), `nvdec.c`.
 - **Audio**: `src/nx/hle/services/audren_dsp.c` (polyphase resampling, Q15 mixing, biquads, volume ramps) and
   `audren.c`.
 - **Input and motion**: `src/nx/hle/services/hid_motion.c` (gyro integrated into a scalar-first quaternion,

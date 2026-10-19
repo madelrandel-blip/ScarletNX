@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* Where a screen's boxes go, in pixels of the area it is drawn in: the row of tabs, the title after them or on a row
-   of its own, the tips under the head when they go there, the list and the box beside it (under it on a narrow
+   of its own, the user against the head's right after the title, the tips under the head when they go there, the list and the box beside it (under it on a narrow
    screen), the status box under that one, in half its column at most, and the foot: the keys' box, and the tips' on
    its left under the list when they go there. A column of margin either side and half a row between boxes; nothing
    overlaps. */
@@ -17,6 +17,7 @@ typedef struct {
     int tabs, tabs_w;   /* the row of tabs: its height and the tabs' width */
     int title, title_w; /* the title's height and width, 0 for none */
     int title_beside;   /* the title in the row of tabs, after them, when both fit */
+    int badge, badge_w; /* the user's nickname and picture: their height and width, 0 for none */
     int tips;           /* the tips' height on a row under the head; 0: they are in the foot */
     int foot;           /* the foot's height: the keys' box, and the tips' beside it unless they are under the head */
     int keys_w;         /* the keys' box at least this wide, the tips' giving way */
@@ -26,7 +27,7 @@ typedef struct {
 } GuiPlaceIn;
 typedef struct {
     GuiRect head; /* the tabs and the title, the whole width */
-    GuiRect tabs, title, tips, list, side, status, keys;
+    GuiRect tabs, title, badge, tips, list, side, status, keys;
     int stacked; /* the side box under the list: too narrow for both side by side */
 } GuiPlace;
 #define GUI_PLACE_SIDE_MIN 24 /* the side box's columns at least, beside the list */

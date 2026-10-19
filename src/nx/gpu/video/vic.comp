@@ -1,271 +1,32 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors
    Ported from Eden (src/video_core/host1x/vic.cpp):
    SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
    SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project */
-/* The VIC composition as a compute shader: a GLSL port of the pixel pipeline in gpu/video/vic.c (which follows
-   Eden's VIC). The slots' NV12 samples become 10 bit pixels (Y, U, V scaled to 10 bit, the slot's planar alpha as
-   the alpha), the slot's color matrix and soft clamp are applied when the config enables them, and the result is
-   written back at 8 bit per channel. Without a color matrix the samples are copied as they are (Y, U, V land in
-   the R, G, B channels): VIC does no fixed YUV to RGB conversion of its own. The last enabled slot that covers a
-   pixel composes it (a later slot overwrites an earlier one, no blending).
+/* The VIC composition as a compute shader (gpu/vk/vic.c runs it, gpu/video/vic.c's compose_cpu is the reference).
+   This file only declares what the body, vic_compose.glsl, reads and writes; the tests run the body on the CPU
+   (tests/glsl/vic_glsl.cpp). CMake compiles it twice at build time (cmake/glsl.cmake): as it is, for planes whose
+   rows are word aligned, and with -DVIC_UNALIGNED for the rest. */
 
-   A workgroup composes a 32x8 tile of output pixels and batches the work that a per texel pass would repeat:
-   the eight slots' parameters are fetched once into shared memory, the slots whose rectangles miss the tile are
-   dropped for every pixel of it, and each remaining slot's input window (the tile's Y, U and V bytes) is fetched
-   cooperatively, one aligned word per load, into shared memory. The per pixel work then reads the window through
-   shared memory instead of walking the block linear layout one byte at a time per texel.
+#include "vic_params.glsl"
 
-   The background colour fills the output config's target rectangle, and the slots compose over it.
+layout(local_size_x = VIC_GROUP_W, local_size_y = VIC_GROUP_H, local_size_z = 1) in;
 
-   An invocation owns four output pixels in a row and writes their words (A8B8G8R8, X8B8G8R8 and A8R8G8B8: one
-   word per pixel; NV12 and NV21: one luma word and, on even rows, one chroma word). Each output word has exactly
-   one owning invocation, so words are written without atomics: bytes an invocation does not own (outside the
-   target and slot rectangles, past the width) keep the values the host round-tripped through the buffer, exactly
-   what the CPU path leaves in guest memory. The planes are byte mirrors of guest memory, so the address math
-   (pitch linear rows or block linear GOBs) is the same as gpu/gpu.c's bl_offset.
-
-   This shader is built twice (scripts/build-vic-shader.py). The default build is the happy path: the planes'
-   rows are word aligned (the host checks every plane's pitch and block kind before it picks the pipeline), so
-   the window fetches are aligned word loads and a word is written by its owner alone. The -DVIC_UNALIGNED
-   build handles planes whose rows are not word aligned (widths the config's padded sizes can name): the fetches
-   gather bytes and the writes insert them with atomics, since invocations can then share a word. */
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-
-/* the host's GpuParams / GpuPlane / GpuSlot (gpu/vk/vic.c): only 32 bit members, so std430 packs them exactly
-   as the C structs do */
-struct PlaneDesc {
-    uint offset; /* byte offset in its buffer */
-    uint pitch;  /* pitch linear: the row pitch in bytes; block linear: the width in bytes */
-    uint height;
-    uint lim; /* bytes the plane may touch */
-    uint blk; /* 0 pitch linear, 1 block linear */
-    uint bh;  /* the block height log2 */
+/* a uniform buffer, not a storage one: every invocation reads the same few words, which drivers then serve from
+   constant caches or scalar registers */
+layout(std140, binding = 0) uniform Params {
+    VicGpuJob job;
+    VicGpuSlot slots[8];
 };
-struct SlotDesc {
-    uint on;
-    uint sx0, sy0, dx0, dy0, w, h;
-    int mat[12]; /* the color matrix rows: c00 c01 c02 c03 c10 ... c23 */
-    uint mat_shift, mat_enable;
-    uint alpha, clamp_lo, clamp_hi;
-    uint vu; /* NV21 input (0x43): V in each chroma pair's even byte */
-    PlaneDesc iy, ic;
+/* the slots' planes, byte for byte as guest memory holds them (VicGpuPlane.base is a plane's offset) */
+layout(std430, binding = 1) readonly restrict buffer Inputs {
+    uint inputs[];
 };
-struct JobDesc {
-    uint fmt, sw, sh, nslots;
-    PlaneDesc ol, oc;     /* oc.lim is 0 when the format has no chroma */
-    uint tx0, ty0, tw, th; /* the target rectangle the background fills, tw 0 for none */
-    uint bg[4];            /* the background colour, R G B A, 10 bit */
+/* the output planes, the same way */
+layout(std430, binding = 2) restrict buffer Outputs {
+    uint outputs[];
 };
 
-layout(std430, binding = 0) readonly buffer Params {
-    JobDesc job;
-    SlotDesc slots[8];
-}
-ps;
-layout(std430, binding = 1) readonly buffer Inputs {
-    uint data[];
-}
-inputs;
-layout(std430, binding = 2) buffer OutLuma {
-    uint data[];
-}
-out_luma;
-layout(std430, binding = 3) buffer OutChroma {
-    uint data[];
-}
-out_chroma;
-
-/* the tile a workgroup composes and the window it stages: 36 bytes per row cover the tile's 32 columns from any
-   word aligned start */
-const uint TILE_W = 32u, TILE_H = 8u;
-const uint WIN_W = 9u;
-
-shared SlotDesc lslots[8];                   /* the job's slots, fetched once per workgroup */
-shared uint lmask;                           /* the slots whose rectangles overlap the tile */
-shared uint lwin_y[8][TILE_H][WIN_W];        /* [slot][row][word]: the slot's luma bytes, window byte 0 at the word aligned start */
-shared uint lwin_c[8][TILE_H][WIN_W];        /* the slot's chroma bytes the same way (pairs duplicated over the rows) */
-
-/* the byte offset of (x, y) in a plane, as plane_row addresses it */
-uint plane_off(PlaneDesc p, uint x, uint y) {
-    if (p.blk == 0) return y * p.pitch + x;
-    /* bl_offset (gpu/gpu.c) with z = 0 and bd = 1 */
-    uint gob_w = (p.pitch + 63u) / 64u;
-    uint bh = 1u << p.bh;
-    uint gx = x / 64u, gy = y / 8u;
-    uint block_y = gy / bh, gob_in = gy % bh;
-    uint off = (block_y * gob_w + gx) * (512u * bh) + gob_in * 512u;
-    uint xb = x % 64u, yb = y % 8u;
-    off += (xb / 32u) * 256u + (yb / 2u) * 64u + ((xb % 32u) / 16u) * 32u + (yb % 2u) * 16u + (xb % 16u);
-    return off;
-}
-
-/* a byte of an input plane: 0 past the end of the mapping, like plane_row's zero fill */
-uint fetch_byte(PlaneDesc p, uint x, uint y) {
-    uint off = plane_off(p, x, y);
-    if (off >= p.lim) return 0u;
-    uint word = inputs.data[(p.offset + off) >> 2];
-    return (word >> (((p.offset + off) & 3u) * 8u)) & 0xFFu;
-}
-
-/* one word of an input plane for the window: bytes past the mapping read as 0, like plane_row's zero fill */
-uint fetch_word(PlaneDesc p, uint x, uint y) {
-#ifdef VIC_UNALIGNED
-    /* the row may not be word aligned: gather the bytes */
-    return fetch_byte(p, x, y) | (fetch_byte(p, x + 1u, y) << 8u) | (fetch_byte(p, x + 2u, y) << 16u) |
-           (fetch_byte(p, x + 3u, y) << 24u);
-#else
-    /* x is word aligned and plane_off keeps it so (the pitch is a multiple of 4 and the block linear math
-       keeps the column's alignment), so the load itself is aligned */
-    uint off = plane_off(p, x, y);
-    if (off >= p.lim) return 0u;
-    uint word = inputs.data[(p.offset + off) >> 2];
-    if (off + 4u <= p.lim) return word;
-    return word & (0xFFFFFFFFu >> ((4u - (p.lim - off)) * 8u));
-#endif
-}
-
-/* a byte of a staged window */
-uint win_byte(uint word, uint k) { return (word >> ((k & 3u) * 8u)) & 0xFFu; }
-
-/* the byte offset the invocation's four owned bytes start at in an output plane, 0xFFFFFFFF past its mapping */
-uint out_off(PlaneDesc p, uint byte_x, uint y) {
-    uint off = plane_off(p, byte_x, y);
-    return off < p.lim ? off : 0xFFFFFFFFu;
-}
-/* the owned bytes, masked: bytes the invocation does not own keep their round-tripped values */
-void out_store(uint off, uint value, uint mask, bool chroma) {
-    if (off == 0xFFFFFFFFu) return;
-#ifdef VIC_UNALIGNED
-    /* the four owned bytes can straddle words other invocations own bytes of: insert each atomically */
-    for (uint b = 0u; b < 4u; b++) {
-        if ((mask & (0xFFu << (b * 8u))) == 0u) continue;
-        uint idx = (off + b) >> 2u, sh = ((off + b) & 3u) * 8u;
-        if (chroma) {
-            atomicAnd(out_chroma.data[idx], ~(0xFFu << sh));
-            atomicOr(out_chroma.data[idx], ((value >> (b * 8u)) & 0xFFu) << sh);
-        } else {
-            atomicAnd(out_luma.data[idx], ~(0xFFu << sh));
-            atomicOr(out_luma.data[idx], ((value >> (b * 8u)) & 0xFFu) << sh);
-        }
-    }
-#else
-    if ((off & 3u) != 0u) return; /* the host promised word aligned rows */
-    uint idx = off >> 2u;
-    uint word = chroma ? out_chroma.data[idx] : out_luma.data[idx];
-    word = (word & ~mask) | (value & mask);
-    if (chroma)
-        out_chroma.data[idx] = word;
-    else
-        out_luma.data[idx] = word;
-#endif
-}
-
-void main() {
-    uint lid = gl_LocalInvocationIndex;
-    uint x0 = gl_WorkGroupID.x * TILE_W, y0 = gl_WorkGroupID.y * TILE_H;
-
-    /* the slots whose rectangles overlap the tile: none of their pixels can fall outside it, so the per pixel
-       search below only walks these */
-    if (lid == 0u) {
-        lmask = 0u;
-        for (uint s = 0u; s < 8u; s++) {
-            SlotDesc sl = ps.slots[s];
-            if (sl.on == 0u) continue;
-            if (sl.dx0 < x0 + TILE_W && x0 < sl.dx0 + sl.w && sl.dy0 < y0 + TILE_H && y0 < sl.dy0 + sl.h)
-                lmask |= 1u << s;
-        }
-    }
-    for (uint s = lid; s < 8u; s += 64u) lslots[s] = ps.slots[s];
-    barrier();
-
-    /* each overlapping slot's input window: the tile's covered rectangle, fetched word by word. The window's
-       byte 0 is the word aligned source column at or before the rectangle's left edge */
-    for (uint s = 0u; s < 8u; s++) {
-        if ((lmask & (1u << s)) == 0u) continue;
-        SlotDesc sl = lslots[s];
-        uint cx0 = max(sl.dx0, x0), cx1 = min(sl.dx0 + sl.w, x0 + TILE_W);
-        uint cy0 = max(sl.dy0, y0), cy1 = min(sl.dy0 + sl.h, y0 + TILE_H);
-        uint sc0 = sl.sx0 + (cx0 - sl.dx0), sr0 = sl.sy0 + (cy0 - sl.dy0);
-        uint base = sc0 & ~3u;
-        uint w0 = (sc0 - base) >> 2, w1 = (sc0 + (cx1 - cx0) - base + 3u) >> 2;
-        for (uint n = lid; n < (cy1 - cy0) * (w1 - w0); n += 64u) {
-            uint row = n / (w1 - w0), word = w0 + n % (w1 - w0);
-            uint sx = base + word * 4u, sy = sr0 + row;
-            lwin_y[s][cy0 - y0 + row][word] = fetch_word(sl.iy, sx, sy);
-            lwin_c[s][cy0 - y0 + row][word] = fetch_word(sl.ic, sx, sy >> 1);
-        }
-    }
-    barrier();
-
-    /* the pixels this invocation owns: the last slot in slot order that covers one composes it, over the
-       background inside the target rectangle */
-    bool nv12 = ps.job.fmt == 0x43u || ps.job.fmt == 0x44u;
-    uint vu = ps.job.fmt == 0x43u ? 1u : 0u; /* NV21 out: V in each chroma pair's even byte */
-    uint px = x0 + gl_LocalInvocationID.x * 4u, py = y0 + gl_LocalInvocationID.y;
-    uint luma = 0u, luma_mask = 0u;     /* the luma word bytes this invocation owns */
-    uint chroma = 0u, chroma_mask = 0u; /* the chroma word bytes, for even rows */
-    for (uint i = 0u; i < 4u; i++) {
-        if (px + i >= ps.job.sw || py >= ps.job.sh) break;
-        uint x = px + i;
-        bool covered =
-            x >= ps.job.tx0 && x - ps.job.tx0 < ps.job.tw && py >= ps.job.ty0 && py - ps.job.ty0 < ps.job.th;
-        /* 10 bit channels: R, G, B hold the Y, U, V samples, A the planar alpha */
-        uvec4 pix = uvec4(ps.job.bg[0], ps.job.bg[1], ps.job.bg[2], ps.job.bg[3]);
-        for (uint s = 0u; s < 8u; s++) {
-            if ((lmask & (1u << s)) == 0u) continue;
-            SlotDesc sl = lslots[s];
-            if (px + i < sl.dx0 || px + i >= sl.dx0 + sl.w || py < sl.dy0 || py >= sl.dy0 + sl.h) continue;
-            uint cx0 = max(sl.dx0, x0);
-            uint base = (sl.sx0 + (cx0 - sl.dx0)) & ~3u;
-            uint row = py - y0;
-            uint sx = sl.sx0 + (px + i - sl.dx0); /* the window's row is the tile row: the fetch staged the rows */
-            uint k = sx - base;
-            uint kc = (sx & ~1u) - base; /* 4:2:0 chroma covers pixel pairs */
-            uint Y = win_byte(lwin_y[s][row][k >> 2], k);
-            uint U = win_byte(lwin_c[s][row][kc >> 2], kc + sl.vu); /* kc is even: the pair is in one word */
-            uint V = win_byte(lwin_c[s][row][kc >> 2], kc + 1u - sl.vu);
-            ivec4 q = ivec4(int(Y << 2), int(U << 2), int(V << 2), int(sl.alpha));
-            if (sl.mat_enable != 0u) {
-                int r = q.r * sl.mat[0] + q.g * sl.mat[1] + q.b * sl.mat[2];
-                int gr = q.r * sl.mat[4] + q.g * sl.mat[5] + q.b * sl.mat[6];
-                int b = q.r * sl.mat[8] + q.g * sl.mat[9] + q.b * sl.mat[10];
-                r = ((r >> sl.mat_shift) + sl.mat[3]) >> 8;
-                gr = ((gr >> sl.mat_shift) + sl.mat[7]) >> 8;
-                b = ((b >> sl.mat_shift) + sl.mat[11]) >> 8;
-                /* the soft clamp range is 10 bit, like the pixels; the alpha stays the planar alpha */
-                int lo = int(sl.clamp_lo), hi = int(sl.clamp_hi);
-                q = ivec4(clamp(r, lo, hi), clamp(gr, lo, hi), clamp(b, lo, hi), q.a);
-            }
-            pix = uvec4(q);
-            covered = true;
-        }
-        if (!covered) continue;
-
-        if (!nv12) {
-            /* the 10 bit channels back to 8 bit, as WriteABGR writes them: A8R8G8B8 stores R and B the other way
-               around than A8B8G8R8 does */
-            bool swap = ps.job.fmt == 0x20u;
-            uint r = pix.r >> 2, gg = pix.g >> 2, b = pix.b >> 2, a = pix.a >> 2;
-            uint word = swap ? (b | (gg << 8) | (r << 16) | (a << 24)) : (r | (gg << 8) | (b << 16) | (a << 24));
-            out_store(out_off(ps.job.ol, (px + i) * 4u, py), word, 0xFFFFFFFFu, false);
-        } else {
-            /* NV12 out: luma from R */
-            luma |= ((pix.r >> 2) & 0xFFu) << (i * 8u);
-            luma_mask |= 0xFFu << (i * 8u);
-            /* chroma from G and B of the pixel pairs, on even rows only (a pair starts on an even pixel) */
-            if ((py & 1u) == 0u && (i & 1u) == 0u) {
-                uint j = i; /* chroma bytes i and i + 1 hold the pair of pixel i */
-                chroma |= (((pix.g >> 2) & 0xFFu) << ((j + vu) * 8u)) |
-                          (((pix.b >> 2) & 0xFFu) << ((j + 1u - vu) * 8u));
-                chroma_mask |= (0xFFu << (j * 8u)) | (0xFFu << ((j + 1u) * 8u));
-            }
-        }
-    }
-    if (nv12) {
-        out_store(out_off(ps.job.ol, px, py), luma, luma_mask, false);
-        if ((py & 1u) == 0u && ps.job.oc.lim != 0u)
-            out_store(out_off(ps.job.oc, px, py >> 1), chroma, chroma_mask, true);
-    }
-}
+#include "vic_compose.glsl"

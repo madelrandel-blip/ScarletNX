@@ -7,29 +7,29 @@
 #include "gnuabi/network/network.h"
 #include "gnuabi/abi/errno/errno.h"
 #include "common/utilities/common.h"
+#include <openssl/rand.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <bcrypt.h>
+#include <windows.h> /* the clocks' FILETIME */
 #else
 #include <unistd.h>
 #endif
 
+/* 0, or -GNU_EIO: RAND_bytes says 1 when it filled the buffer, and takes an int's worth at a time */
 int gnu_random_bytes(void* destination, size_t size) {
-#ifdef _WIN32
-    if (size > UINT32_MAX) return -GNU_EINVAL;
-    return BCryptGenRandom(NULL, destination, (ULONG)size, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0 ? -GNU_EIO : 0;
-#else
-    FILE* random = fopen("/dev/urandom", "rb");
-    if (!random) return -GNU_EIO;
-    size_t n = fread(destination, 1, size, random);
-    fclose(random);
-    return n == size ? 0 : -GNU_EIO;
-#endif
+    unsigned char* out = destination;
+    while (size) {
+        int n = size > INT_MAX ? INT_MAX : (int)size;
+        if (RAND_bytes(out, n) != 1) return -GNU_EIO;
+        out += n;
+        size -= (size_t)n;
+    }
+    return 0;
 }
 int gnu_clock_gettime(int id, int64_t* seconds, int64_t* nanos) {
     if (id != 0 && id != 1 && id != 4 && id != 5 && id != 6 && id != 7 && id != 2 && id != 3) return -GNU_EINVAL;
@@ -76,7 +76,7 @@ void gnu_sleep(int64_t seconds, int64_t nanoseconds) {
     struct timespec t;
     t.tv_sec = (time_t)seconds;
     t.tv_nsec = (long)nanoseconds;
-    while (nanosleep(&t, &t)) {}
+    while (nanosleep(&t, &t));
 #endif
 }
 static int push(GnuProcess* p, uint64_t* sp, const void* data, size_t n) {
@@ -115,25 +115,27 @@ int gnu_process_stack(GnuProcess* p, int argc, const char* const* argv, const ch
     if ((result = gnu_random_bytes(random, sizeof random)) || (result = push(p, &sp, random, sizeof random))) goto done;
     uint64_t random_address = sp;
     /* Features advertised here must be implemented by the shared recompiler. */
-    const uint64_t auxiliary[] = {3,  p->elf.phdr,
-                                  4,  p->elf.phentsize,
-                                  5,  p->elf.phnum,
-                                  6,  GNU_PAGE_SIZE,
-                                  7,  p->interp.image ? p->interp.bias : 0,
-                                  8,  0,
-                                  9,  p->elf.entry,
-                                  11, 1000,
-                                  12, 1000,
-                                  13, 1000,
-                                  14, 1000,
-                                  15, platform_address,
-                                  16, 3,
-                                  17, 100,
-                                  23, 0,
-                                  25, random_address,
-                                  26, 0,
-                                  31, arguments[0],
-                                  0,  0};
+    const uint64_t auxiliary[] = {
+        3,  p->elf.phdr,
+        4,  p->elf.phentsize,
+        5,  p->elf.phnum,
+        6,  GNU_PAGE_SIZE,
+        7,  p->interp.image ? p->interp.bias : 0,
+        8,  0,
+        9,  p->elf.entry,
+        11, 1000,
+        12, 1000,
+        13, 1000,
+        14, 1000,
+        15, platform_address,
+        16, 3,
+        17, 100,
+        23, 0,
+        25, random_address,
+        26, 0,
+        31, arguments[0],
+        0,  0
+    };
     size_t words = 1 + (size_t)argc + 1 + envc + 1 + sizeof auxiliary / sizeof auxiliary[0];
     uint64_t bytes = (uint64_t)words * 8;
     uint64_t initial = (sp - bytes) & ~UINT64_C(15);
@@ -171,10 +173,8 @@ int gnu_process_stack32(GnuProcess* p, int argc, const char* const* argv, const 
     uint32_t sp = 0xf0000000u, stack_low = 0xef800000u;
     if (argc < 1 || argc > 65536) return -GNU_EINVAL;
     size_t envc = 0;
-    if (env)
-        while (env[envc]) {
-            if (++envc > 65536) return -GNU_E2BIG;
-        }
+    for (; env && env[envc]; )
+        if (++envc > 65536) return -GNU_E2BIG;
     if (gnu_memory_map(&p->memory, stack_low, (uint64_t)sp - stack_low, 3, 0)) return -GNU_ENOMEM;
     uint32_t* arguments = calloc((size_t)argc, sizeof *arguments);
     uint32_t* environment = calloc(envc ? envc : 1, sizeof *environment);

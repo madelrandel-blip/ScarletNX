@@ -8,6 +8,7 @@
    SPDX-FileCopyrightText: 2021 Skyline Team and Contributors */
 /* nvdrv's devices: nvmap, the GPU address space, nvhost-ctrl's syncpoints and events, ctrl-gpu, the GPU channels, and
    the NVDEC and VIC fds that gpu/video/host1x.c serves */
+#include "nx/hle/hle.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/gpu/gpu.h"
 #include "nx/hle/kernel/ipc.h"
@@ -22,106 +23,27 @@
 #include <string.h>
 static void nv_events_check(void);
 
-/* an nvmap handle (nv.nvh, by handle number). CREATE and each FROM_ID take a reference, FREE gives one back and the
-   last one ends the handle. allocated: ALLOC gave it guest memory at addr */
-typedef struct {
-    u64 addr;
-    u32 size, align, heap, flags;
-    u32 id;
-    u32 refs;
-    int alive, allocated;
-    u8 kind;
-} NvMapH;
-/* what MAP_BUFFER_EX mapped, for UNMAP_BUFFER: [gva, gva+size) maps cpu. base is the address UNMAP_BUFFER names; a
-   modify (flag 0x100) or FREE_SPACE splits a mapping into pieces that keep it. va is the VA the mapping took from
-   the allocator (0 when the game placed it), given back when it is unmapped */
-typedef struct {
-    u64 gva, size, cpu;
-    u64 base, va;
-} GMap;
-typedef struct {
-    u64 a, e;
-} VaRange;
-/* an nvhost-ctrl event slot (nv.nvev). ev is made on first use and nvdrv keeps a reference. An armed slot is
-   signaled once syncpoint id reaches thresh; armed changes under nv.nvev_lk */
-typedef struct {
-    KEvent* ev;
-    u32 id, thresh;
-    int armed;
-} NvEvent;
-/* an fd (nv.nvf, by number) */
-typedef struct {
-    int dev;       /* a DEV_* value, DEV_NONE while the entry is free */
-    u32 syncpt;    /* DEV_GPU: the channel's syncpoint, 0 until its first use */
-    u64 user_data; /* DEV_GPU: SET_USER_DATA's value, for GET_USER_DATA */
-    /* QueryEvent's events of a channel (1 SM exception, 2 SM pause, 3 error notifier, as Ryujinx numbers them), made
-       on first query and never signaled: nothing here raises them */
-    KEvent* ev[4];
-    H1Ch* h1x; /* DEV_NVDEC, DEV_VIC: the fd's host1x channel (host1x_open) */
-    /* the ioctls running on the fd. Close during one only marks it closed, and the last ioctl to leave releases it:
-       the entry and its channel stay while an ioctl uses them, and Open doesn't hand the fd out again meanwhile */
-    u32 users;
-    int closed;
-} NvFile;
-#define SYNCPT_N 128 /* the syncpoint ids syncpt_alloc hands out (see there) */
-/* nv_init sets the two fields that don't start at 0: an initializer would put the whole table in the binary */
-static struct {
-    NvMapH nvh[8192];
-    u32 nvh_next; /* handles below this have been handed out */
-    /* freed handles, handed out again before nvh_next grows: movies create and free buffers for every clip, and a
-       handle past the table would be written outside it */
-    u32 nvh_free[8192];
-    u32 nvh_nfree;
-    PMutex lock;
-    u64** gmmu;    /* gmmu[i] -> 4096 entries of (guest addr | 1) */
-    PMutex aslock; /* held across ioctl_as: the mappings below and the VA allocator */
-    GMap* gmaps;
-    u32 ngmaps, capgmaps;
-    u32 big_page_bits; /* 64K unless asked otherwise */
-    VaRange* vafree;
-    u32 nvafree, capvafree;
-    int va_ready; /* the free ranges hold the whole region at first (va_init) */
-    u32 syncpt[SYNCPT_IDS];
-    u32 syncpt_max[SYNCPT_IDS];
-    PCond sync_cv;
-    PMutex sync_lk;
-    u8 syncpt_used[SYNCPT_N];
-    u8 syncpt_gpu[SYNCPT_N]; /* a GPU channel's: submissions promise its increments (syncpt_max), the GPU thread makes
-                                them (sync_lk) */
-    PMutex submit_lk;        /* a submission's promise and its place in the GPU queue, in the same order */
-    /* each ctrl fd's 64 event slots, made on first use and dropped with the fd, under nvev_lk: as on the console, the
-       slots are the fd's (Ryujinx's NvHostCtrlDeviceFile keeps them per open). Metroid Dread's GPU fence waits (one
-       fd) and its movie player (another) both use slot 0, and with one table between them a thread resetting its
-       event took the other's wake, which then waited for good */
-    NvEvent* ctrl_ev[256];
-    /* a game thread arms a slot while GPU and video threads run nv_events_check after their increments. Arming
-       clears the event first and does both in one hold: an increment between a separate arm and clear would signal
-       and then lose its wakeup, leaving the game waiting for good. A mutex, not a spin: kevent_signal runs under
-       it */
-    PMutex nvev_lk;
-    NvFile nvf[256];
-} nv;
 /* host1x (nvmap_get) and vi (nvmap_addr_by_id) read handles on the game's other threads while they create, alloc
    and free them, so under the lock, the address and the size in one hold: two would let them describe two handles */
 int nvmap_get(u32 h, u64* addr, u32* size) {
-    pm_lock(&nv.lock);
-    int alive = h && h < 8192 && nv.nvh[h].alive && nv.nvh[h].allocated;
-    *addr = alive ? nv.nvh[h].addr : 0;
-    *size = alive ? nv.nvh[h].size : 0;
-    pm_unlock(&nv.lock);
+    pm_lock(&g_hle.nvdrv.lock);
+    int alive = h && h < 8192 && g_hle.nvdrv.nvh[h].alive && g_hle.nvdrv.nvh[h].allocated;
+    *addr = alive ? g_hle.nvdrv.nvh[h].addr : 0;
+    *size = alive ? g_hle.nvdrv.nvh[h].size : 0;
+    pm_unlock(&g_hle.nvdrv.lock);
     return alive;
 }
 /* the live handle an id names, 0 for none. Called with the lock held */
 static u32 nvmap_from_id(u32 id) {
-    for (u32 i = 1; i < nv.nvh_next; i++)
-        if (nv.nvh[i].alive && nv.nvh[i].id == id) return i;
+    for (u32 i = 1; i < g_hle.nvdrv.nvh_next; i++)
+        if (g_hle.nvdrv.nvh[i].alive && g_hle.nvdrv.nvh[i].id == id) return i;
     return 0;
 }
 u64 nvmap_addr_by_id(u32 id) {
-    pm_lock(&nv.lock);
+    pm_lock(&g_hle.nvdrv.lock);
     u32 h = nvmap_from_id(id);
-    u64 a = h && nv.nvh[h].allocated ? nv.nvh[h].addr : 0;
-    pm_unlock(&nv.lock);
+    u64 a = h && g_hle.nvdrv.nvh[h].allocated ? g_hle.nvdrv.nvh[h].addr : 0;
+    pm_unlock(&g_hle.nvdrv.lock);
     return a;
 }
 
@@ -132,23 +54,30 @@ u64 nvmap_addr_by_id(u32 id) {
 #define GL2_BITS   12 /* gmmu_l2's tables: 4096 entries */
 /* first-level entries: 16 bits of page number above the 12 a second-level table covers, for 40 bits in all */
 #define GL1        (1u << (40 - GPAGE_BITS - GL2_BITS))
+static_assert(GL1 == NV_GMMU_L1, "nvdrv.h sizes the first level");
 static u32 gmmu_l1_index(u64 page) { return (u32)(page >> GL2_BITS) & (GL1 - 1); }
 /* the guest address of a GPU address, 0 when its page isn't mapped. On the GPU thread, while ioctl_as maps and unmaps
    on others. Bits past the 40 the table covers are dropped, as the GPU's MMU does */
 u64 gmmu_translate(u64 gva) {
     u64 page = gva >> GPAGE_BITS;
-    u64* t = __atomic_load_n(&nv.gmmu[gmmu_l1_index(page)], __ATOMIC_ACQUIRE);
+    u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(page)], __ATOMIC_ACQUIRE);
     u64 e;
     if (!t) return 0;
     e = __atomic_load_n(&t[page & ((1u << GL2_BITS) - 1)], __ATOMIC_RELAXED);
     if (!(e & 1)) return 0;
     return (e & ~(u64)0xFFF) | (gva & 0xFFF);
 }
+/* An entry's bits 1 to 11 count the pages after it, in its table, that are mapped and follow on in guest memory: a
+   lower bound, so gmmu_run steps over a run of them in one load instead of one per page. A map writes its pages from the
+   last, each counting those after it already written, and a change first shortens the counts before it that reach into
+   it (gmmu_clip) */
+#define GHINT_MAX  2047u
+#define GHINT_MASK ((u64)GHINT_MAX << 1)
 /* the bytes from gva on, at most max, whose pages map to consecutive guest pages, and in *cpu the guest address of gva:
    0 when gva's page isn't mapped. One walk of the table for a range, where gmmu_translate per page walks it again */
 u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
     u64 page = gva >> GPAGE_BITS, n, e, want;
-    u64* t = __atomic_load_n(&nv.gmmu[gmmu_l1_index(page)], __ATOMIC_ACQUIRE);
+    u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(page)], __ATOMIC_ACQUIRE);
     if (!max || !t) return 0;
     e = __atomic_load_n(&t[page & ((1u << GL2_BITS) - 1)], __ATOMIC_RELAXED);
     if (!(e & 1)) return 0;
@@ -156,8 +85,18 @@ u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
     n = 0x1000 - (gva & 0xFFF);
     want = (e & ~(u64)0xFFF) + 0x1000;
     while (n < max) {
+        u64 h = (e & GHINT_MASK) >> 1;
+        if (h) { /* the next h pages follow on: to the last of them, whose entry tells what follows it */
+            page += h;
+            n += h << GPAGE_BITS;
+            want += h << GPAGE_BITS;
+            if (n >= max) break;
+            e = __atomic_load_n(&t[page & ((1u << GL2_BITS) - 1)], __ATOMIC_RELAXED);
+            continue;
+        }
         page++;
-        if (!(page & ((1u << GL2_BITS) - 1))) t = __atomic_load_n(&nv.gmmu[gmmu_l1_index(page)], __ATOMIC_ACQUIRE);
+        if (!(page & ((1u << GL2_BITS) - 1)))
+            t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(page)], __ATOMIC_ACQUIRE);
         if (!t) break;
         e = __atomic_load_n(&t[page & ((1u << GL2_BITS) - 1)], __ATOMIC_RELAXED);
         if (!(e & 1) || (e & ~(u64)0xFFF) != want) break;
@@ -167,11 +106,11 @@ u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
     return n < max ? n : max;
 }
 static u64* gmmu_l2(u32 i) {
-    u64* t = __atomic_load_n(&nv.gmmu[i], __ATOMIC_ACQUIRE);
+    u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[i], __ATOMIC_ACQUIRE);
     if (t) return t;
     u64* n = calloc(4096, 8);
     if (!n) fatal("nvdrv: out of memory for the GPU page table\n");
-    if (__atomic_compare_exchange_n(&nv.gmmu[i], &t, n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return n;
+    if (__atomic_compare_exchange_n(&g_hle.nvdrv.gmmu[i], &t, n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return n;
     free(n);
     return t;
 }
@@ -183,6 +122,19 @@ static void gmmu_change_end(u64 gva, u64 size) {
     gpu_mem_written(gva, size);
     if (g_gpu_mapping_end) g_gpu_mapping_end();
 }
+/* the counts of the entries before page first stop short of it, before it changes */
+static void gmmu_clip(u64 first) {
+    for (u64 k = 1; k <= GHINT_MAX && k <= first; k++) {
+        u64 q = first - k, e;
+        u64* t;
+        if ((q ^ first) >> GL2_BITS) break; /* counts stay in their table */
+        t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(q)], __ATOMIC_ACQUIRE);
+        if (!t) break;
+        e = __atomic_load_n(&t[q & ((1u << GL2_BITS) - 1)], __ATOMIC_RELAXED);
+        if ((e & GHINT_MASK) >> 1 >= k)
+            __atomic_store_n(&t[q & ((1u << GL2_BITS) - 1)], (e & ~GHINT_MASK) | ((k - 1) << 1), __ATOMIC_RELAXED);
+    }
+}
 /* points the pages of [gva, gva+size) at cpu onwards */
 static void gmmu_map(u64 gva, u64 cpu, u64 size) {
     u64 first, last, p;
@@ -190,10 +142,16 @@ static void gmmu_map(u64 gva, u64 cpu, u64 size) {
     gmmu_change_begin(gva, size);
     first = gva >> GPAGE_BITS;
     last = (gva + size - 1) >> GPAGE_BITS;
-    for (p = first; p <= last; p++) {
+    gmmu_clip(first);
+    for (p = last;; p--) { /* from the last, so a page's count covers only pages already written */
         u64* t = gmmu_l2(gmmu_l1_index(p));
-        u64 e = (cpu + ((p - first) << GPAGE_BITS)) | 1;
+        u64 h = last - p, room = ((1u << GL2_BITS) - 1) - (p & ((1u << GL2_BITS) - 1));
+        u64 e;
+        if (h > room) h = room;
+        if (h > GHINT_MAX) h = GHINT_MAX;
+        e = (cpu + ((p - first) << GPAGE_BITS)) | (h << 1) | 1;
         __atomic_store_n(&t[p & ((1u << GL2_BITS) - 1)], e, __ATOMIC_RELAXED);
+        if (p == first) break;
     }
     gmmu_change_end(gva, size);
 }
@@ -205,34 +163,48 @@ static void gmmu_unmap(u64 gva, u64 size, int own, u64 cpu) {
     gmmu_change_begin(gva, size);
     first = gva >> GPAGE_BITS;
     last = (gva + size - 1) >> GPAGE_BITS;
+    /* no count may reach a page about to be cleared: the ones before the range stop short of it, and the pages in it
+       that an own unmap keeps lose theirs */
+    gmmu_clip(first);
     for (p = first; p <= last; p++) {
-        u64* t = __atomic_load_n(&nv.gmmu[gmmu_l1_index(p)], __ATOMIC_ACQUIRE);
+        u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(p)], __ATOMIC_ACQUIRE);
+        u64 e;
+        if (!t) {
+            p |= (1u << GL2_BITS) - 1;
+            continue;
+        }
+        e = __atomic_load_n(&t[p & ((1u << GL2_BITS) - 1)], __ATOMIC_RELAXED);
+        if (e & GHINT_MASK) __atomic_store_n(&t[p & ((1u << GL2_BITS) - 1)], e & ~GHINT_MASK, __ATOMIC_RELAXED);
+    }
+    for (p = first; p <= last; p++) {
+        u64* t = __atomic_load_n(&g_hle.nvdrv.gmmu[gmmu_l1_index(p)], __ATOMIC_ACQUIRE);
         u64* e;
         if (!t) { /* nothing was ever mapped in this table's range: skip to the next table */
             p |= (1u << GL2_BITS) - 1;
             continue;
         }
         e = &t[p & ((1u << GL2_BITS) - 1)];
-        if (own && __atomic_load_n(e, __ATOMIC_RELAXED) != ((cpu + ((p - first) << GPAGE_BITS)) | 1)) continue;
+        if (own && (__atomic_load_n(e, __ATOMIC_RELAXED) & ~GHINT_MASK) != ((cpu + ((p - first) << GPAGE_BITS)) | 1))
+            continue;
         __atomic_store_n(e, 0, __ATOMIC_RELAXED);
     }
     gmmu_change_end(gva, size);
 }
 static GMap* gmap_add(void) {
-    if (nv.ngmaps == nv.capgmaps) {
-        u32 nc = nv.capgmaps ? nv.capgmaps * 2 : 1024;
-        GMap* g = realloc(nv.gmaps, nc * sizeof *g);
+    if (g_hle.nvdrv.ngmaps == g_hle.nvdrv.capgmaps) {
+        u32 nc = g_hle.nvdrv.capgmaps ? g_hle.nvdrv.capgmaps * 2 : 1024;
+        GMap* g = realloc(g_hle.nvdrv.gmaps, nc * sizeof *g);
         if (!g) fatal("nvdrv: out of memory for GPU mappings\n");
-        nv.gmaps = g;
-        nv.capgmaps = nc;
+        g_hle.nvdrv.gmaps = g;
+        g_hle.nvdrv.capgmaps = nc;
     }
-    return &nv.gmaps[nv.ngmaps++];
+    return &g_hle.nvdrv.gmaps[g_hle.nvdrv.ngmaps++];
 }
 /* takes [gva, gva+size) out of the tracked pieces, splitting a piece that straddles it */
 static void gmap_cut(u64 gva, u64 size) {
     u64 e = gva + size;
-    for (u32 k = 0; k < nv.ngmaps;) {
-        GMap* g = &nv.gmaps[k];
+    for (u32 k = 0; k < g_hle.nvdrv.ngmaps;) {
+        GMap* g = &g_hle.nvdrv.gmaps[k];
         u64 ge = g->gva + g->size;
         if (ge <= gva || g->gva >= e) {
             k++;
@@ -253,7 +225,7 @@ static void gmap_cut(u64 gva, u64 size) {
             g->gva = e;
             k++;
         } else
-            nv.gmaps[k] = nv.gmaps[--nv.ngmaps];
+            g_hle.nvdrv.gmaps[k] = g_hle.nvdrv.gmaps[--g_hle.nvdrv.ngmaps];
     }
 }
 /* GPU VA for ALLOC_SPACE and MAP_BUFFER_EX: first fit from 0x04_0000_0000 to the end of the 40-bit space the gmmu
@@ -263,25 +235,26 @@ static void gmap_cut(u64 gva, u64 size) {
 #define VA_BASE 0x0400000000ull
 #define VA_END  (1ull << 40)
 static void va_insert(u32 k, u64 a, u64 e) {
-    if (nv.nvafree == nv.capvafree) {
-        u32 nc = nv.capvafree ? nv.capvafree * 2 : 64;
-        VaRange* v = realloc(nv.vafree, nc * sizeof *v);
+    if (g_hle.nvdrv.nvafree == g_hle.nvdrv.capvafree) {
+        u32 nc = g_hle.nvdrv.capvafree ? g_hle.nvdrv.capvafree * 2 : 64;
+        VaRange* v = realloc(g_hle.nvdrv.vafree, nc * sizeof *v);
         if (!v) fatal("nvdrv: out of memory for the GPU address space\n");
-        nv.vafree = v;
-        nv.capvafree = nc;
+        g_hle.nvdrv.vafree = v;
+        g_hle.nvdrv.capvafree = nc;
     }
-    memmove(&nv.vafree[k + 1], &nv.vafree[k], (nv.nvafree - k) * sizeof *nv.vafree);
-    nv.vafree[k].a = a;
-    nv.vafree[k].e = e;
-    nv.nvafree++;
+    memmove(&g_hle.nvdrv.vafree[k + 1], &g_hle.nvdrv.vafree[k], (g_hle.nvdrv.nvafree - k) * sizeof *g_hle.nvdrv.vafree);
+    g_hle.nvdrv.vafree[k].a = a;
+    g_hle.nvdrv.vafree[k].e = e;
+    g_hle.nvdrv.nvafree++;
 }
 static void va_remove(u32 k) {
-    memmove(&nv.vafree[k], &nv.vafree[k + 1], (nv.nvafree - k - 1) * sizeof *nv.vafree);
-    nv.nvafree--;
+    memmove(&g_hle.nvdrv.vafree[k], &g_hle.nvdrv.vafree[k + 1],
+            (g_hle.nvdrv.nvafree - k - 1) * sizeof *g_hle.nvdrv.vafree);
+    g_hle.nvdrv.nvafree--;
 }
 static void va_init(void) {
-    if (nv.va_ready) return;
-    nv.va_ready = 1;
+    if (g_hle.nvdrv.va_ready) return;
+    g_hle.nvdrv.va_ready = 1;
     va_insert(0, VA_BASE, VA_END);
 }
 static u64 va_round(u64 size) { return (size + 0xFFFF) & ~0xFFFFull; }
@@ -293,8 +266,8 @@ static int cpu_ok(u64 cpu, u64 size) { return size <= AS_SIZE && cpu <= AS_SIZE 
 /* takes [a, e) out of the free ranges */
 static void va_take(u64 a, u64 e) {
     va_init();
-    for (u32 k = 0; k < nv.nvafree;) {
-        VaRange r = nv.vafree[k];
+    for (u32 k = 0; k < g_hle.nvdrv.nvafree;) {
+        VaRange r = g_hle.nvdrv.vafree[k];
         if (r.e <= a || r.a >= e) {
             k++;
             continue;
@@ -314,13 +287,13 @@ static void va_free(u64 a, u64 size) {
     if (a >= e) return;
     va_take(a, e); /* what is already free isn't added twice */
     u32 k = 0;
-    while (k < nv.nvafree && nv.vafree[k].a < a) k++;
-    if (k > 0 && nv.vafree[k - 1].e == a) {
-        a = nv.vafree[k - 1].a;
+    while (k < g_hle.nvdrv.nvafree && g_hle.nvdrv.vafree[k].a < a) k++;
+    if (k > 0 && g_hle.nvdrv.vafree[k - 1].e == a) {
+        a = g_hle.nvdrv.vafree[k - 1].a;
         va_remove(--k);
     }
-    if (k < nv.nvafree && nv.vafree[k].a == e) {
-        e = nv.vafree[k].e;
+    if (k < g_hle.nvdrv.nvafree && g_hle.nvdrv.vafree[k].a == e) {
+        e = g_hle.nvdrv.vafree[k].e;
         va_remove(k);
     }
     va_insert(k, a, e);
@@ -329,9 +302,11 @@ static void va_free(u64 a, u64 size) {
 static u64 va_alloc(u64 size, u64 align) {
     va_init();
     align = align > 0x10000 ? align : 0x10000; /* the allocator's unit */
-    for (u32 k = 0; k < nv.nvafree; k++) {
-        u64 a = (nv.vafree[k].a + align - 1) & ~(align - 1);
-        if (a < nv.vafree[k].a || a >= nv.vafree[k].e || va_round(size) > nv.vafree[k].e - a) continue;
+    for (u32 k = 0; k < g_hle.nvdrv.nvafree; k++) {
+        u64 a = (g_hle.nvdrv.vafree[k].a + align - 1) & ~(align - 1);
+        if (a < g_hle.nvdrv.vafree[k].a || a >= g_hle.nvdrv.vafree[k].e ||
+            va_round(size) > g_hle.nvdrv.vafree[k].e - a)
+            continue;
         va_reserve(a, size);
         return a;
     }
@@ -340,14 +315,14 @@ static u64 va_alloc(u64 size, u64 align) {
 }
 
 /* syncpoints */
-u32 syncpt_read(u32 id) { return id < SYNCPT_IDS ? __atomic_load_n(&nv.syncpt[id], __ATOMIC_SEQ_CST) : 0; }
+u32 syncpt_read(u32 id) { return id < SYNCPT_IDS ? __atomic_load_n(&g_hle.nvdrv.syncpt[id], __ATOMIC_SEQ_CST) : 0; }
 void syncpt_add(u32 id, u32 n) {
     if (id >= SYNCPT_IDS || !n) return;
-    pm_lock(&nv.sync_lk);
-    u32 v = __atomic_add_fetch(&nv.syncpt[id], n, __ATOMIC_SEQ_CST);
-    if ((i32)(v - nv.syncpt_max[id]) > 0) nv.syncpt_max[id] = v; /* the CPU promises nothing first */
-    pc_broadcast(&nv.sync_cv);
-    pm_unlock(&nv.sync_lk);
+    pm_lock(&g_hle.nvdrv.sync_lk);
+    u32 v = __atomic_add_fetch(&g_hle.nvdrv.syncpt[id], n, __ATOMIC_SEQ_CST);
+    if ((i32)(v - g_hle.nvdrv.syncpt_max[id]) > 0) g_hle.nvdrv.syncpt_max[id] = v; /* the CPU promises nothing first */
+    pc_broadcast(&g_hle.nvdrv.sync_cv);
+    pm_unlock(&g_hle.nvdrv.sync_lk);
     nv_events_check();
     gpu_kick(); /* a GPU channel's stream may wait for it */
 }
@@ -355,12 +330,12 @@ void syncpt_incr(u32 id) { syncpt_add(id, 1); }
 u32 syncpt_promise(u32 id, u32 n) {
     u32 cur, v;
     if (id >= SYNCPT_IDS) return 0;
-    pm_lock(&nv.sync_lk);
+    pm_lock(&g_hle.nvdrv.sync_lk);
     cur = syncpt_read(id);
-    if ((i32)(cur - nv.syncpt_max[id]) > 0) nv.syncpt_max[id] = cur;
-    nv.syncpt_max[id] += n;
-    v = nv.syncpt_max[id];
-    pm_unlock(&nv.sync_lk);
+    if ((i32)(cur - g_hle.nvdrv.syncpt_max[id]) > 0) g_hle.nvdrv.syncpt_max[id] = cur;
+    g_hle.nvdrv.syncpt_max[id] += n;
+    v = g_hle.nvdrv.syncpt_max[id];
+    pm_unlock(&g_hle.nvdrv.sync_lk);
     return v;
 }
 /* whether syncpoint id has reached thresh, counting across the 32-bit wrap */
@@ -374,7 +349,8 @@ int syncpt_wait(u32 id, u32 thresh, i64 timeout_ns) {
     if (syncpt_reached(id, thresh)) return 1;
     if (!timeout_ns) return 0;
     deadline = timeout_ns > 0 ? plat_ns() + (u64)timeout_ns : 0;
-    pm_lock(&nv.sync_lk); /* syncpt_add broadcasts under it, so no increment slips between the check and the wait */
+    /* syncpt_add broadcasts under it, so no increment slips between the check and the wait */
+    pm_lock(&g_hle.nvdrv.sync_lk);
     for (;;) {
         i64 left = -1;
         reached = syncpt_reached(id, thresh);
@@ -384,9 +360,9 @@ int syncpt_wait(u32 id, u32 thresh, i64 timeout_ns) {
             if (now >= deadline) break;
             left = (i64)(deadline - now);
         }
-        pc_wait(&nv.sync_cv, &nv.sync_lk, left);
+        pc_wait(&g_hle.nvdrv.sync_cv, &g_hle.nvdrv.sync_lk, left);
     }
-    pm_unlock(&nv.sync_lk);
+    pm_unlock(&g_hle.nvdrv.sync_lk);
     return reached;
 }
 /* every syncpoint user (GPU channels here, host1x channels in host1x.c) allocates here, so ids stay unique and low.
@@ -394,24 +370,25 @@ int syncpt_wait(u32 id, u32 thresh, i64 timeout_ns) {
    id past them writes into the game's heap: running out is fatal, and a closed channel (GPU or host1x) gives its ids
    back */
 u32 syncpt_alloc(void) {
-    pm_lock(&nv.sync_lk);
+    pm_lock(&g_hle.nvdrv.sync_lk);
     for (u32 id = 20; id < SYNCPT_N; id++)
-        if (!nv.syncpt_used[id]) {
-            nv.syncpt_used[id] = 1;
-            nv.syncpt_max[id] = nv.syncpt[id]; /* an id used before starts with nothing promised past its value */
-            pm_unlock(&nv.sync_lk);
+        if (!g_hle.nvdrv.syncpt_used[id]) {
+            g_hle.nvdrv.syncpt_used[id] = 1;
+            /* an id used before starts with nothing promised past its value */
+            g_hle.nvdrv.syncpt_max[id] = g_hle.nvdrv.syncpt[id];
+            pm_unlock(&g_hle.nvdrv.sync_lk);
             return id;
         }
-    pm_unlock(&nv.sync_lk);
+    pm_unlock(&g_hle.nvdrv.sync_lk);
     fatal("nvdrv: all %u syncpoints are in use (NVIDIA's stream library has room for %u ids)\n", SYNCPT_N - 20,
           SYNCPT_N);
 }
 void syncpt_free(u32 id) {
     if (id >= SYNCPT_N) return;
-    pm_lock(&nv.sync_lk);
-    nv.syncpt_used[id] = 0;
-    nv.syncpt_gpu[id] = 0;
-    pm_unlock(&nv.sync_lk);
+    pm_lock(&g_hle.nvdrv.sync_lk);
+    g_hle.nvdrv.syncpt_used[id] = 0;
+    g_hle.nvdrv.syncpt_gpu[id] = 0;
+    pm_unlock(&g_hle.nvdrv.sync_lk);
 }
 /* whether a present can leave a fence to the GPU thread: a GPU channel's value that submissions already promised is
    reached by that channel's jobs queued ahead of the present (a promise and its job are queued in one hold of
@@ -420,9 +397,9 @@ void syncpt_free(u32 id) {
    as a stream can (gpu_park) */
 static int fence_on_gpu_thread(u32 id, u32 val) {
     if (id == ~0u) return 0;
-    pm_lock(&nv.sync_lk);
-    int gpu = id < SYNCPT_N && nv.syncpt_gpu[id] && (i32)(val - nv.syncpt_max[id]) <= 0;
-    pm_unlock(&nv.sync_lk);
+    pm_lock(&g_hle.nvdrv.sync_lk);
+    int gpu = id < SYNCPT_N && g_hle.nvdrv.syncpt_gpu[id] && (i32)(val - g_hle.nvdrv.syncpt_max[id]) <= 0;
+    pm_unlock(&g_hle.nvdrv.sync_lk);
     if (gpu) return 1;
     if (!syncpt_wait(id, val, 1000000000))
         WARN_LIMIT(
@@ -439,25 +416,25 @@ void nv_gpu_call_after(u32 n, u32* id, const u32* val, void (*fn)(void*), void* 
             chans[nchans++] = id[i]; /* a GPU channel's syncpoint id is the channel */
         else
             id[i] = ~0u;    /* done with here */
-    pm_lock(&nv.submit_lk); /* after the submissions promising the fences left to the GPU thread */
+    pm_lock(&g_hle.nvdrv.submit_lk); /* after the submissions promising the fences left to the GPU thread */
     gpu_call(fn, arg, chans, nchans);
-    pm_unlock(&nv.submit_lk);
+    pm_unlock(&g_hle.nvdrv.submit_lk);
 }
 /* a GPU channel's syncpoint, allocated on first use. Two ioctls on the fd at once may both allocate: the one that
    stores it first under nv.lock wins, the other gives its id back (there are 108 to hand out) */
 static u32 gpu_channel_syncpt(NvFile* f) {
-    pm_lock(&nv.lock);
+    pm_lock(&g_hle.nvdrv.lock);
     u32 sp = f->syncpt;
-    pm_unlock(&nv.lock);
+    pm_unlock(&g_hle.nvdrv.lock);
     if (sp) return sp;
     u32 mine = syncpt_alloc();
-    pm_lock(&nv.sync_lk); /* a GPU channel's before any ioctl can submit on it */
-    nv.syncpt_gpu[mine] = 1;
-    pm_unlock(&nv.sync_lk);
-    pm_lock(&nv.lock);
+    pm_lock(&g_hle.nvdrv.sync_lk); /* a GPU channel's before any ioctl can submit on it */
+    g_hle.nvdrv.syncpt_gpu[mine] = 1;
+    pm_unlock(&g_hle.nvdrv.sync_lk);
+    pm_lock(&g_hle.nvdrv.lock);
     if (!f->syncpt) f->syncpt = mine;
     sp = f->syncpt;
-    pm_unlock(&nv.lock);
+    pm_unlock(&g_hle.nvdrv.lock);
     if (sp != mine) syncpt_free(mine); /* clears its syncpt_gpu too */
     return sp;
 }
@@ -469,13 +446,17 @@ static void gpu_channel_retire(void* p) {
     syncpt_free(id);
 }
 
-static void nvev_lock(void) { pm_lock(&nv.nvev_lk); }
-static void nvev_unlock(void) { pm_unlock(&nv.nvev_lk); }
+static void nvev_lock(void) { pm_lock(&g_hle.nvdrv.nvev_lk); }
+static void nvev_unlock(void) { pm_unlock(&g_hle.nvdrv.nvev_lk); }
 /* ctrl fd fd's event slot, its table made if make is set (NULL without memory, or when it isn't made). Called with the
    lock held, for an fd that stays open meanwhile */
 static NvEvent* nvev_slot(u32 fd, u32 slot, int make) {
-    if (!nv.ctrl_ev[fd] && make) nv.ctrl_ev[fd] = calloc(64, sizeof(NvEvent));
-    return nv.ctrl_ev[fd] ? &nv.ctrl_ev[fd][slot & 63] : NULL;
+    if (!g_hle.nvdrv.ctrl_ev[fd] && make) {
+        NvEventTable* t = POOL_TAKE(g_hle.nvdrv.ctrl_evt, g_hle.nvdrv.ctrl_evt_next, "nvhost-ctrl fds with events");
+        t->fd = fd + 1;
+        g_hle.nvdrv.ctrl_ev[fd] = POOL_INDEX(g_hle.nvdrv.ctrl_evt, t) + 1;
+    }
+    return g_hle.nvdrv.ctrl_ev[fd] ? &g_hle.nvdrv.ctrl_evt[g_hle.nvdrv.ctrl_ev[fd] - 1].slot[slot & 63] : NULL;
 }
 /* the KEvent of an event slot, made on first use (NULL without memory). nvdrv keeps a reference of its own, so the
    game closing its handle doesn't free an event a later syncpoint increment signals. Called with the lock held */
@@ -488,23 +469,27 @@ static KEvent* nvev_get(u32 fd, u32 slot) {
     }
     return e->ev;
 }
-/* the fd's slots, taken from the table when its entry is cleared (with nv.lock held, so a new fd with the number
-   doesn't meet them); nv_release drops them */
-static NvEvent* nvev_detach(u32 fd) {
-    NvEvent* t;
+/* the fd's slots, copied into out[64] and their table given back when its entry is cleared (with nv.lock held, so a
+   new fd with the number doesn't meet them): out, or NULL when the fd had none. nv_release drops them */
+static NvEvent* nvev_detach(u32 fd, NvEvent* out) {
+    NvEventTable* t;
     nvev_lock();
-    t = nv.ctrl_ev[fd];
-    nv.ctrl_ev[fd] = NULL;
+    t = g_hle.nvdrv.ctrl_ev[fd] ? &g_hle.nvdrv.ctrl_evt[g_hle.nvdrv.ctrl_ev[fd] - 1] : NULL;
+    if (t) {
+        memcpy(out, t->slot, sizeof t->slot);
+        POOL_PUT(t);
+    }
+    g_hle.nvdrv.ctrl_ev[fd] = 0;
     nvev_unlock();
-    return t;
+    return t ? out : NULL;
 }
 /* signals the armed event slots whose syncpoint got where they wait for, and disarms them */
 static void nv_events_check(void) {
-    u32 fd, i;
+    u32 t, i;
     nvev_lock();
-    for (fd = 0; fd < 256; fd++)
-        for (i = 0; nv.ctrl_ev[fd] && i < 64; i++) {
-            NvEvent* e = &nv.ctrl_ev[fd][i];
+    for (t = 0; t < NV_CTRL_TABLES; t++)
+        for (i = 0; g_hle.nvdrv.ctrl_evt[t].fd && i < 64; i++) {
+            NvEvent* e = &g_hle.nvdrv.ctrl_evt[t].slot[i];
             if (!e->armed || !syncpt_reached(e->id, e->thresh)) continue;
             e->armed = 0;
             if (e->ev) kevent_signal(e->ev);
@@ -535,25 +520,28 @@ static void copy_extra(u8* extra, u32 nextra, const void* src, u32 size) {
 
 /* /dev/nvmap: handles to guest memory, numbered 1..8191. Every access to a handle is under nv.lock: host1x and vi
    read them on other threads */
-#define NVMAP_HANDLES 8192
-static NvMapH* nvmap_live(u32 h) { return h && h < NVMAP_HANDLES && nv.nvh[h].alive ? &nv.nvh[h] : NULL; }
+static NvMapH* nvmap_live(u32 h) {
+    return h && h < NVMAP_HANDLES && g_hle.nvdrv.nvh[h].alive ? &g_hle.nvdrv.nvh[h] : NULL;
+}
 static u32 ioctl_nvmap(u32 cmd, u8* d, u32 n) {
     u32 h, r = 0;
     NvMapH* m;
     (void)n;
     switch (cmd & 0xFF) {
         case 0x01: /* CREATE {u32 size; out u32 handle} */
-            pm_lock(&nv.lock);
-            h = nv.nvh_nfree ? nv.nvh_free[--nv.nvh_nfree] : nv.nvh_next < NVMAP_HANDLES ? nv.nvh_next++ : 0;
+            pm_lock(&g_hle.nvdrv.lock);
+            h = g_hle.nvdrv.nvh_nfree                    ? g_hle.nvdrv.nvh_free[--g_hle.nvdrv.nvh_nfree]
+                : g_hle.nvdrv.nvh_next < NVMAP_HANDLES ? g_hle.nvdrv.nvh_next++
+                                                       : 0;
             if (h) {
-                m = &nv.nvh[h];
+                m = &g_hle.nvdrv.nvh[h];
                 memset(m, 0, sizeof *m);
                 m->size = rd32(d, 0);
                 m->id = h;
                 m->refs = 1;
                 m->alive = 1;
             }
-            pm_unlock(&nv.lock);
+            pm_unlock(&g_hle.nvdrv.lock);
             wr32(d, 4, h);
             if (!h) {
                 WARN_LIMIT(4, "nvdrv: nvmap has no handle left for %#x bytes\n", rd32(d, 0));
@@ -562,10 +550,10 @@ static u32 ioctl_nvmap(u32 cmd, u8* d, u32 n) {
             LOGV("nvdrv: nvmap create %#x bytes -> %u\n", rd32(d, 0), h);
             return 0;
         case 0x03: /* FROM_ID {u32 id; out u32 handle} */
-            pm_lock(&nv.lock);
+            pm_lock(&g_hle.nvdrv.lock);
             h = nvmap_from_id(rd32(d, 0));
-            if (h) nv.nvh[h].refs++;
-            pm_unlock(&nv.lock);
+            if (h) g_hle.nvdrv.nvh[h].refs++;
+            pm_unlock(&g_hle.nvdrv.lock);
             if (!h) return 1;
             wr32(d, 4, h);
             return 0;
@@ -573,7 +561,7 @@ static u32 ioctl_nvmap(u32 cmd, u8* d, u32 n) {
             u64 addr = rd64(d, 24);
             h = rd32(d, 0);
             if (!h || h >= NVMAP_HANDLES) return 1;
-            pm_lock(&nv.lock);
+            pm_lock(&g_hle.nvdrv.lock);
             m = nvmap_live(h);
             if (!m)
                 r = 1;
@@ -587,7 +575,7 @@ static u32 ioctl_nvmap(u32 cmd, u8* d, u32 n) {
                 m->addr = addr;
                 m->allocated = 1;
             }
-            pm_unlock(&nv.lock);
+            pm_unlock(&g_hle.nvdrv.lock);
             if (!r) LOGV("nvdrv: nvmap alloc %u at %llx\n", h, (unsigned long long)addr);
             return r;
         }
@@ -595,7 +583,7 @@ static u32 ioctl_nvmap(u32 cmd, u8* d, u32 n) {
             int last = 0;
             h = rd32(d, 0);
             if (!h || h >= NVMAP_HANDLES) return 1;
-            pm_lock(&nv.lock);
+            pm_lock(&g_hle.nvdrv.lock);
             m = nvmap_live(h);
             if (m) {
                 wr64(d, 8, m->addr);
@@ -604,20 +592,20 @@ static u32 ioctl_nvmap(u32 cmd, u8* d, u32 n) {
                 last = !--m->refs;
                 if (last) m->alive = m->allocated = 0;
             }
-            pm_unlock(&nv.lock);
+            pm_unlock(&g_hle.nvdrv.lock);
             if (!m) return 1;
             if (last) {
                 /* NVDEC and VIC drop what they mapped of it before the number can name another buffer */
                 host1x_forget_handle(h);
-                pm_lock(&nv.lock);
-                nv.nvh_free[nv.nvh_nfree++] = h;
-                pm_unlock(&nv.lock);
+                pm_lock(&g_hle.nvdrv.lock);
+                g_hle.nvdrv.nvh_free[g_hle.nvdrv.nvh_nfree++] = h;
+                pm_unlock(&g_hle.nvdrv.lock);
             }
             return 0;
         }
         case 0x09: { /* PARAM {u32 handle, u32 param; out u32 value} */
             u32 v = 0;
-            pm_lock(&nv.lock);
+            pm_lock(&g_hle.nvdrv.lock);
             m = nvmap_live(rd32(d, 0));
             if (!m)
                 r = 1;
@@ -631,15 +619,15 @@ static u32 ioctl_nvmap(u32 cmd, u8* d, u32 n) {
                     case 6: v = 0; break; /* not compressed */
                     default: r = 1; break;
                 }
-            pm_unlock(&nv.lock);
+            pm_unlock(&g_hle.nvdrv.lock);
             if (!r) wr32(d, 8, v);
             return r;
         }
         case 0x0E: /* GET_ID {out u32 id; u32 handle at 4} */
-            pm_lock(&nv.lock);
+            pm_lock(&g_hle.nvdrv.lock);
             m = nvmap_live(rd32(d, 4));
             if (m) wr32(d, 0, m->id);
-            pm_unlock(&nv.lock);
+            pm_unlock(&g_hle.nvdrv.lock);
             return m ? 0 : 1;
         default: WARN_LIMIT(16, "nvdrv: nvmap ioctl %08x not implemented\n", cmd); return 0;
     }
@@ -673,15 +661,15 @@ static u32 as_alloc_space(u8* d) { /* {u32 pages, u32 page_size, u32 flags; u64 
 static u32 as_unmap_buffer(u64 base) {
     u64 va = 0;
     u32 k = 0;
-    while (k < nv.ngmaps) {
-        GMap g = nv.gmaps[k];
+    while (k < g_hle.nvdrv.ngmaps) {
+        GMap g = g_hle.nvdrv.gmaps[k];
         if (g.base != base) {
             k++;
             continue;
         }
         gmmu_unmap(g.gva, g.size, 1, g.cpu);
         if (g.va) va = g.va;
-        nv.gmaps[k] = nv.gmaps[--nv.ngmaps];
+        g_hle.nvdrv.gmaps[k] = g_hle.nvdrv.gmaps[--g_hle.nvdrv.ngmaps];
     }
     if (va) va_free(base, va);
     return 0;
@@ -709,10 +697,10 @@ static u32 as_map_buffer(u8* d) {
     if (flags & 0x100) { /* the pieces it replaces keep naming the mapping UNMAP_BUFFER will end */
         u32 k;
         base = gva;
-        for (k = 0; k < nv.ngmaps; k++)
-            if (gva >= nv.gmaps[k].gva && gva - nv.gmaps[k].gva < nv.gmaps[k].size) {
-                base = nv.gmaps[k].base;
-                va = nv.gmaps[k].va;
+        for (k = 0; k < g_hle.nvdrv.ngmaps; k++)
+            if (gva >= g_hle.nvdrv.gmaps[k].gva && gva - g_hle.nvdrv.gmaps[k].gva < g_hle.nvdrv.gmaps[k].size) {
+                base = g_hle.nvdrv.gmaps[k].base;
+                va = g_hle.nvdrv.gmaps[k].va;
                 break;
             }
         gmap_cut(gva, span);
@@ -739,7 +727,7 @@ static u32 as_map_buffer(u8* d) {
 /* GET_VA_REGIONS: the small-page region below the big-page one, which starts where the allocator does. The sizes are
    Eden's defaults (a 2^37 byte space, small pages from big page size << 10) */
 static void as_va_regions(u8* d, u8* extra, u32 nextra) {
-    u32 bits = nv.big_page_bits;
+    u32 bits = g_hle.nvdrv.big_page_bits;
     u64 big = (u64)1 << bits, start = big << 10, end = (u64)1 << 37;
     u8 r[48];
     memset(r, 0, sizeof r);
@@ -756,7 +744,7 @@ static void as_va_regions(u8* d, u8* extra, u32 nextra) {
 /* REMAP: entries of {u16 flags, u16 kind, u32 handle, u32 mem_offset, u32 gpu_offset, u32 pages}, in big pages. A
    bad entry is skipped and the rest go on: what the SDK makes of an error here is unknown */
 static u32 as_remap(const u8* d, u32 n) {
-    u32 bits = nv.big_page_bits, i;
+    u32 bits = g_hle.nvdrv.big_page_bits, i;
     for (i = 0; i < n / 20; i++) {
         const u8* e = d + i * 20;
         u32 h = rd32(e, 4), hsize;
@@ -805,9 +793,9 @@ static u32 ioctl_as(u32 cmd, u8* d, u32 n, u8* extra, u32 nextra) {
         case 0x08: as_va_regions(d, extra, nextra); return 0;
         case 0x09: { /* ALLOC_AS_EX {u32 flags, i32 as_fd, u32 big_page_size, ...} */
             u32 big = rd32(d, 8) ? rd32(d, 8) : 0x20000;
-            if (big == 0x10000) nv.big_page_bits = 16;
-            if (big == 0x20000) nv.big_page_bits = 17;
-            LOG("nvdrv: GPU address space with %u KB big pages\n", (1u << nv.big_page_bits) >> 10);
+            if (big == 0x10000) g_hle.nvdrv.big_page_bits = 16;
+            if (big == 0x20000) g_hle.nvdrv.big_page_bits = 17;
+            LOG("nvdrv: GPU address space with %u KB big pages\n", (1u << g_hle.nvdrv.big_page_bits) >> 10);
             return 0;
         }
         case 0x14: return as_remap(d, n);
@@ -874,9 +862,9 @@ static u32 ioctl_ctrl(u32 fd, u32 cmd, u8* d, u32 n) {
             return ok ? 0 : 5;
         }
         case 0x1A: /* SYNCPT_READ_MAX {u32 id; out u32 max}: submissions raise it under sync_lk */
-            pm_lock(&nv.sync_lk);
-            wr32(d, 4, nv.syncpt_max[id]);
-            pm_unlock(&nv.sync_lk);
+            pm_lock(&g_hle.nvdrv.sync_lk);
+            wr32(d, 4, g_hle.nvdrv.syncpt_max[id]);
+            pm_unlock(&g_hle.nvdrv.sync_lk);
             return 0;
         case 0x1B: /* GET_CONFIG {char domain[0x41], param[0x41], value[0x101]}: no setting has a value */
             memset(d + 0x82, 0, 0x101);
@@ -997,10 +985,10 @@ static u32 gpu_submit_gpfifo(NvFile* f, u32 cmd, u8* d, u32 n, const u8* extra, 
     incs = host + ((flags & 0x100) ? fval : 0);
     sp = gpu_channel_syncpt(f);
     /* the promise and the queueing in one hold, so promises reach the GPU thread in order */
-    pm_lock(&nv.submit_lk);
+    pm_lock(&g_hle.nvdrv.submit_lk);
     promised = syncpt_promise(sp, incs);
     gpu_submit(entries, num, sp, host, wait_id, fval, promised);
-    pm_unlock(&nv.submit_lk);
+    pm_unlock(&g_hle.nvdrv.submit_lk);
     wr32(d, 16, sp);
     wr32(d, 20, promised);
     return 0;
@@ -1021,14 +1009,14 @@ static u32 ioctl_gpu(NvFile* f, u32 cmd, u8* d, u32 n, u8* extra, u32 nextra) {
             wr64(d, 8, rd32(d, 0));
             return 0;
         case 0x14: /* SET_USER_DATA {u64} */
-            pm_lock(&nv.lock);
+            pm_lock(&g_hle.nvdrv.lock);
             f->user_data = rd64(d, 0);
-            pm_unlock(&nv.lock);
+            pm_unlock(&g_hle.nvdrv.lock);
             return 0;
         case 0x15: /* GET_USER_DATA {out u64} */
-            pm_lock(&nv.lock);
+            pm_lock(&g_hle.nvdrv.lock);
             wr64(d, 0, f->user_data);
-            pm_unlock(&nv.lock);
+            pm_unlock(&g_hle.nvdrv.lock);
             return 0;
         case 0x16: memset(d, 0, n); return 0; /* GET_ERROR_NOTIFICATION: none */
         case 0x1A: { /* ALLOC_GPFIFO_EX2 {u32 num_entries, num_jobs, flags; NvFence fence at 12; u32 reserved[3]} */
@@ -1060,16 +1048,16 @@ static int nns_nvdrv_INvDrvServices_Open(SvcObj* self, IpcBuf path, u32* fd, u32
     int h1x_dev = dev == DEV_NVDEC || dev == DEV_VIC;
     H1Ch* h1x = h1x_dev ? host1x_open(dev == DEV_VIC) : NULL;
     int slot = -1;
-    pm_lock(&nv.lock);
+    pm_lock(&g_hle.nvdrv.lock);
     for (int i = 1; i < 256 && (h1x || !h1x_dev); i++)
-        if (!nv.nvf[i].dev) {
+        if (!g_hle.nvdrv.nvf[i].dev) {
             slot = i;
-            memset(&nv.nvf[i], 0, sizeof nv.nvf[i]);
-            nv.nvf[i].dev = dev;
-            nv.nvf[i].h1x = h1x;
+            memset(&g_hle.nvdrv.nvf[i], 0, sizeof g_hle.nvdrv.nvf[i]);
+            g_hle.nvdrv.nvf[i].dev = dev;
+            g_hle.nvdrv.nvf[i].h1x = h1x;
             break;
         }
-    pm_unlock(&nv.lock);
+    pm_unlock(&g_hle.nvdrv.lock);
     if (slot < 0) host1x_close(h1x);
     LOG("nvdrv: open %s -> %d\n", name, slot);
     *fd = (u32)slot;
@@ -1087,31 +1075,32 @@ static void nv_release(NvFile* old, NvEvent* slots) {
         if (old->ev[k]) kobj_unref(&old->ev[k]->o);
     for (int k = 0; slots && k < 64; k++) /* a ctrl fd's events: the game's handles keep them as long as they need */
         if (slots[k].ev) kobj_unref(&slots[k].ev->o);
-    free(slots);
 }
 /* Ioctl, Ioctl2 (extra is a second input) and Ioctl3 (extra is a second output): the ioctl's in and out buffers go
    through tmp, the extra one straight to the device. A GPU channel takes Ioctl2's and Ioctl3's, as-gpu and ctrl-gpu
    only Ioctl3's. ipc is the command, for the log */
 #define NV_SCRATCH 0x4000
-/* the (device, ioctl) pairs logged already: each is logged on its first use */
+/* the (device, ioctl) pairs logged already: each is logged on its first use. The size field (bits 16-29) is left out
+   of the pair: a channel's submit carries its entry count there, and every count was logged as a new ioctl. With the
+   table full, nothing new is logged: it said "first use" for every pair it couldn't hold, which logged nearly every
+   submit (a lock and a log write a frame in Super Mario Odyssey) */
 static int nv_first_use(int dev, u32 cmd) {
-    static PMutex lock = PMUTEX_INIT;
-    static struct {
-        int dev;
-        u32 cmd;
-    } seen[256];
-    static u32 nseen;
+    HleNvdrv* nv = &g_hle.nvdrv;
     u32 i;
     int first = 1;
-    pm_lock(&lock);
-    for (i = 0; i < nseen && first; i++)
-        if (seen[i].dev == dev && seen[i].cmd == cmd) first = 0;
-    if (first && nseen < sizeof seen / sizeof seen[0]) {
-        seen[nseen].dev = dev;
-        seen[nseen].cmd = cmd;
-        nseen++;
+    cmd &= ~(0x3FFFu << 16);
+    pm_lock(&nv->seen_lock);
+    for (i = 0; i < nv->nseen && first; i++)
+        if (nv->seen[i].dev == dev && nv->seen[i].cmd == cmd) first = 0;
+    if (first) {
+        if (nv->nseen < sizeof nv->seen / sizeof nv->seen[0]) {
+            nv->seen[nv->nseen].dev = dev;
+            nv->seen[nv->nseen].cmd = cmd;
+            nv->nseen++;
+        } else
+            first = 0;
     }
-    pm_unlock(&lock);
+    pm_unlock(&nv->seen_lock);
     return first;
 }
 /* a guest buffer, or none when it lies outside guest memory */
@@ -1123,17 +1112,17 @@ static u32 nv_ioctl(u32 fd, u32 cmd, IpcBuf in, IpcBuf out, IpcBuf extra, int ex
     u32 nx = 0, r;
     NvFile* f;
     NvFile old;
-    NvEvent* slots = NULL;
+    NvEvent slot_copy[64], *slots = NULL;
     int dev, release = 0;
-    pm_lock(&nv.lock);
-    if (fd >= 256 || !nv.nvf[fd].dev || nv.nvf[fd].closed) {
-        pm_unlock(&nv.lock);
+    pm_lock(&g_hle.nvdrv.lock);
+    if (fd >= 256 || !g_hle.nvdrv.nvf[fd].dev || g_hle.nvdrv.nvf[fd].closed) {
+        pm_unlock(&g_hle.nvdrv.lock);
         return 8;
     }
-    f = &nv.nvf[fd];
+    f = &g_hle.nvdrv.nvf[fd];
     f->users++; /* the entry and its channel stay until this ioctl leaves (Close) */
     dev = f->dev;
-    pm_unlock(&nv.lock);
+    pm_unlock(&g_hle.nvdrv.lock);
     if (nv_first_use(dev, cmd))
         LOG("nvdrv: ioctl %08x on device %d (command %u), buffers %llx/%llx/%llx\n", cmd, dev, ipc,
             (unsigned long long)in.size, (unsigned long long)out.size, (unsigned long long)extra.size);
@@ -1155,9 +1144,9 @@ static u32 nv_ioctl(u32 fd, u32 cmd, IpcBuf in, IpcBuf out, IpcBuf extra, int ex
     switch (dev) {
         case DEV_NVMAP: r = ioctl_nvmap(cmd, d, (u32)n); break;
         case DEV_AS:
-            pm_lock(&nv.aslock);
+            pm_lock(&g_hle.nvdrv.aslock);
             r = ioctl_as(cmd, d, (u32)n, x, nx);
-            pm_unlock(&nv.aslock);
+            pm_unlock(&g_hle.nvdrv.aslock);
             break;
         case DEV_CTRL: r = ioctl_ctrl(fd, cmd, d, (u32)n); break;
         case DEV_CTRLGPU: r = ioctl_ctrlgpu(cmd, d, (u32)n, x, nx); break;
@@ -1170,14 +1159,14 @@ static u32 nv_ioctl(u32 fd, u32 cmd, IpcBuf in, IpcBuf out, IpcBuf extra, int ex
             break;
     }
     if (nout) memcpy(dst, d, (size_t)nout);
-    pm_lock(&nv.lock);
+    pm_lock(&g_hle.nvdrv.lock);
     if (!--f->users && f->closed) { /* closed meanwhile: this was the last one using it */
         old = *f;
         memset(f, 0, sizeof *f);
-        slots = nvev_detach(fd);
+        slots = nvev_detach(fd, slot_copy);
         release = 1;
     }
-    pm_unlock(&nv.lock);
+    pm_unlock(&g_hle.nvdrv.lock);
     if (release) nv_release(&old, slots);
     return r;
 }
@@ -1198,21 +1187,21 @@ static int nns_nvdrv_INvDrvServices_Ioctl3(SvcObj* self, u32 fd, u32 request, Ip
 }
 static int nns_nvdrv_INvDrvServices_Close(SvcObj* self, u32 fd, u32* error) {
     NvFile old;
-    NvEvent* slots = NULL;
+    NvEvent slot_copy[64], *slots = NULL;
     int release = 0, open = 0;
-    pm_lock(&nv.lock);
-    if (fd < 256 && nv.nvf[fd].dev && !nv.nvf[fd].closed) {
+    pm_lock(&g_hle.nvdrv.lock);
+    if (fd < 256 && g_hle.nvdrv.nvf[fd].dev && !g_hle.nvdrv.nvf[fd].closed) {
         open = 1;
-        if (nv.nvf[fd].users) { /* the last ioctl releases it */
-            nv.nvf[fd].closed = 1;
+        if (g_hle.nvdrv.nvf[fd].users) { /* the last ioctl releases it */
+            g_hle.nvdrv.nvf[fd].closed = 1;
         } else {
-            old = nv.nvf[fd];
-            memset(&nv.nvf[fd], 0, sizeof nv.nvf[fd]);
-            slots = nvev_detach(fd);
+            old = g_hle.nvdrv.nvf[fd];
+            memset(&g_hle.nvdrv.nvf[fd], 0, sizeof g_hle.nvdrv.nvf[fd]);
+            slots = nvev_detach(fd, slot_copy);
             release = 1;
         }
     }
-    pm_unlock(&nv.lock);
+    pm_unlock(&g_hle.nvdrv.lock);
     if (release) nv_release(&old, slots);
     *error = open ? 0 : 8; /* an fd that isn't open, or closed already: the NvError the ioctls answer for it */
     R_SUCCEED();
@@ -1221,14 +1210,14 @@ static int nns_nvdrv_INvDrvServices_Close(SvcObj* self, u32 fd, u32* error) {
 static int nns_nvdrv_INvDrvServices_QueryEvent(SvcObj* self, u32 fd, u32 event_id, u32* error, u32* event) {
     KEvent* e = NULL;
     int held = 0;
-    pm_lock(&nv.lock);
-    int dev = fd < 256 && !nv.nvf[fd].closed ? nv.nvf[fd].dev : DEV_NONE;
+    pm_lock(&g_hle.nvdrv.lock);
+    int dev = fd < 256 && !g_hle.nvdrv.nvf[fd].closed ? g_hle.nvdrv.nvf[fd].dev : DEV_NONE;
     if (dev != DEV_NONE && dev != DEV_CTRL && event_id >= 1 && event_id <= 3) {
-        if (!nv.nvf[fd].ev[event_id]) {
-            nv.nvf[fd].ev[event_id] = kevent_new("nv channel event");
-            kobj_ref(&nv.nvf[fd].ev[event_id]->o); /* the fd's reference, dropped on close */
+        if (!g_hle.nvdrv.nvf[fd].ev[event_id]) {
+            g_hle.nvdrv.nvf[fd].ev[event_id] = kevent_new("nv channel event");
+            kobj_ref(&g_hle.nvdrv.nvf[fd].ev[event_id]->o); /* the fd's reference, dropped on close */
         }
-        e = nv.nvf[fd].ev[event_id];
+        e = g_hle.nvdrv.nvf[fd].ev[event_id];
         kobj_ref(&e->o); /* a Close before h_new would drop the last reference */
         held = 1;
     }
@@ -1241,7 +1230,7 @@ static int nns_nvdrv_INvDrvServices_QueryEvent(SvcObj* self, u32 fd, u32 event_i
         }
         nvev_unlock();
     }
-    pm_unlock(&nv.lock);
+    pm_unlock(&g_hle.nvdrv.lock);
     LOG_LIMIT(8, "nvdrv: QueryEvent fd %u (device %d) id %x\n", fd, dev, event_id);
     if (dev == DEV_NONE) { /* an fd that isn't open: the NvError the ioctls answer for it, and no handle to leak */
         *event = 0;
@@ -1254,17 +1243,16 @@ static int nns_nvdrv_INvDrvServices_QueryEvent(SvcObj* self, u32 fd, u32 event_i
     *error = 0;
     R_SUCCEED();
 }
-static SvcObj* new_nvdrv(void) { return nns_nvdrv_INvDrvServices_new(0); }
+static SvcObj* new_nvdrv(void) { return nns_nvdrv_INvDrvServices_new(); }
 
 void nv_init(void) {
-    nv.nvh_next = 1;
-    nv.big_page_bits = 16;
-    pm_init(&nv.lock);
-    pm_init(&nv.aslock);
-    pm_init(&nv.nvev_lk);
-    pm_init(&nv.sync_lk);
-    pm_init(&nv.submit_lk);
-    pc_init(&nv.sync_cv);
-    nv.gmmu = calloc(GL1, sizeof(u64*));
+    g_hle.nvdrv.nvh_next = 1;
+    g_hle.nvdrv.big_page_bits = 16;
+    pm_init(&g_hle.nvdrv.lock);
+    pm_init(&g_hle.nvdrv.aslock);
+    pm_init(&g_hle.nvdrv.nvev_lk);
+    pm_init(&g_hle.nvdrv.sync_lk);
+    pm_init(&g_hle.nvdrv.submit_lk);
+    pc_init(&g_hle.nvdrv.sync_cv);
     nns_nvdrv_INvDrvServices_register(new_nvdrv);
 }

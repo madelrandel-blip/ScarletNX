@@ -6,7 +6,7 @@
 #include <stdio.h>
 
 int main(void) {
-    assert(snx_launcher_name("scarletnx") && snx_launcher_name("scarletnx-mariko"));
+    assert(snx_launcher_name("scarletnx") && snx_launcher_name("scarletnx-switch"));
     assert(snx_launcher_name("ScarletNX-x86_64") && snx_launcher_name("SCARLETNX"));
     assert(snx_launcher_name("scarletnx.real"));
     assert(!snx_launcher_name("Catherine") && !snx_launcher_name("scarlet") && !snx_launcher_name(""));

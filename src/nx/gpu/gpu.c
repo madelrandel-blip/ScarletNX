@@ -61,17 +61,39 @@ static int copy_runs(u64 gva, u8* in, const u8* out, u64 size) {
 }
 void gmem_read_raw(u64 gva, void* dst, u64 size) { copy_runs(gva, (u8*)dst, NULL, size); }
 void gmem_write_raw(u64 gva, const void* src, u64 size) { copy_runs(gva, NULL, (const u8*)src, size); }
+/* whether anything the renderer holds may cover [gva, gva + size): one lookup where each hook below makes its own */
+static int mem_pending(u64 gva, u64 size) { return !g_renderer->mem_pending || g_renderer->mem_pending(gva, size); }
 void gmem_need(u64 gva, u64 size) {
+    if ((__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) || g_cs_any || g_gfx_any || g_gfx_img_any) &&
+        !mem_pending(gva, size))
+        return;
     if (!size) return;
     if (g_cs_any && g_renderer->cs_mem_need) g_renderer->cs_mem_need(gva, size);
     if ((g_gfx_any || g_gfx_img_any) && g_renderer->gfx_mem_need) g_renderer->gfx_mem_need(gva, size);
     if (__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) && g_renderer->release_need)
         g_renderer->release_need(gva, size);
 }
+/* the renderer's hook (vkr_before_write) makes a release queued over the bytes happen first, with everything else
+   pending there: dma.c and the inline-to-memory path call it directly */
 void gmem_before_write(u64 gva, u64 size) {
     if (size && g_gpu_before_write) g_gpu_before_write(gva, size);
 }
 int gmem_read(u64 gva, void* dst, u64 size) {
+    if ((__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) || g_cs_any || g_gfx_any || g_gfx_img_any) &&
+        !mem_pending(gva, size))
+        return copy_runs(gva, (u8*)dst, NULL, size) ? 0 : -1;
+    /* a queued release's payload is known: the stream reads it without waiting for the work before it, as the console's
+       GPU, in order, would find it there (TotK's conditional rendering read report pairs this way, waiting for the GPU
+       60 times a second) */
+    if (__atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE) && g_renderer->release_read) {
+        int r = g_renderer->release_read(gva, dst, size);
+        if (r > 0) return 0;
+        if (r < 0) g_renderer->release_need(gva, size);
+        if (g_cs_any) g_renderer->cs_mem_need(gva, size);
+        if (g_gfx_any || g_gfx_img_any) g_renderer->gfx_mem_need(gva, size);
+        gmem_read_raw(gva, dst, size);
+        return 0;
+    }
     gmem_need(gva, size);
     return copy_runs(gva, (u8*)dst, NULL, size) ? 0 : -1;
 }
@@ -602,7 +624,10 @@ static void job_end(const GpuItem* j, GpuChannel* ch) {
     u32 i, v;
     r3d_const_flush(ch);
     r3d_pending_flush();
-    gpu_signal_point();
+    /* without a renderer that queues the increments, the work's results land before the game can see its fence. A
+       renderer's queue lands them itself before each increment (release.c), so landing every pending result here
+       was a full GPU wait at the end of each submission, about 2 ms a frame in TotK */
+    if (!g_renderer->stream_incr) gpu_signal_point();
     dma_snap_finish(j->chan, j->id);
     for (i = 0; i < j->incs; i++) stream_incr(j->chan);
     if (g_renderer->stream_end) g_renderer->stream_end();

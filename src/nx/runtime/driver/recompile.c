@@ -6,7 +6,6 @@
 #include "nx/loader/loader.h"
 #include "nx/loader/module.h"
 #include "nx/loader/module_llvm.h"
-#include "common/cpu/recompiler/backend.h"
 #include "nx/runtime/driver/toolchain.h"
 #include "common/utilities/build_info.h"
 #include <ctype.h>
@@ -15,22 +14,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* -O's level when none is given, which the help names */
+#define SNX_RECOMPILE_OPT "2"
 static void usage(void) {
     puts("Usage: scarletnx -r INPUT [NAME] [OPTIONS]\n"
          "  INPUT                  Game/ExeFS directory or .nro\n"
          "  -o, --name, --out NAME  Output name (default: the title ID, else the NPDM's or input name)\n"
          "  --outdir DIR           Where the game's folder goes (default: games/ in the data folder)\n"
-         "  -O LEVEL               Optimization: 0,1,2,3,s,z (default: 3)\n"
+         "  -O LEVEL               Optimization: 0,1,2,3,s,z (default: " SNX_RECOMPILE_OPT ")\n"
          "  --jobs N               Parallel compiles (default: CPU count)");
-    puts("  --backend NAME         Code generator: llvm (LLVM-C, the default and the recommended one),\n"
-         "                         gcc (libgccjit, optional: for DEC Alpha EV67 hosts; elsewhere use llvm)");
     printf("  --chunk N              Instructions per code unit, whole functions batched (default: %d)\n",
            SNX_CHUNK_INSTRUCTIONS);
     puts("  --target auto|linux|win64  The host only: modules are built for the machine that builds them\n"
-         "  --no-build             Stage data/INI only, generate no code");
-    puts("  --interp-only          Generate fallback interpreter only\n"
+         "  --no-build             Stage data/INI only, generate no code\n"
+         "  --tmpfs                Leave the RomFS in the extraction (in tmpfs), which the game reads it from");
+    puts("  --interp-only          Generate no code: the runtime JIT compiles all of it\n"
          "  --runtime FILE         Deploy this runtime instead of building one\n"
-         "  --keep-ir              Save the generated code (LLVM IR, libgccjit dumps) in <NAME>/<NAME>_build\n"
+         "  --hook-direct-calls    Route calls and branches between functions through dispatch (SNX_NVN_TRACE)\n"
+         "  --keep-ir              Save the generated code (LLVM IR) in <NAME>/<NAME>_build\n"
          "  -q, --quiet            Suppress progress");
     puts("Each game is a folder of <outdir>, <NAME>/: its program <NAME>, <NAME>_code and <NAME>_data/.\n"
          "Hints: <outdir>/<NAME>/<NAME>.hints (hex PCs, one per line).");
@@ -134,7 +135,8 @@ static SnxU64* read_hints(const char* base, int is64, size_t* count) {
     *count = n;
     return hints;
 }
-static int copy_data(const SnxProgram* p, const char* dir, int quiet) {
+/* the game's data folder: its ExeFS (or NRO) and RomFS, the RomFS left where it is with tmpfs */
+static int copy_data(const SnxProgram* p, const char* dir, int quiet, int tmpfs) {
     char *ex = snx_path_join(dir, "exefs"), *dst, *src, **names;
     size_t n, i;
     int rc = 0;
@@ -167,8 +169,8 @@ static int copy_data(const SnxProgram* p, const char* dir, int quiet) {
         free(dst);
         if (!rc) {
             dst = snx_path_join(dir, "romfs.bin");
-            if (p->romfs_data)
-                rc = snx_write_file(dst, p->romfs_data, p->romfs_size);
+            if (p->romfs_size)
+                rc = snx_copy_file_range(p->entry_path, p->romfs_offset, p->romfs_size, dst);
             else if (snx_is_file(dst))
                 /* An updated NRO without embedded RomFS must not inherit the old image's assets. */
                 rc = snx_remove_tree(dst);
@@ -190,7 +192,7 @@ static int copy_data(const SnxProgram* p, const char* dir, int quiet) {
             free(dst);
         }
         snx_free_strings(names, n);
-        if (!rc && p->romfs_path) {
+        if (!rc && p->romfs_path && !tmpfs) {
             dst = snx_path_join(dir, "romfs");
             if (!snx_is_dir(dst)) {
                 /* A stopped copy must not look like a complete cache on the next run. */
@@ -214,7 +216,6 @@ static int copy_data(const SnxProgram* p, const char* dir, int quiet) {
 }
 int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
     const char *input = NULL, *name = NULL, *outdir = NULL, *runtime = NULL, *target = "auto", *arg, *value;
-    SnxBackend backend = SNX_BACKEND_LLVM;
     SnxLlvmBuild llvm;
     SnxCompileOptions compile;
     SnxCodegenOptions gen;
@@ -224,12 +225,12 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
     char error[1024], option[64];
     const char* equal;
     size_t option_size;
-    int i, rc = 1, no_build = 0, keep_c = 0, host_win = 0, positional = 0;
+    int i, rc = 1, no_build = 0, keep_c = 0, host_win = 0, positional = 0, tmpfs = 0;
     memset(&compile, 0, sizeof(compile));
     memset(&gen, 0, sizeof(gen));
     memset(&program, 0, sizeof(program));
     memset(&llvm, 0, sizeof(llvm));
-    compile.opt = "2";
+    compile.opt = SNX_RECOMPILE_OPT;
     compile.jobs = snx_cpu_count();
     gen.chunk_instrs = SNX_CHUNK_INSTRUCTIONS;
 #ifdef _WIN32
@@ -257,8 +258,12 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
         }
         if (!strcmp(arg, "--no-build"))
             no_build = 1;
+        else if (!strcmp(arg, "--tmpfs"))
+            tmpfs = 1;
         else if (!strcmp(arg, "--interp-only"))
             gen.interp_only = 1;
+        else if (!strcmp(arg, "--hook-direct-calls"))
+            gen.hook_direct_calls = 1;
         else if (!strcmp(arg, "--keep-ir") || !strcmp(arg, "--keep-c")) {
             if (!strcmp(arg, "--keep-c"))
                 fprintf(stderr, "scarletnx: --keep-c is deprecated: use --keep-ir (docs/DEPRECATIONS.md)\n");
@@ -280,7 +285,7 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
             }
             if (strcmp(arg, "-o") && strcmp(arg, "--name") && strcmp(arg, "--out") && strcmp(arg, "--outname") &&
                 strcmp(arg, "--outdir") && strcmp(arg, "--runtime") && strcmp(arg, "--target") && strcmp(arg, "-O") &&
-                strcmp(arg, "--jobs") && strcmp(arg, "--chunk") && strcmp(arg, "--backend"))
+                strcmp(arg, "--jobs") && strcmp(arg, "--chunk"))
                 return snx_error("unknown recompiler option: %s", arg);
             if (!value) {
                 if (++i == argc) return snx_error("%s requires a value", arg);
@@ -295,11 +300,7 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
                 runtime = value;
             else if (!strcmp(arg, "--target"))
                 target = value;
-            else if (!strcmp(arg, "--backend")) {
-                if (!strcmp(value, "portable"))
-                    return snx_error("the portable backend was removed: --backend=llvm (the default) or gcc");
-                if (snx_backend_parse(value, &backend)) return snx_error("--backend expects llvm or gcc");
-            } else if (!strcmp(arg, "-O")) {
+            else if (!strcmp(arg, "-O")) {
                 if (strlen(value) != 1 || !strchr("0123sz", value[0])) return snx_error("-O expects 0,1,2,3,s,z");
                 compile.opt = value;
             } else if (!strcmp(arg, "--jobs")) {
@@ -330,10 +331,6 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
     if (compile.target_win != host_win) return snx_error("--target: modules are built for this host only");
     gen.abi = snx_game_abi();
     if (snx_load_program(input, &program, error, sizeof(error))) return snx_error("%s", error);
-    if (!program.npdm.is64 && backend != SNX_BACKEND_LLVM) {
-        snx_error("AArch32 programs are recompiled by the LLVM backend only (--backend=llvm)");
-        goto done;
-    }
     title = snx_game_shown(name, &program);
     game = snx_game_name(name, &program.npdm, program.entry_path);
     out = outdir ? snx_absolute(outdir) : snx_path_join(paths->repo, "games");
@@ -379,7 +376,7 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
     gen.title = title;
     gen.hints = read_hints(base, program.npdm.is64, &gen.hint_count);
     if (!compile.quiet) printf("Recompiling %s (%lu modules)\n", title, (unsigned long)program.module_count);
-    if (copy_data(&program, data, compile.quiet)) {
+    if (copy_data(&program, data, compile.quiet, tmpfs)) {
         snx_error("cannot stage game data in %s", data);
         goto done;
     }
@@ -421,10 +418,8 @@ int snx_recompile(int argc, char** argv, const SnxPaths* paths) {
         if (i) snx_error("cannot save the generated code in %s", kept);
         if (!i && !program.npdm.is64)
             i = snx_build_module_arm(&program, &gen, &llvm);
-        else if (!i && backend == SNX_BACKEND_LLVM)
+        else if (!i)
             i = snx_build_module_llvm(&program, &gen, &llvm);
-        else if (!i && backend == SNX_BACKEND_GCC)
-            i = snx_build_module_gccjit(&program, &gen, &llvm);
         free(kept);
         if (i) goto done;
     }

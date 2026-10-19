@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* Switch container extraction through hactool. Keys stay in a private temporary HOME. */
+/* Switch container extraction with hactool in this process (hactool/snx_hac.h): each NCA read where it lies in the
+   XCI or NSP, the ExeFS and RomFS written straight into the output. Keys go from their files into hactool's keyset in
+   memory, and nothing hactool prints reaches the console but its last error, keys left out */
 #include "nx/runtime/driver/extract.h"
+#include "nx/runtime/driver/hactool/snx_hac.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,11 +14,6 @@ typedef struct {
     const char *base, *update, *name, *out, *keys, *title_keys;
 } ExtractOptions;
 
-typedef struct TitleKey {
-    char *name, *value;
-    struct TitleKey* next;
-} TitleKey;
-
 typedef struct {
     const char *name, *value;
     size_t name_size, value_size;
@@ -23,20 +21,21 @@ typedef struct {
 
 typedef struct {
     char *base, *update, *out, *keys, *title_keys;
-    char *hactool, *temp, *home, *base_dir, *update_dir;
-    char *program, *patch, *exefs, *romfs;
-    char* control; /* the Control NCA the game's name comes from: the update's, else the base's */
+    char *exefs, *romfs;
     int made_out, base_xci, update_xci, has_keys;
-    SnxU64 title_id;
-    TitleKey* titles;
+    SnxHac* hac;
+    /* the progress row: what the extraction will have written, and when it was said last */
+    SnxU64 total, written;
+    double said_at;
+    int said;
 } ExtractState;
 
-typedef struct ProgramNca {
-    char* path;
-    SnxU64 title_id, size;
-    int patch, control; /* control: a Control NCA, not a Program one */
-    struct ProgramNca* next;
-} ProgramNca;
+/* an NCA where it lies: a container's number (snx_hac_open) and its entry, found 0 for none */
+typedef struct {
+    int found, container;
+    size_t entry;
+    SnxU64 size, title_id;
+} NcaRef;
 
 static void extract_help(void) {
     puts("Usage: scarletnx -x BASE.xci|BASE.nsp|BASE.dxci|BASE.dnsp [options]\n"
@@ -62,20 +61,6 @@ static char* text_copy(const char* text, size_t size) {
         copy[size] = 0;
     }
     return copy;
-}
-
-static char* option_arg(const char* option, const char* value) {
-    size_t a, b;
-    char* text;
-    a = strlen(option);
-    b = strlen(value);
-    if (a > (size_t)-1 - b - 1) return NULL;
-    text = (char*)malloc(a + b + 1);
-    if (text) {
-        memcpy(text, option, a);
-        memcpy(text + a, value, b + 1);
-    }
-    return text;
 }
 
 static int option_is(const char* arg, const char* name) {
@@ -177,31 +162,6 @@ static int container_kind(const char* path, int* xci) {
     return snx_error("Unsupported container header. Expected NSP/DNSP (PFS0) or XCI/DXCI (HEAD/DXCI)");
 }
 
-static int nca_needs_keys(const char* path) {
-    unsigned char header[0x204];
-    size_t size;
-    FILE* file;
-    int failed;
-    file = snx_fopen(path, "rb");
-    if (!file) return -1;
-    size = fread(header, 1, sizeof header, file);
-    failed = ferror(file);
-    if (fclose(file)) failed = 1;
-    if (failed) return -1;
-    return size != sizeof header || (memcmp(header + 0x200, "DNCA", 4) && memcmp(header + 0x200, "NCA3", 4) &&
-                                     memcmp(header + 0x200, "NCA2", 4));
-}
-
-static char* path_parent(const char* path) {
-    const char *p, *last;
-    last = NULL;
-    for (p = path; *p; p++)
-        if (*p == '/' || *p == '\\') last = p;
-    if (!last) return text_copy(".", 1);
-    if (last == path || (last == path + 2 && path[1] == ':')) last++;
-    return text_copy(path, (size_t)(last - path));
-}
-
 static char* dump_name(const char* path) {
     const char *p, *base, *dot;
     base = path;
@@ -278,534 +238,14 @@ static void secret_free(void* memory, size_t size) {
     free(memory);
 }
 
-static int clean_prod_keys(const char* source, const char* dest) {
-    unsigned char* data;
-    size_t size, start, end;
-    unsigned long dropped;
-    FILE* file;
-    KeyLine line;
-    int failed;
-    data = snx_read_file(source, &size);
-    if (!data) return snx_error("Cannot read prod.keys");
-    file = snx_fopen(dest, "wb");
-    if (!file) {
-        secret_free(data, size);
-        return snx_error("Cannot write private prod.keys");
-    }
-    start = 0;
-    dropped = 0;
-    failed = 0;
-    while (start < size) {
-        end = start;
-        while (end < size && data[end] != '\n') end++;
-        if (key_line((const char*)data + start, end - start, &line)) {
-            if (line.value_size % 32)
-                dropped++;
-            else if (fwrite(line.name, 1, line.name_size, file) != line.name_size || fputs(" = ", file) == EOF ||
-                     fwrite(line.value, 1, line.value_size, file) != line.value_size || fputc('\n', file) == EOF) {
-                failed = 1;
-                break;
-            }
-        }
-        start = end < size ? end + 1 : end;
-    }
-    if (fclose(file)) failed = 1;
-    secret_free(data, size);
-    if (failed) return snx_error("Cannot write private prod.keys");
-    if (dropped) printf("Left out %lu malformed key lines\n", dropped);
-    return 0;
-}
-
-static int title_add(TitleKey** list, const KeyLine* line) {
-    TitleKey *item, **last;
-    char* name;
-    size_t i;
-    name = text_copy(line->name, line->name_size);
-    if (!name) return snx_error("Out of memory merging title keys");
-    for (i = 0; i < line->name_size; i++) name[i] = ascii_lower(name[i]);
-    last = list;
-    while (*last) {
-        if (!strcmp((*last)->name, name)) {
-            free(name);
-            return 0;
-        }
-        last = &(*last)->next;
-    }
-    item = (TitleKey*)calloc(1, sizeof *item);
-    if (!item) {
-        free(name);
-        return snx_error("Out of memory merging title keys");
-    }
-    item->name = name;
-    item->value = text_copy(line->value, line->value_size);
-    if (!item->value) {
-        free(name);
-        free(item);
-        return snx_error("Out of memory merging title keys");
-    }
-    *last = item;
-    return 0;
-}
-
-static int read_title_keys(const char* source, TitleKey** list) {
-    unsigned char* data;
-    size_t size, start, end;
-    KeyLine line;
-    int failed;
-    if (!snx_is_file(source)) return 0;
-    data = snx_read_file(source, &size);
-    if (!data) return snx_error("Cannot read title.keys");
-    start = 0;
-    failed = 0;
-    while (start < size) {
-        end = start;
-        while (end < size && data[end] != '\n') end++;
-        if (key_line((const char*)data + start, end - start, &line) && title_add(list, &line)) {
-            failed = 1;
-            break;
-        }
-        start = end < size ? end + 1 : end;
-    }
-    secret_free(data, size);
-    return failed;
-}
-
 static SnxU64 le_bytes(const unsigned char* p, unsigned n) {
     SnxU64 value = 0;
     while (n--) value = value << 8 | p[n];
     return value;
 }
-static int ticket_key(const char* path, TitleKey** list) {
-    unsigned char data[1024];
-    char name[33], value[33];
-    static const char digits[] = "0123456789abcdef";
-    SnxU32 signature;
-    size_t size, offset, i;
-    FILE* file;
-    KeyLine line;
-    int failed;
-    file = snx_fopen(path, "rb");
-    if (!file) return snx_error("Cannot read an extracted ticket");
-    size = fread(data, 1, sizeof data, file);
-    failed = ferror(file);
-    if (fclose(file)) failed = 1;
-    if (failed) return snx_error("Cannot read an extracted ticket");
-    if (size < 4) return 0;
-    signature = (SnxU32)le_bytes(data, 4);
-    switch (signature) {
-        case 0x10000UL:
-        case 0x10003UL: offset = 4 + 0x200 + 0x3c; break;
-        case 0x10001UL:
-        case 0x10004UL: offset = 4 + 0x100 + 0x3c; break;
-        case 0x10002UL:
-        case 0x10005UL: offset = 4 + 0x3c + 0x40; break;
-        case 0x10006UL: offset = 4 + 0x14 + 0x28; break;
-        default: return 0;
-    }
-    if (size < offset + 0x170 || data[offset + 0x141]) return 0;
-    for (i = 0; i < 16; i++) {
-        name[i * 2] = digits[data[offset + 0x160 + i] >> 4];
-        name[i * 2 + 1] = digits[data[offset + 0x160 + i] & 15];
-        value[i * 2] = digits[data[offset + 0x40 + i] >> 4];
-        value[i * 2 + 1] = digits[data[offset + 0x40 + i] & 15];
-    }
-    name[32] = value[32] = 0;
-    line.name = name;
-    line.name_size = 32;
-    line.value = value;
-    line.value_size = 32;
-    return title_add(list, &line);
-}
-
-static int read_tickets(const char* folder, TitleKey** list) {
-    char **names, *path;
-    size_t count, i;
-    int failed;
-    names = NULL;
-    count = 0;
-    if (snx_list_dir(folder, &names, &count)) return snx_error("Cannot enumerate extracted tickets");
-    failed = 0;
-    for (i = 0; i < count; i++) {
-        if (!has_suffix(names[i], ".tik")) continue;
-        path = snx_path_join(folder, names[i]);
-        if (!path) {
-            failed = snx_error("Out of memory reading tickets");
-            break;
-        }
-        if (snx_is_file(path)) failed = ticket_key(path, list);
-        free(path);
-        if (failed) break;
-    }
-    snx_free_strings(names, count);
-    return failed;
-}
-
-static int write_title_keys(const char* path, const TitleKey* list) {
-    FILE* file;
-    int failed;
-    file = snx_fopen(path, "wb");
-    if (!file) return snx_error("Cannot write private title.keys");
-    failed = 0;
-    while (list) {
-        if (fprintf(file, "%s = %s\n", list->name, list->value) < 0) {
-            failed = 1;
-            break;
-        }
-        list = list->next;
-    }
-    if (fclose(file)) failed = 1;
-    return failed ? snx_error("Cannot write private title.keys") : 0;
-}
-
-/* what hactool writes in a run of minutes, said once a second on one row: how far it is, never its own output */
-typedef struct {
-    const char* verb;    /* "unpacked", "extracted" */
-    const char* dirs[2]; /* where it writes, NULL for none */
-    SnxU64 total;        /* what it will have written */
-    int said;            /* a row went out, which the last one ends */
-} Progress;
-
-static SnxU64 tree_bytes(const char* path, unsigned depth) {
-    char** names;
-    char* child;
-    size_t count, i;
-    SnxU64 sum;
-    if (!path || depth > 16) return 0;
-    if (!snx_is_dir(path)) return snx_is_file(path) ? snx_file_size(path) : 0;
-    if (snx_list_dir(path, &names, &count)) return 0;
-    sum = 0;
-    for (i = 0; i < count; i++) {
-        child = snx_path_join(path, names[i]);
-        if (child) sum += tree_bytes(child, depth + 1);
-        free(child);
-    }
-    snx_free_strings(names, count);
-    return sum;
-}
-
-/* "  unpacked 1229 of 4096 MB (30%)", ending in a carriage return while hactool runs: a terminal and the launcher's
-   console write the next over it, the last one ends the row */
-static void progress_say(Progress* progress, int last) {
-    SnxU64 done = tree_bytes(progress->dirs[0], 0) + tree_bytes(progress->dirs[1], 0);
-    if (done > progress->total) done = progress->total;
-    printf("  %s %lu of %lu MB (%d%%)%s", progress->verb, (unsigned long)(done >> 20),
-           (unsigned long)(progress->total >> 20), progress->total ? (int)(done * 100 / progress->total) : 100,
-           last ? "\n" : "\r");
-    fflush(stdout);
-    progress->said = 1;
-}
-static void progress_tick(void* progress) { progress_say((Progress*)progress, 0); }
-
-/* what -txci or -tpfs0 writes of a container: an XCI's secure partition, as its root HFS0 (the header at 0x130 says
-   where) lists it, its padding and other partitions left; an NSP whole. The file's size when it cannot be read */
-static SnxU64 container_payload(const char* path, int xci) {
-    unsigned char head[0x140], root[0x10], entries[8 * 0x40];
-    char names[0x200];
-    SnxU64 size = snx_file_size(path), at, found;
-    unsigned files, strings, i, name;
-    FILE* file;
-    if (!xci) return size;
-    file = snx_fopen(path, "rb");
-    if (!file) return size;
-    found = 0;
-    if (fread(head, 1, sizeof head, file) == sizeof head && (at = le_bytes(head + 0x130, 8)) < 0x7fffffffUL &&
-        !fseek(file, (long)at, SEEK_SET) && fread(root, 1, sizeof root, file) == sizeof root &&
-        !memcmp(root, "HFS0", 4)) {
-        files = (unsigned)le_bytes(root + 4, 4);
-        strings = (unsigned)le_bytes(root + 8, 4);
-        if (files && files <= 8 && strings < sizeof names && fread(entries, 0x40, files, file) == files &&
-            fread(names, 1, strings, file) == strings) {
-            names[strings] = 0;
-            for (i = 0; i < files; i++) {
-                name = (unsigned)le_bytes(entries + i * 0x40 + 0x10, 4);
-                if (name < strings && !strcmp(names + name, "secure")) found = le_bytes(entries + i * 0x40 + 8, 8);
-            }
-        }
-    }
-    fclose(file);
-    return found ? found : size;
-}
-
-/* Hactool warnings can print secret values. Never forward its captured output, including on failure. */
-static int run_hactool(const ExtractState* state, const char* const* args, size_t count, char** information,
-                       Progress* progress) {
-    const char* command[12];
-    char* output;
-    size_t i;
-    int result;
-    if (count > 8) return snx_error("Internal hactool argument limit exceeded");
-    command[0] = state->hactool;
-    command[1] = "--disablekeywarns";
-    for (i = 0; i < count; i++) command[i + 2] = args[i];
-    command[count + 2] = NULL;
-    output = NULL;
-    result = progress ? snx_run_ticking(command, NULL, state->home, &output, progress_tick, progress)
-                      : snx_run(command, NULL, state->home, &output);
-    if (progress && progress->said) progress_say(progress, 1);
-    if (result) {
-        if (output) secret_free(output, strlen(output));
-        return snx_error(
-            "hactool failed; diagnostic output withheld because it can contain keys. Check the dump and keys.");
-    }
-    if (information)
-        *information = output;
-    else if (output)
-        secret_free(output, strlen(output));
-    return 0;
-}
-
-static int unpack(const ExtractState* state, const char* container, const char* directory, int xci) {
-    const char* command[3];
-    char* output_option;
-    int result;
-    Progress progress;
-    output_option = option_arg(xci ? "--securedir=" : "--outdir=", directory);
-    if (!output_option) return snx_error("Out of memory unpacking container");
-    command[0] = xci ? "-txci" : "-tpfs0";
-    command[1] = output_option;
-    command[2] = container;
-    printf("Unpacking %s\n", container);
-    fflush(stdout);
-    progress.verb = "unpacked";
-    progress.dirs[0] = directory;
-    progress.dirs[1] = NULL;
-    progress.total = container_payload(container, xci);
-    progress.said = 0;
-    result = run_hactool(state, command, 3, NULL, &progress);
-    free(output_option);
-    if (!result && !snx_is_dir(directory))
-        result = snx_error("hactool did not create the extracted container directory");
-    return result;
-}
-
-/* the NCA hactool -i described holds type, "Program" or "Control" */
-static int content_type(const char* information, const char* type) {
-    const char* p;
-    size_t n = strlen(type);
-    if (!information) return 0;
-    p = strstr(information, "Content Type:");
-    if (!p) return 0;
-    p += strlen("Content Type:");
-    while (*p && isspace((unsigned char)*p)) p++;
-    return !strncmp(p, type, n) && !ascii_name((unsigned char)p[n]);
-}
-
-static int program_title_id(const char* information, SnxU64* title_id) {
-    const char* p;
-    size_t i;
-    unsigned digit;
-    SnxU64 value;
-    p = information ? strstr(information, "Title ID:") : NULL;
-    if (!p) return 0;
-    p += strlen("Title ID:");
-    while (*p && isspace((unsigned char)*p)) p++;
-    value = 0;
-    for (i = 0; i < 16; i++) {
-        if (!ascii_hex((unsigned char)p[i])) return 0;
-        digit = p[i] <= '9' ? (unsigned)(p[i] - '0') : (unsigned)(ascii_lower(p[i]) - 'a' + 10);
-        value = (value << 4) | digit;
-    }
-    if (ascii_hex((unsigned char)p[16])) return 0;
-    *title_id = value;
-    return 1;
-}
-
-/* the Program NCA of folder's NCAs to extract: the base's, or with update the patch of expected_title; the patch an
-   NSP of both has (embedded_patch), its title (selected_title), and the Control NCA of the same title (control) */
-static int program_nca(const ExtractState* state, const char* folder, int update, SnxU64 expected_title,
-                       char** selected, char** embedded_patch, SnxU64* selected_title, char** control) {
-    char **names, *path, *information;
-    const char* args[2];
-    size_t count, i;
-    SnxU64 title_id;
-    ProgramNca *programs, *item, *next, *base, *patch;
-    int failed, needs_keys;
-    names = NULL;
-    count = 0;
-    programs = base = patch = NULL;
-    *selected = NULL;
-    if (embedded_patch) *embedded_patch = NULL;
-    if (control) *control = NULL;
-    if (snx_list_dir(folder, &names, &count)) return snx_error("Cannot enumerate extracted NCAs");
-    failed = 0;
-    for (i = 0; i < count; i++) {
-        if (!has_suffix(names[i], ".nca") || has_suffix(names[i], ".cnmt.nca")) continue;
-        path = snx_path_join(folder, names[i]);
-        if (!path) {
-            failed = snx_error("Out of memory selecting Program NCA");
-            break;
-        }
-        if (!snx_is_file(path)) {
-            free(path);
-            continue;
-        }
-        needs_keys = nca_needs_keys(path);
-        if (needs_keys < 0)
-            failed = snx_error("Cannot read an extracted NCA header");
-        else if (needs_keys && !state->has_keys)
-            failed = snx_error("Encrypted content needs prod.keys. Provide --keys, or put it at %s or in ~/.switch",
-                               state->keys);
-        if (failed) {
-            free(path);
-            break;
-        }
-        args[0] = "-i";
-        args[1] = path;
-        information = NULL;
-        failed = run_hactool(state, args, 2, &information, NULL);
-        if (!failed && content_type(information, "Control") && program_title_id(information, &title_id)) {
-            item = (ProgramNca*)calloc(1, sizeof *item);
-            if (!item)
-                failed = snx_error("Out of memory selecting Program NCA");
-            else {
-                item->path = path;
-                path = NULL;
-                item->title_id = title_id;
-                item->control = 1;
-                item->next = programs;
-                programs = item;
-            }
-        } else if (!failed && content_type(information, "Program")) {
-            if (!program_title_id(information, &title_id))
-                failed = snx_error("hactool did not report a valid Program NCA title ID");
-            else {
-                item = (ProgramNca*)calloc(1, sizeof *item);
-                if (!item)
-                    failed = snx_error("Out of memory selecting Program NCA");
-                else {
-                    item->path = path;
-                    path = NULL;
-                    item->title_id = title_id;
-                    item->size = snx_file_size(item->path);
-                    item->patch = (title_id & 0x800UL) != 0 || strstr(information, "Patch RomFS") != NULL;
-                    item->next = programs;
-                    programs = item;
-                }
-            }
-        }
-        if (information) secret_free(information, strlen(information));
-        free(path);
-        if (failed) break;
-    }
-    snx_free_strings(names, count);
-    if (!failed) {
-        for (item = programs; item; item = item->next) {
-            if (item->control) continue;
-            if (update) {
-                if (item->patch && (item->title_id & ~(SnxU64)0x800UL) == expected_title &&
-                    (!base || item->size > base->size))
-                    base = item;
-            } else if (!item->patch && (!base || item->size > base->size))
-                base = item;
-        }
-        if (!base)
-            failed =
-                snx_error(update ? "Update has no Program NCA matching the selected base game"
-                                 : "Container has no base Program NCA (possibly an update or DLC). Supply a base game");
-        else {
-            if (embedded_patch) {
-                for (item = programs; item; item = item->next)
-                    if (!item->control && item->patch && (item->title_id & ~(SnxU64)0x800UL) == base->title_id &&
-                        (!patch || item->size > patch->size))
-                        patch = item;
-                if (patch) {
-                    *embedded_patch = patch->path;
-                    patch->path = NULL;
-                }
-            }
-            for (item = programs; control && item; item = item->next) /* the same game's, base or update */
-                if (item->control && (item->title_id & ~(SnxU64)0x800UL) == (base->title_id & ~(SnxU64)0x800UL)) {
-                    *control = item->path;
-                    item->path = NULL;
-                    break;
-                }
-            *selected = base->path;
-            base->path = NULL;
-            if (selected_title) *selected_title = base->title_id;
-        }
-    }
-    for (item = programs; item; item = next) {
-        next = item->next;
-        free(item->path);
-        free(item);
-    }
-    return failed;
-}
-
-static char* locate_hactool(const SnxPaths* paths) {
-    const char *tool_name, *command[9];
-    char *path, *parent, *cmake, *output, *extract_build;
-    int result;
-#if defined(_WIN32)
-    tool_name = "hactool.exe";
-#elif defined(__ANDROID__)
-    tool_name = "libhactool.so"; /* the app's libraries folder takes no other name (cmake/hactool.cmake) */
-#else
-    tool_name = "hactool";
-#endif
-    path = snx_path_join(paths->build, tool_name);
-    if (!path || snx_is_file(path)) return path;
-    free(path);
-    parent = path_parent(paths->executable);
-    if (!parent) return NULL;
-    path = snx_path_join(parent, tool_name);
-    free(parent);
-    if (!path || snx_is_file(path)) return path;
-    free(path);
-    if (!paths->source) {
-        snx_error("hactool is missing, and there is no checkout to build it from");
-        return NULL;
-    }
-    extract_build = snx_path_join(paths->source, "build/extract");
-    if (!extract_build) return NULL;
-    path = snx_path_join(extract_build, tool_name);
-    if (!path || snx_is_file(path)) {
-        free(extract_build);
-        return path;
-    }
-    free(path);
-    cmake = snx_find_tool("cmake");
-    if (!cmake) {
-        free(extract_build);
-        snx_error("hactool is missing, and CMake is unavailable to build it");
-        return NULL;
-    }
-    puts("Building hactool");
-    fflush(stdout);
-    command[0] = cmake;
-    command[1] = "--preset";
-    command[2] = "default";
-    command[3] = "-B";
-    command[4] = extract_build;
-    command[5] = "-DSNX_HACTOOL_ONLY=ON";
-    command[6] = NULL;
-    output = NULL;
-    result = snx_run(command, paths->source, NULL, &output);
-    free(output);
-    if (!result) {
-        command[1] = "--build";
-        command[2] = extract_build;
-        command[3] = "--target";
-        command[4] = "hactool";
-        command[5] = NULL;
-        output = NULL;
-        result = snx_run(command, paths->source, NULL, &output);
-        free(output);
-    }
-    free(cmake);
-    path = snx_path_join(extract_build, tool_name);
-    free(extract_build);
-    if (result || !path || !snx_is_file(path)) {
-        free(path);
-        snx_error("CMake could not build hactool");
-        return NULL;
-    }
-    return path;
-}
 
 static int prepare_paths(ExtractState* state, const ExtractOptions* options, const SnxPaths* paths) {
-    char *name, *work, *target, *parent;
-    SnxU64 base_size, update_size, needed, maximum;
+    char *name, *work, *target;
     int made_out;
     state->base = snx_absolute(options->base);
     if (options->update) state->update = snx_absolute(options->update);
@@ -841,185 +281,307 @@ static int prepare_paths(ExtractState* state, const ExtractOptions* options, con
     if (snx_is_file(state->exefs) || snx_is_dir(state->exefs) || snx_is_link(state->exefs))
         return snx_error("Output already contains exefs: %s", state->out);
     if (snx_is_file(state->out)) return snx_error("Extraction output is a file");
-    base_size = update_size = 0;
-    base_size = snx_file_size(state->base);
-    if (state->update) update_size = snx_file_size(state->update);
-    maximum = (SnxU64)-1;
-    needed = base_size > maximum - update_size ? maximum : base_size + update_size;
-    needed = needed > maximum - needed / 2 ? maximum : needed + needed / 2;
     made_out = !snx_is_dir(state->out);
     if (snx_mkdirs(state->out)) return snx_error("Cannot create extraction output");
     state->made_out = made_out;
-    state->temp = snx_temp_dir(NULL);
-    if (state->temp && snx_free_space(state->temp) < needed) {
-        if (snx_remove_tree(state->temp)) return snx_error("Cannot remove the first extraction temp directory");
-        free(state->temp);
-        state->temp = NULL;
-    }
-    if (!state->temp) {
-        parent = path_parent(state->out);
-        if (!parent) return snx_error("Out of memory selecting extraction temp directory");
-        state->temp = snx_temp_dir(parent);
-        free(parent);
-    }
-    if (!state->temp) return snx_error("Cannot create extraction temp directory");
-    state->home = snx_path_join(state->temp, "home");
-    state->base_dir = snx_path_join(state->temp, "base");
-    if (state->update) state->update_dir = snx_path_join(state->temp, "update");
-    if (!state->home || !state->base_dir || (state->update && !state->update_dir))
-        return snx_error("Out of memory preparing extraction temp directory");
     return 0;
 }
 
-/* the game's control.nacp beside exefs/, where the loader reads the game's name from: out of the Control NCA's RomFS.
-   A game without one, or one that cannot be read, keeps the name of its file, a line saying why */
-static void control_nacp(const ExtractState* state) {
-    const char* command[2];
-    char *dir = snx_path_join(state->temp, "control"), *arg = dir ? option_arg("--romfsdir=", dir) : NULL;
-    char *from = dir ? snx_path_join(dir, "control.nacp") : NULL, *to = snx_path_join(state->out, "control.nacp");
-    const char* why = NULL;
-    if (!state->control)
-        why = "it has no Control NCA";
-    else if (!arg || !from || !to)
-        why = "out of memory";
-    else {
-        command[0] = arg;
-        command[1] = state->control;
-        if (run_hactool(state, command, 2, NULL, NULL))
-            why = "hactool could not open its Control NCA";
-        else if (!snx_is_file(from))
-            why = "its Control NCA holds no control.nacp";
-        else if (snx_copy_file(from, to))
-            why = "its control.nacp could not be copied";
+
+/* hactool's last error after what failed, when it said one */
+static int hac_error(const char* what) {
+    const char* said = snx_hac_message();
+    return said[0] ? snx_error("%s (hactool: %s)", what, said) : snx_error("%s", what);
+}
+
+static int hex_bytes(const char* text, size_t size, unsigned char* out) {
+    size_t i;
+    unsigned digit;
+    for (i = 0; i < size; i++) {
+        if (!ascii_hex((unsigned char)text[i])) return -1;
+        digit = text[i] <= '9' ? (unsigned)(text[i] - '0') : (unsigned)(ascii_lower(text[i]) - 'a' + 10);
+        if (i & 1)
+            out[i / 2] = (unsigned char)(out[i / 2] | digit);
+        else
+            out[i / 2] = (unsigned char)(digit << 4);
     }
+    return 0;
+}
+
+/* prod.keys into hactool's keyset. A value of a length no key has is left out, as hactool would stop on it */
+static int load_prod_keys(ExtractState* state) {
+    unsigned char* data;
+    size_t size, start, end;
+    unsigned long dropped;
+    char *name, *value;
+    KeyLine line;
+    int failed;
+    data = snx_read_file(state->keys, &size);
+    if (!data) return snx_error("Cannot read prod.keys");
+    start = 0;
+    dropped = 0;
+    failed = 0;
+    while (start < size && !failed) {
+        end = start;
+        while (end < size && data[end] != '\n') end++;
+        if (key_line((const char*)data + start, end - start, &line)) {
+            if (line.value_size % 32)
+                dropped++;
+            else {
+                name = text_copy(line.name, line.name_size);
+                value = text_copy(line.value, line.value_size);
+                if (!name || !value)
+                    failed = snx_error("Out of memory reading prod.keys");
+                else
+                    snx_hac_set_key(state->hac, name, value);
+                if (name) secret_free(name, line.name_size);
+                if (value) secret_free(value, line.value_size);
+            }
+        }
+        start = end < size ? end + 1 : end;
+    }
+    secret_free(data, size);
+    if (failed) return 1;
+    snx_hac_derive_keys(state->hac);
+    if (dropped) printf("Left out %lu malformed key lines\n", dropped);
+    return 0;
+}
+
+/* title.keys, when there is one: a rights ID and its title key a line */
+static int load_title_keys(ExtractState* state) {
+    unsigned char *data, rights[16], key[16];
+    size_t size, start, end;
+    KeyLine line;
+    if (!snx_is_file(state->title_keys)) return 0;
+    data = snx_read_file(state->title_keys, &size);
+    if (!data) return snx_error("Cannot read title.keys");
+    start = 0;
+    while (start < size) {
+        end = start;
+        while (end < size && data[end] != '\n') end++;
+        if (key_line((const char*)data + start, end - start, &line) && line.name_size == 32 && line.value_size == 32 &&
+            !hex_bytes(line.name, 32, rights) && !hex_bytes(line.value, 32, key))
+            snx_hac_add_title_key(state->hac, rights, key);
+        start = end < size ? end + 1 : end;
+    }
+    memset(key, 0, sizeof key);
+    secret_free(data, size);
+    return 0;
+}
+
+/* the title keys of a container's tickets: common tickets, whose key is stored as is */
+static int read_tickets(ExtractState* state, int container) {
+    unsigned char data[1024];
+    const SnxHacEntry* entries;
+    size_t count, i, size, offset;
+    count = snx_hac_entries(state->hac, container, &entries);
+    for (i = 0; i < count; i++) {
+        if (!has_suffix(entries[i].name, ".tik")) continue;
+        size = entries[i].size < sizeof data ? (size_t)entries[i].size : sizeof data;
+        if (snx_hac_read(state->hac, container, i, data, size)) return snx_error("Cannot read a ticket");
+        if (size < 4) continue;
+        switch ((SnxU32)le_bytes(data, 4)) {
+            case 0x10000UL:
+            case 0x10003UL: offset = 4 + 0x200 + 0x3c; break;
+            case 0x10001UL:
+            case 0x10004UL: offset = 4 + 0x100 + 0x3c; break;
+            case 0x10002UL:
+            case 0x10005UL: offset = 4 + 0x3c + 0x40; break;
+            case 0x10006UL: offset = 4 + 0x14 + 0x28; break;
+            default: continue;
+        }
+        if (size < offset + 0x170 || data[offset + 0x141]) continue; /* a personalized ticket's key is encrypted */
+        snx_hac_add_title_key(state->hac, data + offset + 0x160, data + offset + 0x40);
+    }
+    memset(data, 0, sizeof data);
+    return 0;
+}
+
+/* 1 when an NCA's header is encrypted: a decrypted one (DNCA) or a plain NCA3 or NCA2 header needs no keys */
+static int nca_needs_keys(ExtractState* state, int container, size_t entry) {
+    unsigned char header[0x204];
+    if (snx_hac_read(state->hac, container, entry, header, sizeof header)) return 1;
+    return memcmp(header + 0x200, "DNCA", 4) && memcmp(header + 0x200, "NCA3", 4) && memcmp(header + 0x200, "NCA2", 4);
+}
+
+static void take(NcaRef* ref, int container, size_t entry, const SnxHacEntry* e, SnxU64 title_id) {
+    ref->found = 1;
+    ref->container = container;
+    ref->entry = entry;
+    ref->size = e->size;
+    ref->title_id = title_id;
+}
+
+/* the Program NCA of a container to extract: the base's, or with update the patch of expected_title; the patch an NSP of
+   both has (embedded_patch), and the Control NCA of the same title (control). The biggest when there are several */
+static int select_ncas(ExtractState* state, int container, int update, SnxU64 expected_title, NcaRef* selected,
+                       NcaRef* embedded_patch, NcaRef* control) {
+    const SnxHacEntry* entries;
+    SnxHacNca* ncas;
+    size_t count, i;
+    unsigned long unreadable;
+    int patch;
+    const SnxU64 update_bit = 0x800UL;
+    memset(selected, 0, sizeof *selected);
+    if (embedded_patch) memset(embedded_patch, 0, sizeof *embedded_patch);
+    memset(control, 0, sizeof *control);
+    count = snx_hac_entries(state->hac, container, &entries);
+    ncas = (SnxHacNca*)calloc(count ? count : 1, sizeof *ncas);
+    if (!ncas) return snx_error("Out of memory selecting Program NCA");
+    unreadable = 0;
+    for (i = 0; i < count; i++) {
+        ncas[i].type = SNX_HAC_OTHER;
+        if (!has_suffix(entries[i].name, ".nca") || has_suffix(entries[i].name, ".cnmt.nca")) continue;
+        if (!state->has_keys && nca_needs_keys(state, container, i)) {
+            free(ncas);
+            return snx_error("Encrypted content needs prod.keys. Provide --keys, or put it at %s or in ~/.switch",
+                             state->keys);
+        }
+        if (snx_hac_nca(state->hac, container, i, &ncas[i])) {
+            ncas[i].type = SNX_HAC_OTHER;
+            unreadable++;
+        }
+    }
+    for (i = 0; i < count; i++) {
+        patch = (ncas[i].title_id & update_bit) || ncas[i].patch;
+        if (ncas[i].type != SNX_HAC_PROGRAM || (selected->found && entries[i].size <= selected->size)) continue;
+        if (update ? patch && (ncas[i].title_id & ~update_bit) == expected_title : !patch)
+            take(selected, container, i, &entries[i], ncas[i].title_id);
+    }
+    for (i = 0; selected->found && i < count; i++) {
+        patch = (ncas[i].title_id & update_bit) || ncas[i].patch;
+        if (embedded_patch && ncas[i].type == SNX_HAC_PROGRAM && patch &&
+            (ncas[i].title_id & ~update_bit) == selected->title_id &&
+            (!embedded_patch->found || entries[i].size > embedded_patch->size))
+            take(embedded_patch, container, i, &entries[i], ncas[i].title_id);
+        if (!control->found && ncas[i].type == SNX_HAC_CONTROL && /* the same game's, base or update */
+            (ncas[i].title_id & ~update_bit) == (selected->title_id & ~update_bit))
+            take(control, container, i, &entries[i], ncas[i].title_id);
+    }
+    free(ncas);
+    if (selected->found) return 0;
+    if (unreadable) return hac_error("The NCAs' headers cannot be decrypted. Check that prod.keys is current");
+    return snx_error(update ? "Update has no Program NCA matching the selected base game"
+                            : "Container has no base Program NCA (possibly an update or DLC). Supply a base game");
+}
+
+/* "  extracted 1229 of 4096 MB (30%)", ending in a carriage return while hactool writes: a terminal and the launcher's
+   console write the next over it, the last one ends the row */
+static void progress_say(ExtractState* state, int last) {
+    SnxU64 done = state->written > state->total ? state->total : state->written;
+    printf("  extracted %lu of %lu MB (%d%%)%s", (unsigned long)(done >> 20), (unsigned long)(state->total >> 20),
+           state->total ? (int)(done * 100 / state->total) : 100, last ? "\n" : "\r");
+    fflush(stdout);
+    state->said = 1;
+}
+
+/* once a second at most: hactool writes in pieces of a few megabytes */
+static void progress_tick(uint64_t written, void* data) {
+    ExtractState* state = (ExtractState*)data;
+    double now = snx_seconds();
+    state->written = written;
+    if (now - state->said_at < 1.0) return;
+    state->said_at = now;
+    progress_say(state, 0);
+}
+
+/* the game's control.nacp beside exefs/, where the loader reads the game's name from: out of the Control NCA's RomFS,
+   unpacked into the output for a moment. A game without one, or one that cannot be read, keeps the name of its file, a
+   line saying why */
+static void control_nacp(ExtractState* state, const NcaRef* control) {
+    char *dir = snx_path_join(state->out, "control.romfs"), *from = dir ? snx_path_join(dir, "control.nacp") : NULL;
+    char* to = snx_path_join(state->out, "control.nacp");
+    const char* why = NULL;
+    if (!control->found)
+        why = "it has no Control NCA";
+    else if (!dir || !from || !to)
+        why = "out of memory";
+    else if (snx_hac_extract(state->hac, control->container, control->entry, -1, 0, NULL, dir))
+        why = "its Control NCA cannot be read";
+    else if (!snx_is_file(from))
+        why = "its Control NCA holds no control.nacp";
+    else if (snx_replace(from, to))
+        why = "its control.nacp could not be moved beside exefs/";
+    if (dir && snx_is_dir(dir) && snx_remove_tree(dir)) snx_error("Could not remove %s", dir);
     if (why) printf("The game keeps the name of its file: %s\n", why);
     fflush(stdout);
     free(dir);
-    free(arg);
     free(from);
     free(to);
 }
 
+static int open_container(ExtractState* state, const char* path, int xci) {
+    int container = snx_hac_open(state->hac, path, xci);
+    if (container < 0) hac_error(xci ? "Cannot read the XCI's secure partition" : "Cannot read the NSP");
+    return container;
+}
+
 static int extract_files(ExtractState* state) {
-    const char* command[4];
-    char *switch_dir, *prod_path, *title_path, *exefs_arg, *romfs_arg, *base_arg, *main_path;
-    int result;
-    Progress progress;
-    switch_dir = snx_path_join(state->home, ".switch");
-    prod_path = switch_dir ? snx_path_join(switch_dir, "prod.keys") : NULL;
-    title_path = switch_dir ? snx_path_join(switch_dir, "title.keys") : NULL;
-    exefs_arg = option_arg("--exefsdir=", state->exefs);
-    romfs_arg = option_arg("--romfsdir=", state->romfs);
-    main_path = snx_path_join(state->exefs, "main");
-    base_arg = NULL;
-    result = 1;
-    if (!switch_dir || !prod_path || !title_path || !exefs_arg || !romfs_arg || !main_path) {
-        snx_error("Out of memory preparing extraction");
-        goto done;
+    NcaRef program, patch, control, newer;
+    char* main_path;
+    int base, update, failed;
+    if (state->has_keys && load_prod_keys(state)) return 1;
+    if (load_title_keys(state)) return 1;
+    printf("Reading %s\n", state->base);
+    fflush(stdout);
+    base = open_container(state, state->base, state->base_xci);
+    if (base < 0 || read_tickets(state, base)) return 1;
+    update = -1;
+    if (state->update) {
+        printf("Reading %s\n", state->update);
+        fflush(stdout);
+        update = open_container(state, state->update, state->update_xci);
+        if (update < 0 || read_tickets(state, update)) return 1;
     }
-    if (snx_mkdirs(switch_dir)) {
-        snx_error("Cannot create private key directory");
-        goto done;
-    }
-    if (state->has_keys) {
-        if (clean_prod_keys(state->keys, prod_path)) goto done;
-    } else if (snx_write_file(prod_path, "", 0)) {
-        snx_error("Cannot write private prod.keys");
-        goto done;
-    }
-    if (unpack(state, state->base, state->base_dir, state->base_xci)) goto done;
-    if (state->update && unpack(state, state->update, state->update_dir, state->update_xci)) goto done;
-    if (read_title_keys(state->title_keys, &state->titles) || read_tickets(state->base_dir, &state->titles)) goto done;
-    if (state->update_dir && read_tickets(state->update_dir, &state->titles)) goto done;
-    if (write_title_keys(title_path, state->titles) ||
-        program_nca(state, state->base_dir, 0, 0, &state->program, state->update_dir ? NULL : &state->patch,
-                    &state->title_id, &state->control))
-        goto done;
-    if (state->update_dir) {
-        char* newer = NULL; /* the update's Control NCA, which a name changed in it comes with */
-        if (program_nca(state, state->update_dir, 1, state->title_id, &state->patch, NULL, NULL, &newer)) goto done;
-        if (newer) {
-            free(state->control);
-            state->control = newer;
-        }
+    if (select_ncas(state, base, 0, 0, &program, update < 0 ? &patch : NULL, &control)) return 1;
+    if (update >= 0) {
+        if (select_ncas(state, update, 1, program.title_id, &patch, NULL, &newer)) return 1;
+        if (newer.found) control = newer; /* the update's, which a name changed in it comes with */
     }
     /* the base's program NCA: its RomFS is most of it, and an update's RomFS is about as big */
-    progress.verb = "extracted";
-    progress.dirs[0] = state->exefs;
-    progress.dirs[1] = state->romfs;
-    progress.total = snx_file_size(state->program);
-    progress.said = 0;
-    if (state->patch) {
-        base_arg = option_arg("--basenca=", state->program);
-        if (!base_arg) {
-            snx_error("Out of memory preparing update extraction");
-            goto done;
-        }
-        command[0] = base_arg;
-        command[1] = exefs_arg;
-        command[2] = romfs_arg;
-        command[3] = state->patch;
-        puts("Extracting the base with the update applied");
-        fflush(stdout);
-        if (run_hactool(state, command, 4, NULL, &progress)) goto done;
-    } else {
-        command[0] = exefs_arg;
-        command[1] = romfs_arg;
-        command[2] = state->program;
-        puts("Extracting the base game");
-        fflush(stdout);
-        if (run_hactool(state, command, 3, NULL, &progress)) goto done;
-    }
-    if (!snx_is_file(main_path)) {
-        snx_error("Extracted exefs has no main; verify that the update matches the base game");
-        goto done;
-    }
-    control_nacp(state);
-    result = 0;
-done:
-    free(switch_dir);
-    free(prod_path);
-    free(title_path);
-    free(exefs_arg);
-    free(romfs_arg);
-    free(base_arg);
+    state->total = program.size;
+    state->said_at = snx_seconds(); /* a quick one says nothing */
+    snx_hac_progress(progress_tick, state);
+    puts(patch.found ? "Extracting the base with the update applied" : "Extracting the base game");
+    fflush(stdout);
+    failed = patch.found ? snx_hac_extract(state->hac, patch.container, patch.entry, program.container, program.entry,
+                                           state->exefs, state->romfs)
+                         : snx_hac_extract(state->hac, program.container, program.entry, -1, 0, state->exefs,
+                                           state->romfs);
+    snx_hac_progress(NULL, NULL);
+    if (state->said) progress_say(state, 1);
+    if (failed) return hac_error("The Program NCA cannot be extracted");
+    main_path = snx_path_join(state->exefs, "main");
+    if (!main_path) return snx_error("Out of memory checking the extraction");
+    failed = !snx_is_file(main_path);
     free(main_path);
-    return result;
+    if (failed) return hac_error("Extracted exefs has no main; verify that the update matches the base game");
+    control_nacp(state, &control);
+    return 0;
 }
 
 static int cleanup(ExtractState* state, int result) {
-    TitleKey *item, *next;
-    int incomplete;
-    incomplete = result;
-    if (state->temp && snx_remove_tree(state->temp))
-        result = snx_error("Could not remove extraction temp directory: %s", state->temp);
-    if (incomplete && state->made_out && state->out && snx_remove_tree(state->out))
+    if (result && state->made_out && state->out && snx_remove_tree(state->out))
         snx_error("Could not remove incomplete extraction output: %s", state->out);
-    item = state->titles;
-    while (item) {
-        next = item->next;
-        secret_free(item->name, strlen(item->name));
-        secret_free(item->value, strlen(item->value));
-        free(item);
-        item = next;
-    }
-    if (!result) printf("Done: %s\n", state->out);
+    if (!result && state->out) printf("Done: %s\n", state->out);
+    snx_hac_free(state->hac);
     free(state->base);
     free(state->update);
     free(state->out);
     free(state->keys);
     free(state->title_keys);
-    free(state->hactool);
-    free(state->temp);
-    free(state->home);
-    free(state->base_dir);
-    free(state->update_dir);
-    free(state->program);
-    free(state->patch);
-    free(state->control);
     free(state->exefs);
     free(state->romfs);
+    memset(state, 0, sizeof *state);
     return result;
+}
+
+/* hactool exits on a dump it cannot read: what it said, and the incomplete output removed first */
+static void hactool_exit(void* data) {
+    ExtractState* state = (ExtractState*)data;
+    if (state->said) puts("");
+    hac_error("hactool stopped on the dump");
+    cleanup(state, 1);
 }
 
 int snx_extract(int argc, char** argv, const SnxPaths* paths) {
@@ -1028,14 +590,43 @@ int snx_extract(int argc, char** argv, const SnxPaths* paths) {
     int result;
     result = parse_options(argc, argv, &options);
     if (result) return result == 2 ? 0 : 1;
-    if (!paths || !paths->repo || !paths->build || !paths->executable)
-        return snx_error("Extraction requires repository, build and executable paths");
+    if (!paths || !paths->repo) return snx_error("Extraction requires the repository path");
     memset(&state, 0, sizeof state);
     result = prepare_paths(&state, &options, paths);
     if (!result) {
-        state.hactool = locate_hactool(paths);
-        if (!state.hactool) result = 1;
+        state.hac = snx_hac_new();
+        if (!state.hac) result = snx_error("Out of memory preparing extraction");
     }
-    if (!result) result = extract_files(&state);
+    if (!result) {
+        snx_hac_on_exit(hactool_exit, &state);
+        result = extract_files(&state);
+        snx_hac_on_exit(NULL, NULL);
+    }
+    return cleanup(&state, result);
+}
+int snx_extract_title(const char* dump, const SnxPaths* paths, SnxU64* title) {
+    ExtractState state;
+    NcaRef program, control;
+    int base, result = 0;
+    memset(&state, 0, sizeof state);
+    state.base = snx_absolute(dump);
+    state.keys = find_keys(NULL, "prod.keys", paths);
+    state.title_keys = find_keys(NULL, "title.keys", paths);
+    if (!state.base || !state.keys || !state.title_keys)
+        result = snx_error("Cannot resolve extraction input paths");
+    else if (!snx_is_file(state.base))
+        result = snx_error("Base dump is missing or is not a file");
+    else
+        result = container_kind(state.base, &state.base_xci);
+    if (!result && !(state.hac = snx_hac_new())) result = snx_error("Out of memory reading the dump");
+    if (!result) {
+        state.has_keys = snx_is_file(state.keys);
+        snx_hac_on_exit(hactool_exit, &state);
+        result = (state.has_keys && load_prod_keys(&state)) || load_title_keys(&state) ||
+                 (base = open_container(&state, state.base, state.base_xci)) < 0 || read_tickets(&state, base) ||
+                 select_ncas(&state, base, 0, 0, &program, NULL, &control);
+        snx_hac_on_exit(NULL, NULL);
+        if (!result) *title = program.title_id;
+    }
     return cleanup(&state, result);
 }

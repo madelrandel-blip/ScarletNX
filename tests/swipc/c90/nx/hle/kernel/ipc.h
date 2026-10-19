@@ -33,7 +33,11 @@ typedef struct IpcCtx {
 } IpcCtx;
 typedef struct SvcObj SvcObj;
 typedef SvcObj* (*SvcCtor)(void);
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t datasize);
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*));
+SvcObj* svcobj_new_data(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), void* base, size_t size, u32 count,
+                        u32* next, const char* what);
+#define SVCOBJ_NEW_DATA(name, dispatch, arr, next, what)                                                               \\
+    svcobj_new_data((name), (dispatch), (arr), sizeof *(arr), (u32)(sizeof(arr) / sizeof *(arr)), &(next), (what))
 void svcobj_unref(SvcObj* o);
 void out_copy_h(IpcCtx* c, u32 h);
 void out_move_h(IpcCtx* c, u32 h);

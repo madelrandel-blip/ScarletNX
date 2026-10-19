@@ -21,6 +21,8 @@ typedef enum { GUI_SIZING_FIXED, GUI_SIZING_ADAPTIVE } GuiSizing;
 typedef enum { GUI_TEXT_WRAP, GUI_TEXT_SLIDE } GuiTextFlow;
 /* the title in the row of tabs, after them, or on a row of its own under them */
 typedef enum { GUI_HEAD_TABS, GUI_HEAD_BELOW } GuiHeadPlace;
+/* the user's picture at the head's right, by their nickname: none (and no nickname), square or round */
+typedef enum { GUI_PICTURE_NONE, GUI_PICTURE_SQUARE, GUI_PICTURE_ROUND } GuiPicture;
 /* what the focus is about: in the foot's box beside the keys, or on a row under the head */
 typedef enum { GUI_TIPS_BOTTOM, GUI_TIPS_TOP } GuiTipsPlace;
 /* the lines that wait on the user: the keys screen's drop line, the ESC line after a run, a run being aborted */
@@ -58,6 +60,7 @@ typedef struct {
     GuiStyle head, footer; /* the head plain or on a band of ink; the foot too, or (none) without the Status box */
     int head_rule, footer_rule;
     GuiHeadPlace head_place;
+    GuiPicture picture;
     uint32_t title_size; /* the title's letters, times the text's; 0 is 1 */
     int title_shadow;
     int focus_bar; /* the focused box as a band of the focus colour, its text in the page colour */

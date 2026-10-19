@@ -13,6 +13,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 static uint64_t up(uint64_t value) { return (value + GNU_PAGE_SIZE - 1) & ~(uint64_t)(GNU_PAGE_SIZE - 1); }
@@ -20,7 +21,7 @@ static int range(GnuMemory* m, uint64_t address, uint64_t length) {
     return m->base && address >= GNU_PAGE_SIZE && !(address & (GNU_PAGE_SIZE - 1)) && length && length <= m->size &&
            address <= m->size - length && up(length) <= m->size - address;
 }
-static int host_protect(GnuMemory* m, uint64_t address, uint64_t length, unsigned permissions) {
+static int host_protect_pages(GnuMemory* m, uint64_t address, uint64_t length, unsigned permissions) {
 #ifdef _WIN32
     DWORD previous;
     DWORD p = (permissions & GNU_PROT_WRITE)                    ? PAGE_READWRITE
@@ -35,6 +36,28 @@ static int host_protect(GnuMemory* m, uint64_t address, uint64_t length, unsigne
     return mprotect(m->base + address, (size_t)length, p) ? -GNU_ENOMEM : 0;
 #endif
 }
+/* What a mapped guest page asks of the host's: its permissions, without write while compiled code is watched on it */
+static unsigned host_wants(unsigned flags) {
+    if (!(flags & GNU_PAGE_MAPPED)) return 0;
+    return flags & GNU_PAGE_CODE ? flags & (GNU_PROT_READ | GNU_PROT_EXEC) : flags & 7u;
+}
+/* [address, address + length) given permissions on the host. A host page larger than a guest page also holds guest
+   pages outside the range, so the host pages at its ends get what any of their guest pages wants: a page sharing a
+   host page with a more permissive one isn't protected (a guest fault there goes unseen, and so does a guest write
+   to compiled code beside writable data) */
+static int host_protect(GnuMemory* m, uint64_t address, uint64_t length, unsigned permissions) {
+    uint64_t hp = m->host_page, end = address + length, first = address & ~(hp - 1),
+             last = (end - 1) & ~(hp - 1), edge[2] = {first, last}; /* the first and last host pages touched */
+    if (!((address | end) & (hp - 1))) return host_protect_pages(m, address, length, permissions);
+    if (last > first + hp && host_protect_pages(m, first + hp, last - first - hp, permissions)) return -GNU_ENOMEM;
+    for (int i = 0; i < (last != first ? 2 : 1); i++) {
+        unsigned wants = 0;
+        for (uint64_t g = edge[i]; g < edge[i] + hp; g += GNU_PAGE_SIZE)
+            wants |= g >= address && g < end ? permissions : host_wants(m->pages[g / GNU_PAGE_SIZE]);
+        if (host_protect_pages(m, edge[i], hp, wants)) return -GNU_ENOMEM;
+    }
+    return 0;
+}
 /* executable pages in [a, a + n) are about to change */
 static void code_changes(GnuMemory* m, uint64_t a, uint64_t n) {
     if (!m->code_changed) return;
@@ -47,11 +70,31 @@ static void code_changes(GnuMemory* m, uint64_t a, uint64_t n) {
 int gnu_memory_init(GnuMemory* m) {
     memset(m, 0, sizeof *m);
     m->size = GNU_ADDRESS_LIMIT;
+    m->host_page = GNU_PAGE_SIZE;
 #ifdef _WIN32
     m->base = VirtualAlloc(NULL, (SIZE_T)m->size, MEM_RESERVE, PAGE_NOACCESS);
 #else
-    m->base = mmap(NULL, (size_t)m->size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (m->base == MAP_FAILED) m->base = NULL;
+    {
+        /* SNX_HOST_PAGE, a larger power of two up to 1 MiB, works as a host with those pages (tests) */
+        long host = sysconf(_SC_PAGESIZE);
+        const char* forced = getenv("SNX_HOST_PAGE");
+        uint64_t extra, head;
+        if (host > (long)GNU_PAGE_SIZE) m->host_page = (uint64_t)host;
+        if (forced) {
+            uint64_t v = strtoull(forced, NULL, 0);
+            if (v > m->host_page && v <= (UINT64_C(1) << 20) && !(v & (v - 1))) m->host_page = v;
+        }
+        extra = m->host_page - (host > 0 ? (uint64_t)host : GNU_PAGE_SIZE);
+        m->base = mmap(NULL, (size_t)(m->size + extra), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m->base == MAP_FAILED) {
+            m->base = NULL;
+        } else { /* aligned to the host page, the rest given back */
+            head = (m->host_page - (uint64_t)(uintptr_t)m->base % m->host_page) % m->host_page;
+            if (head) munmap(m->base, (size_t)head);
+            if (extra > head) munmap(m->base + head + m->size, (size_t)(extra - head));
+            m->base += head;
+        }
+    }
 #endif
     m->pages = calloc((size_t)(m->size / GNU_PAGE_SIZE), 1);
     m->mmap_next = UINT64_C(0x40000000);
@@ -92,14 +135,20 @@ void gnu_memory_watch_code(GnuMemory* m, uint64_t a, uint64_t n) {
         m->pages[i] = (unsigned char)(flags | GNU_PAGE_CODE);
     }
 }
+/* With a host page larger than a guest page, the write makes the whole host page writable: every watched page in it
+   is written as far as its code goes, as none of them is protected any more */
 int gnu_memory_code_written(GnuMemory* m, uint64_t a) {
-    uint64_t page = a & ~(uint64_t)(GNU_PAGE_SIZE - 1);
+    uint64_t page = a & ~(uint64_t)(GNU_PAGE_SIZE - 1), host = a & ~(m->host_page - 1);
     unsigned flags;
     if (a >= m->size) return 0;
     flags = m->pages[page / GNU_PAGE_SIZE];
     if (!(flags & GNU_PAGE_CODE)) return 0;
-    m->pages[page / GNU_PAGE_SIZE] = (unsigned char)(flags & ~GNU_PAGE_CODE);
-    if (m->code_changed) m->code_changed(m->code_context, page, GNU_PAGE_SIZE);
+    for (uint64_t g = host; g < host + m->host_page; g += GNU_PAGE_SIZE) {
+        unsigned f = m->pages[g / GNU_PAGE_SIZE];
+        if (!(f & GNU_PAGE_CODE)) continue;
+        m->pages[g / GNU_PAGE_SIZE] = (unsigned char)(f & ~GNU_PAGE_CODE);
+        if (m->code_changed) m->code_changed(m->code_context, g, GNU_PAGE_SIZE);
+    }
     return !host_protect(m, page, GNU_PAGE_SIZE, flags & 7u);
 }
 int gnu_memory_read(GnuMemory* m, uint64_t a, void* d, size_t n) {
@@ -145,7 +194,10 @@ int gnu_memory_unmap(GnuMemory* m, uint64_t a, uint64_t n) {
     if (!VirtualFree(m->base + a, (SIZE_T)n, MEM_DECOMMIT)) return -GNU_ENOMEM;
 #else
     if (host_protect(m, a, n, 0)) return -GNU_ENOMEM;
-    (void)madvise(m->base + a, (size_t)n, MADV_DONTNEED);
+    { /* the host pages wholly inside: a mapping zeroes its pages anyway, so neighbours' host pages keep theirs */
+        uint64_t mask = m->host_page - 1, lo = (a + mask) & ~mask, hi = (a + n) & ~mask;
+        if (lo < hi) (void)madvise(m->base + lo, (size_t)(hi - lo), MADV_DONTNEED);
+    }
 #endif
     memset(m->pages + a / GNU_PAGE_SIZE, 0, (size_t)(n / GNU_PAGE_SIZE));
     return 0;

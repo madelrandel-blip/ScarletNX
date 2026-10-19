@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 the ScarletNX contributors
+name: PR title
+
+# A pull request whose title still holds a donotmerge mark ([donotmerge needs #N]) fails this check until the mark is
+# out, and it runs again whenever the title is edited. As a required check of main it keeps the merge button off.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+# one at a time per pull request: of a burst of edits the newest waits and those before it are dropped. Never skipped
+# on an edit, as a skipped required check passes
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+
+jobs:
+  title:
+    name: No donotmerge in the title
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/pr-title.py
+          sparse-checkout-cone-mode: false
+      - name: Check the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: python3 scripts/pr-title.py "$TITLE"

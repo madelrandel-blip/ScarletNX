@@ -13,7 +13,8 @@ It prints one line per candidate, file:line: rule: what it saw. Four rules can b
           down. An atomic is declared _Atomic, or reached through an __atomic_* builtin in the struct's own file
           or in a file read that includes it
   globals two or more variables of static duration in one file (at file scope, or static in a function) that
-          aren't const: one struct holds the file's state, in one global
+          aren't const: one struct holds the file's state, in one global. Under src/nx/hle/, any one: the
+          state is a member of g_hle (hle/hle.h)
 Exit status 0 whatever it finds; 2 when a path cannot be read.
 """
 import os, re, sys
@@ -208,7 +209,13 @@ def check_state(path, text, report):
         for m in re.finditer(r"\bstatic\b([^;(]*?)(\w+)\s*(?:\[[^\]]*\]\s*)*(?:=[^;]*)?;", body):
             if not const_object(m.group(1)):
                 variables.append((m.group(2), open_at + 1 + m.start()))
-    if len(variables) > 1:
+    hle = "src/nx/hle/" in path.replace(os.sep, "/") and not path.endswith("hle.c")
+    if hle and variables:
+        variables.sort(key=lambda v: v[1])
+        report(path, line_of(text, variables[0][1]), "globals",
+               f"{len(variables)} variables of static duration ({', '.join(n for n, _ in variables)}): HLE state "
+               f"is a member of g_hle (hle/hle.h)")
+    elif len(variables) > 1:
         variables.sort(key=lambda v: v[1])
         report(path, line_of(text, variables[0][1]), "globals",
                f"{len(variables)} variables of static duration ({', '.join(n for n, _ in variables)}): one struct "

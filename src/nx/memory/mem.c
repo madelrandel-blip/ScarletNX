@@ -51,10 +51,13 @@ void mem_layout32(unsigned aspace) {
 
 /* ============================================================ the block list */
 /* The blocks cover [0, AS_END) in address order, each a run of pages with one state, permission and attribute set,
-   and no two neighbours alike. Free pages have no host memory behind them (decommitted), every other block has.
+   and no two neighbours alike. Free pages have no host memory behind them (decommitted), every other block has, but
+   the host commits whole host pages (g_host_page): one larger than the Switch's 4 KiB also commits the free guest
+   pages beside a mapped one, which then read zero (commit_nl, decommit_nl).
    Everything here is under g_mem_lk; a change of host memory also holds the renderer's memory lock around it
    (g_gpu_mapping_begin, taken first), which may query the list itself */
 static PMutex g_mem_lk = PMUTEX_INIT;
+static u64 g_host_page = PAGE; /* plat_vm_page: set by mem_init, before other threads */
 static MemBlock* g_blk;
 static u32 g_nblk, g_capblk;
 /* whether this thread holds g_mem_lk: a crash inside mem.c is reported by the thread that holds it, and the report's
@@ -171,6 +174,31 @@ static int range_is_nl(u64 a, u64 size, u32 state, u32 perm, u32 attr) {
         if (b->state != state || (perm != ANY && b->perm != perm) || (attr != ANY && b->attr != attr)) return 0;
     }
     return 1;
+}
+/* host memory under [a, a + size): the host pages it touches committed, whole */
+static int commit_nl(u64 a, u64 size) {
+    u64 mask = g_host_page - 1, lo = a & ~mask, hi = (a + size + mask) & ~mask;
+    return plat_vm_commit(GP(lo), hi - lo);
+}
+/* [a, a + size), free in the block list now, given back: the host pages left with no mapped guest page decommitted,
+   and in a host page a neighbour still maps, the range's part zeroed, as fresh pages read when mapped again */
+static void decommit_nl(u64 a, u64 size) {
+    u64 mask = g_host_page - 1, end = a + size, first = a & ~mask, last = (end - 1) & ~mask, edge[2];
+    int i, n = 0;
+    if (!((a | end) & mask)) { /* whole host pages, all of them free */
+        plat_vm_decommit(GP(a), size);
+        return;
+    }
+    edge[n++] = first;
+    if (last != first) edge[n++] = last;
+    for (i = 0; i < n; i++) {
+        u64 lo = edge[i] > a ? edge[i] : a, hi = edge[i] + g_host_page < end ? edge[i] + g_host_page : end;
+        if (range_is_nl(edge[i], g_host_page, MS_FREE, ANY, ANY))
+            plat_vm_decommit(GP(edge[i]), g_host_page);
+        else
+            memset(GP(lo), 0, (size_t)(hi - lo));
+    }
+    if (last > first + g_host_page) plat_vm_decommit(GP(first + g_host_page), last - first - g_host_page);
 }
 /* [a, a + size) widened to whole pages, inside the address space [AS_BASE, AS_END) and not empty: 0 when it can't be */
 static int page_range(u64* a, u64* size) {
@@ -304,31 +332,30 @@ static void pool_set_nl(u64 a, u64 size, u64 pool) {
     c.pool = pool;
     blk_change_nl(a, size, &c);
 }
-/* host memory of [a, a + size), inside one block b, given back: the reservation's own decommitted, the pool's
-   unmapped (the pages stay their owner's) */
-static void release_nl(const MemBlock* b, u64 a, u64 size) {
-    if (b->state == MS_FREE) return;
-    if (!b->pool)
-        plat_vm_decommit(GP(a), size);
-    else if (plat_alias_unmap(GP(a), size))
-        fatal("Could not unmap %llu KiB of guest memory from the alias pool", (unsigned long long)(size >> 10));
-}
-/* whatever is mapped in [a, a + size) goes */
+/* whatever is mapped in [a, a + size) goes: the pool's pages unmapped (they stay their owner's), the reservation's own
+   decommitted, block by block with the guest's pages, else once the list is free there (decommit_nl) */
 static void unmap_nl(u64 a, u64 size) {
     u64 end = a + size;
     u32 i;
     for (i = blk_index_nl(a); i < g_nblk && g_blk[i].addr < end; i++) {
         const MemBlock* b = &g_blk[i];
         u64 lo = b->addr > a ? b->addr : a, hi = blk_end(b) < end ? blk_end(b) : end;
-        release_nl(b, lo, hi - lo);
+        if (b->state == MS_FREE) continue;
+        if (b->pool) {
+            if (plat_alias_unmap(GP(lo), hi - lo))
+                fatal("Could not unmap %llu KiB of guest memory from the alias pool",
+                      (unsigned long long)((hi - lo) >> 10));
+        } else if (g_host_page == PAGE)
+            plat_vm_decommit(GP(lo), hi - lo);
     }
     blk_set_nl(a, size, MS_FREE, PERM_NONE, 0);
+    if (g_host_page != PAGE) decommit_nl(a, size); /* no pool with larger pages (mem_init) */
 }
 /* [a, a + size) the reservation's own pages again: committed with the pool's contents from *off, or decommitted
    without off. Also what a failed MAP_FIXED needs, as it may have taken the old pages with it; a host that can't do
    even this leaves nothing to run on */
 static void unpool_nl(u64 a, u64 size, const u64* off) {
-    if (plat_alias_unmap(GP(a), size) || (off && (plat_vm_commit(GP(a), size) || plat_alias_read(*off, GP(a), size))))
+    if (plat_alias_unmap(GP(a), size) || (off && (commit_nl(a, size) || plat_alias_read(*off, GP(a), size))))
         fatal("Could not put %llu KiB of guest memory back from the alias pool", (unsigned long long)(size >> 10));
 }
 /* Moves mapped memory into the pool: its contents are copied there and the pool's pages mapped over it, so views of
@@ -362,6 +389,10 @@ static void demote_nl(u64 a, u64 size) {
     hi = lo + size;
     for (i = 0; i < g_nblk; i++) {
         const MemBlock* b = &g_blk[i];
+        /* a's own pages, in a block merged with a neighbour that is the source of another view: two stacks mapped
+           one after the other get neighbouring pool pages and become one block, and keeping them here left pool
+           pages in the heap that a later stack's view then overlapped (svcMapMemory failed, and nn::os aborted) */
+        if (b->pool && b->addr + lo == a + (b->pool - 1)) continue;
         if (b->pool && (b->addr < a || blk_end(b) > a + size) && b->pool - 1 < hi && lo < b->pool - 1 + b->size)
             return; /* another mapping of them, or a block reaching past a's range (a view of part of a view) */
     }
@@ -380,7 +411,7 @@ static int alias_map_nl(u64 dst, u64 src, u64 size, u32 state, u32 perm) {
         return MEM_NOMEM;
     }
     if (!p) {
-        if (plat_vm_commit(GP(dst), size)) return MEM_NOMEM;
+        if (commit_nl(dst, size)) return MEM_NOMEM;
         memcpy(GP(dst), GP(src), size);
     }
     c.set_state = c.set_perm = c.set_pool = 1;
@@ -394,6 +425,7 @@ static int alias_map_nl(u64 dst, u64 src, u64 size, u32 state, u32 perm) {
 }
 
 void mem_init(void) {
+    g_host_page = plat_vm_page();
     g_mem = plat_vm_reserve(AS_SIZE);
     if (!g_mem) fatal("Could not reserve %llu GiB of address space for the game's memory", AS_SIZE >> 30);
     mem_lock();
@@ -402,8 +434,10 @@ void mem_init(void) {
     g_blk[0].size = AS_END;
     g_nblk = 1;
     mem_unlock();
-    g_pool_on = !plat_alias_init(g_pool_size);
-    LOG("memory: %s\n",
+    /* a view shares pages only at the same place in a host page as its source, which a game picking addresses in
+       4 KiB steps leaves to chance with larger pages: they copy, as hosts without a pool do */
+    g_pool_on = g_host_page == PAGE && !plat_alias_init(g_pool_size);
+    LOG("memory: %llu KiB host pages, %s\n", (unsigned long long)(g_host_page >> 10),
         g_pool_on ? "views share their source's pages (alias pool)" : "views are copies (no alias pool)");
 }
 
@@ -415,7 +449,7 @@ int mem_map(u64 addr, u64 size, u32 state, u32 perm) {
     mem_lock();
     if (!range_is_nl(addr, size, MS_FREE, ANY, ANY))
         r = -1;
-    else if (plat_vm_commit(GP(addr), size))
+    else if (commit_nl(addr, size))
         r = -2;
     else
         blk_set_nl(addr, size, state, perm, 0);
@@ -501,7 +535,7 @@ u64 kmem_alloc(u64 size, u32 state, u32 perm) {
     size = (size + PAGE - 1) & ~(PAGE - 1);
     mem_lock();
     a = find_free_nl(KERN_BASE, KERN_END, size, PAGE, PAGE);
-    if (a && !plat_vm_commit(GP(a), size))
+    if (a && !commit_nl(a, size))
         blk_set_nl(a, size, state, perm, 0);
     else
         a = 0;
@@ -639,7 +673,7 @@ int mem_heap_set(u64 size, u64 budget) {
             r = MEM_LIMIT;
         else if (!range_is_nl(a, grow, MS_FREE, ANY, ANY))
             r = MEM_BADSTATE;
-        else if (plat_vm_commit(GP(a), grow))
+        else if (commit_nl(a, grow))
             r = MEM_NOMEM;
         else
             blk_set_nl(a, grow, MS_NORMAL, PERM_RW, 0);
@@ -682,7 +716,7 @@ int mem_map_physical(u64 addr, u64 size, u64 budget) {
         while (a < end && !r) {
             u32 k = blk_index_nl(a);
             u64 hi = blk_end(&g_blk[k]) < end ? blk_end(&g_blk[k]) : end;
-            if (g_blk[k].state == MS_FREE && plat_vm_commit(GP(a), hi - a)) r = MEM_NOMEM;
+            if (g_blk[k].state == MS_FREE && commit_nl(a, hi - a)) r = MEM_NOMEM;
             if (!r) done = hi;
             a = hi;
         }
@@ -691,7 +725,7 @@ int mem_map_physical(u64 addr, u64 size, u64 budget) {
             u64 hi = blk_end(&g_blk[k]) < done ? blk_end(&g_blk[k]) : done;
             if (g_blk[k].state == MS_FREE) {
                 if (r)
-                    plat_vm_decommit(GP(a), hi - a);
+                    decommit_nl(a, hi - a);
                 else
                     blk_set_nl(a, hi - a, MS_NORMAL, PERM_RW, 0);
             }
@@ -810,7 +844,7 @@ int mem_map_code(MemCodeMap* m) {
         r = MEM_LIMIT;
     else if (g_pool_on)
         r = code_alias_nl(m, base);
-    else if (plat_vm_commit(GP(base), total))
+    else if (commit_nl(base, total))
         r = MEM_NOMEM;
     else {
         memcpy(GP(base), GP(m->source), m->size);

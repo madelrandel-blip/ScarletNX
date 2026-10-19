@@ -258,7 +258,7 @@ static int nn_socket_resolver_IResolver_GetCancelHandleRequest(SvcObj* self, u64
     *cancel_handle = 1;
     R_SUCCEED();
 }
-SvcObj* new_sfdnsres(void) { return nn_socket_resolver_IResolver_new(0); }
+SvcObj* new_sfdnsres(void) { return nn_socket_resolver_IResolver_new(); }
 
 #define NSD_ENVIRONMENT "lp1" /* the retail network environment, GetEnvironmentIdentifier's */
 /* the name with each '%', the console's placeholder (accounts.%.ndas.srv.nintendo.net), replaced by the environment,
@@ -305,7 +305,7 @@ static int nn_nsd_detail_IManager_GetApplicationServerEnvironmentType(SvcObj* se
    them (Diablo III's nn::nsd proxies: BufferArgumentInfo<0, 22, 8> and <1, 21, 256>), which libnx does only when they
    don't fit the server's pointer buffer */
 SvcObj* new_nsd(void) {
-    SvcObj* o = nn_nsd_detail_IManager_new(0);
+    SvcObj* o = nn_nsd_detail_IManager_new();
     if (o) o->ptrbuf = 0;
     return o;
 }

@@ -38,27 +38,29 @@ type nn::time::sf::ClockSnapshot = bytes<0xd0, 8>;
 
 interface nn::timesrv::detail::service::ISystemClock {
     [0] GetCurrentTime() -> nn::time::PosixTime time;
-    @stub [1] SetCurrentTime(nn::time::PosixTime time);
+    [1] SetCurrentTime(nn::time::PosixTime time);
     [2] GetSystemClockContext() -> nn::time::SystemClockContext context;
-    @stub [3] SetSystemClockContext(nn::time::SystemClockContext context);
+    [3] SetSystemClockContext(nn::time::SystemClockContext context);
     [4] GetOperationEventReadableHandle() -> handle<copy, event> event;
 }
 
 interface nn::timesrv::detail::service::ISteadyClock {
     [0] GetCurrentTimePoint() -> nn::time::SteadyClockTimePoint time_point;
     @stub [2] GetTestOffset() -> nn::TimeSpanType offset;
-    @stub [3] SetTestOffset(nn::TimeSpanType offset);
+    [3] SetTestOffset(nn::TimeSpanType offset);
     @stub [100] GetRtcValue() -> i64 value;
     @stub [200] GetInternalOffset() -> nn::TimeSpanType offset;
 }
 
 interface nn::timesrv::detail::service::ITimeZoneService {
     [0] GetDeviceLocationName() -> nn::time::LocationName name;
-    @stub [1] SetDeviceLocationName(nn::time::LocationName name);
+    [1] SetDeviceLocationName(nn::time::LocationName name);
     [2] GetTotalLocationNameCount() -> i32 count;
     [3] LoadLocationNameList(i32 index, array<nn::time::LocationName, 6> names) -> i32 count;
     [4] LoadTimeZoneRule(nn::time::LocationName name, buffer<nn::time::TimeZoneRule, 0x16> rule);
     [5] GetTimeZoneRuleVersion() -> nn::time::TimeZoneRuleVersion version;
+    [6] GetDeviceLocationNameAndUpdatedTime() -> (nn::time::LocationName name,
+                                                  nn::time::SteadyClockTimePoint time_point);
     [20] GetDeviceLocationNameOperationEventReadableHandle() -> handle<copy, event> event;
     [100] ToCalendarTime(nn::time::PosixTime time, buffer<nn::time::TimeZoneRule, 0x15> rule)
         -> (nn::time::CalendarTime calendar, nn::time::sf::CalendarAdditionalInfo info);
@@ -69,7 +71,8 @@ interface nn::timesrv::detail::service::ITimeZoneService {
     [202] ToPosixTimeWithMyRule(nn::time::CalendarTime calendar, array<nn::time::PosixTime, 0xa> times) -> i32 count;
 }
 
-interface nn::timesrv::detail::service::IStaticService is time:u, time:a, time:s {
+# time:a and time:s; time:u, an application's, is the same interface with every write refused (time.c)
+interface nn::timesrv::detail::service::IStaticService is time:a, time:s {
     [0] GetStandardUserSystemClock() -> object<nn::timesrv::detail::service::ISystemClock> clock;
     [1] GetStandardNetworkSystemClock() -> object<nn::timesrv::detail::service::ISystemClock> clock;
     [2] GetStandardSteadyClock() -> object<nn::timesrv::detail::service::ISteadyClock> clock;
@@ -79,8 +82,9 @@ interface nn::timesrv::detail::service::IStaticService is time:u, time:a, time:s
     [20] GetSharedMemoryNativeHandle() -> handle<copy, shared_memory> shared_memory;
     [30] GetStandardNetworkClockOperationEventReadableHandle() -> handle<copy, event> event;
     [31] GetEphemeralNetworkClockOperationEventReadableHandle() -> handle<copy, event> event;
+    [50] SetStandardSteadyClockInternalOffset(nn::TimeSpanType offset);
     [100] IsStandardUserSystemClockAutomaticCorrectionEnabled() -> b8 enabled;
-    @stub [101] SetStandardUserSystemClockAutomaticCorrectionEnabled(b8 enabled);
+    [101] SetStandardUserSystemClockAutomaticCorrectionEnabled(b8 enabled);
     [102] GetStandardUserSystemClockInitialYear() -> i32 year;
     [200] IsStandardNetworkSystemClockAccuracySufficient() -> b8 sufficient;
     [300] CalculateMonotonicSystemClockBaseTimePoint(nn::time::SystemClockContext context) -> i64 time;

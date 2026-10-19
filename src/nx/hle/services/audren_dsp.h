@@ -143,4 +143,20 @@ int audren_state_update(ARState* s, const u8* in, u64 in_size, u8* out, u64 out_
 /* one frame. The device sink's first two channels go to stereo (frame samples, interleaved); returns 1 when a
    device sink is in use and stereo holds its output, 0 when there is none */
 int audren_frame(ARState* s, i16* stereo);
+/* ---- HLE state in g_hle (hle.h) */
+/* the renderers open at once: the console's audren:u has two sessions (Eden's MaxRendererSessions), with room for a
+   game that closes one late */
+#define SNX_AUDREN_MAX 8
+/* the compressors' states: an effect each, of the 0x100 a renderer has at most (audren_state_new) */
+#define SNX_AUDREN_COMPRESSORS (0x100 * SNX_AUDREN_MAX)
+/* the compressor's state (audren_dsp.c), used while it is in its pool */
+typedef struct {
+    u32 used;
+    float detector, held, gain, knee, knee_lo, knee_hi, rate, out;
+} ARCompressor;
+/* the pool of the compressors' states, guarded by the lock every update and frame run under (audren.c's) */
+typedef struct {
+    ARCompressor compressors[SNX_AUDREN_COMPRESSORS];
+    u32 compressor_next;
+} HleAudrenDsp;
 #endif

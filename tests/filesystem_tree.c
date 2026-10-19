@@ -438,6 +438,51 @@ static void test_failed_initialization(const char* scratch) {
     puts("PASS failed scans discard the index and initial hardlinks are rejected");
 }
 
+/* fs_tree_graft: a folder elsewhere as a readonly child of the data directory (the RomFS of Extract to tmpfs), its
+   host paths in that folder and every other in the data directory */
+static void test_graft(const char* scratch) {
+    char base[FS_TREE_PATH_MAX], ram[FS_TREE_PATH_MAX], path[FS_TREE_PATH_MAX], text[8] = {0};
+    const char* tail = "/graft-ram/sub/file.bin";
+    FsTree other;
+    FsNode *file = NULL, *dir = NULL, *made = NULL;
+    FILE* f;
+    CHECK(snprintf(base, sizeof base, "%s/graft-base", scratch) < (int)sizeof base);
+    CHECK(snprintf(ram, sizeof ram, "%s/graft-ram", scratch) < (int)sizeof ram);
+    CHECK(!plat_mkdir(base) && !plat_mkdir(ram));
+    CHECK(snprintf(path, sizeof path, "%s/sub", ram) < (int)sizeof path && !plat_mkdir(path));
+    CHECK(snprintf(path, sizeof path, "%s%s", scratch, tail) < (int)sizeof path);
+    f = fopen(path, "wb");
+    CHECK(f != NULL && fwrite("bytes", 1, 5, f) == 5 && !fclose(f));
+    scans_allowed = 1;
+    OK(fs_tree_init(&other, base));
+    pm_lock(&other.lock);
+    OK(fs_tree_graft(&other, "romfs", ram));
+    CHECK(fs_tree_graft(&other, "romfs", ram) == FS_TREE_EXISTS);
+    CHECK(snprintf(path, sizeof path, "%s/no-such-directory", scratch) < (int)sizeof path);
+    CHECK(fs_tree_graft(&other, "missing", path) != FS_TREE_OK);
+    scans_allowed = 0;
+    CHECK(fs_tree_lookup(&other, NULL, "missing", &dir) == FS_TREE_NOTFOUND);
+    OK(fs_tree_lookup(&other, NULL, "romfs/sub/file.bin", &file));
+    CHECK(file->size == 5 && file->readonly);
+    OK(fs_tree_path(&other, file, path, sizeof path));
+    CHECK(strlen(path) > strlen(tail) && !strcmp(path + strlen(path) - strlen(tail), tail));
+    f = fopen(path, "rb");
+    CHECK(f != NULL && fread(text, 1, sizeof text, f) == 5 && !fclose(f) && !strcmp(text, "bytes"));
+    /* nothing under it changes */
+    OK(fs_tree_lookup(&other, NULL, "romfs/sub", &dir));
+    CHECK(fs_tree_create(&other, dir, "new.bin", 0, 1, NULL) == FS_TREE_READONLY);
+    CHECK(fs_tree_remove(&other, NULL, "romfs/sub/file.bin", 0, 0, 0) == FS_TREE_READONLY);
+    CHECK(fs_tree_remove(&other, NULL, "romfs", 1, 1, 0) == FS_TREE_READONLY);
+    CHECK(fs_tree_rename(&other, NULL, "romfs/sub/file.bin", "moved.bin", 0) == FS_TREE_READONLY);
+    /* the rest is the data directory's */
+    OK(fs_tree_create(&other, NULL, "save.bin", 0, 3, &made));
+    OK(fs_tree_path(&other, made, path, sizeof path));
+    CHECK(!strncmp(path, other.base, strlen(other.base)) && strstr(path, "/graft-base/save.bin"));
+    fs_tree_destroy(&other);
+    pm_unlock(&other.lock);
+    puts("PASS a graft reads its own folder, readonly, and the rest stays in the data directory");
+}
+
 int main(int argc, char** argv) {
     CHECK(argc == 3);
     CHECK(strstr(argv[1], "scarletnx-fs-tree-") != NULL);
@@ -472,6 +517,7 @@ int main(int argc, char** argv) {
     pm_unlock(&tree.lock);
     test_missing_root(argv[1]);
     test_failed_initialization(argv[1]);
+    test_graft(argv[1]);
     CHECK(!host_chdir(argv[1]));
     printf("PASS %u checks; native enumeration was restricted to initialization (%u opens)\n", checks, scan_count);
     return 0;

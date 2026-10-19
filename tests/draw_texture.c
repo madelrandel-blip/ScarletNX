@@ -32,6 +32,15 @@ int gmem_write(u64 gva, const void* src, u64 size) { return (void)gva, (void)src
 u32 gmem_r32(u64 gva) { return (void)gva, 0; }
 void gmem_w32(u64 gva, u32 v) { (void)gva, (void)v; }
 u64 gmmu_translate(u64 gva) { return gva; }
+/* maxwell3d.c's runs of contiguous pages, from the translation above */
+u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
+    u64 n, first = gmmu_translate(gva);
+    if (!max || !first) return 0;
+    *cpu = first;
+    n = 0x1000 - (gva & 0xFFF);
+    while (n < max && gmmu_translate(gva + n) == first + n) n += 0x1000;
+    return n < max ? n : max;
+}
 u32 gpu_color_bpp(u32 format) { return (void)format, 4; }
 u64 bl_offset(u32 x_bytes, u32 y, u32 z, u32 width_bytes, u32 height, u32 bh_log2, u32 bd_log2) {
     (void)x_bytes, (void)y, (void)z, (void)width_bytes, (void)height, (void)bh_log2, (void)bd_log2;
@@ -48,6 +57,9 @@ void pm_unlock(PMutex* m) { (void)m; }
 void i2m_launch(GpuChannel* ch, u32* regs, int base) { (void)ch, (void)regs, (void)base; }
 void i2m_data(GpuChannel* ch, u32 v) { (void)ch, (void)v; }
 void mme_run(GpuChannel* ch, u32 idx, u32 np) { (void)ch, (void)idx, (void)np; }
+void mme_upload_ptr(GpuChannel* ch, u32 v) { (void)ch, (void)v; }
+void mme_upload(GpuChannel* ch, u32 v) { (void)ch, (void)v; }
+void mme_bind(GpuChannel* ch, u32 v) { (void)ch, (void)v; }
 void logf_(int lvl, const char* fmt, ...) { (void)lvl, (void)fmt; }
 
 static GpuChannel ch;

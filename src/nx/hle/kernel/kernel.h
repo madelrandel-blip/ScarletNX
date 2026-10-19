@@ -11,6 +11,8 @@
 /* the one application process's id, which IPC PID descriptors carry too */
 #define K_PROCESS_ID 0x51ull
 #define NCORES       4 /* guest CPU cores */
+#define THREAD_MAX   96 /* the application's ThreadCountMax: creating one more answers R_LIMIT */
+#define H_MAX        1024 /* handles: the most the console's handle table holds */
 
 /* what a kernel object is (KObj.type) */
 enum {
@@ -61,6 +63,7 @@ struct KThread {
     int ideal_core; /* as set, -1 for none */
     u32 yields;     /* consecutive yields, of which only some reach the host */
     int on_core;    /* the core it holds, -2 while waiting for one, -1 for none */
+    int pinned;     /* the core whose host CPUs its host thread runs on (core_pin), -1 before it first ran */
     KThread* core_next; /* the core's wait list */
     u64 core_ticket;    /* arrival order there, which breaks priority ties */
     u64 affinity;
@@ -130,15 +133,12 @@ extern void (*const g_svc64[SNX_SVC_COUNT])(CPU* c, u32 imm);
 KShmem* kshmem_new(u64 size, const char* name);
 u8* kshmem_ptr(KShmem* s);
 
-void kernel_load_symbols(void); /* once the game's modules are loaded, for the dumps */
+/* once the game's modules are loaded, for the dumps and kernel_find_symbol_exact */
+void kernel_load_symbols(void);
+u64 kernel_find_symbol_exact(const char* name); /* 0 when no loaded module exports this name */
 void kernel_dump_regs(CPU* c);
 void kernel_dump_threads(void);
 void mem_report(char* out, int n);
 
-extern PMutex g_klock;
-extern u64 g_title_id;
-extern u64 g_sysres_size;
-extern int g_opt_mem_gb;
-/* the cores and priorities the npdm's kernel capabilities allow (svcGetInfo 0 and 1) */
-extern u64 g_core_mask, g_prio_mask;
+/* g_klock, the kernel lock, is g_hle.kernel.klock (hle.h): every list a waiter or signaller touches is under it */
 #endif

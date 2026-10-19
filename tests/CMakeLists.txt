@@ -25,8 +25,8 @@ function(snx_test_sanitize)
         endif()
     endforeach()
 endfunction()
-snx_test_sanitize(snx_driver snx_nx_module snx_driver_llvm snx_driver_gccjit scarletnx-common scarletnx-net snx_lz4
-                  snx_llvm snx_arm_llvm snx_jit scarletnx-recompiler scarletnx-recompiler-shared)
+snx_test_sanitize(snx_driver snx_nx_module snx_driver_llvm scarletnx-common scarletnx-net snx_lz4
+                  snx_llvm snx_arm_llvm scarletnx-recompiler scarletnx-recompiler-shared)
 # one Python for the scripted tests: without it they are left out
 find_package(Python3 QUIET COMPONENTS Interpreter)
 # x86-64, by any of the names hosts give it
@@ -206,6 +206,15 @@ if(TARGET snx_ctr_board)
         set_tests_properties(3ds_supertux_bootstrap PROPERTIES TIMEOUT 1800 LABELS "external;bootstrap")
     endif()
 endif()
+# Under a cross build's emulator, the 3DS AOT links its module with the compiler built into the driver (its path on the
+# build machine, the target's own when installed there), whose linker doesn't take the target's objects
+if(CMAKE_CROSSCOMPILING_EMULATOR)
+    foreach(snx_test 3ds_static_pipeline 3ds_extract)
+        if(TEST ${snx_test})
+            set_tests_properties(${snx_test} PROPERTIES DISABLED TRUE)
+        endif()
+    endforeach()
+endif()
 
 add_executable(snx-test-arm-profile arm_profile.c "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/a32.c"
     "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/thumb_decode.c"
@@ -236,6 +245,7 @@ foreach(suite tree service)
 endforeach()
 target_compile_options(snx-test-fs-service PRIVATE -Wno-unused-parameter)
 snx_swipc(snx-test-fs-service ROOT "${PROJECT_SOURCE_DIR}/src/nx" FILES hle/services/types.swipc hle/filesystem/fs.swipc)
+target_link_libraries(snx-test-fs-service PRIVATE scarletnx-common)
 add_test(NAME filesystem_raw COMMAND snx-test-fs-fixture $<TARGET_FILE:snx-test-fs-service> raw)
 
 if(UNIX)
@@ -279,7 +289,7 @@ snx_test_target(snx-test-arm-decode 11)
 add_test(NAME arm_decode COMMAND snx-test-arm-decode)
 add_executable(snx-test-arm-exec arm_exec_test.c)
 snx_test_target(snx-test-arm-exec 11)
-target_link_libraries(snx-test-arm-exec PRIVATE snx_arm_llvm)
+target_link_libraries(snx-test-arm-exec PRIVATE snx_llvm)
 add_test(NAME arm_exec_dry_svc COMMAND snx-test-arm-exec)
 
 # Small architectural witnesses need neither game assets nor an emulator.
@@ -316,7 +326,7 @@ if(SNX_TEST_A64_FP_DIFF)
     endif()
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(NAME a64_fp_differential COMMAND "${Python3_EXECUTABLE}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/a64_fp_diff.py" --cc "${CMAKE_C_COMPILER}")
+        "${CMAKE_CURRENT_SOURCE_DIR}/a64_fp_diff.py" --cc "${SNX_TARGET_C_COMPILER}")
     set_tests_properties(a64_fp_differential PROPERTIES TIMEOUT 900)
 endif()
 
@@ -396,18 +406,58 @@ endforeach()
 add_executable(snx-test-bsd-service bsd_service.c)
 snx_test_target(snx-test-bsd-service 23)
 snx_service_swipc(snx-test-bsd-service hle/services/network/bsd.swipc)
-target_link_libraries(snx-test-bsd-service PRIVATE scarletnx-net)
+target_link_libraries(snx-test-bsd-service PRIVATE scarletnx-ldn)
 add_test(NAME bsd_service COMMAND snx-test-bsd-service)
 set_tests_properties(bsd_service PROPERTIES TIMEOUT 60)
+
+# the Eden room server the room tests talk to (fake_room.h), with the ENet it is written on: a test that links it
+# gets the pinned ENet, never a system one's headers
+add_library(snx-test-fake-room STATIC fake_room.c)
+snx_test_target(snx-test-fake-room 23)
+target_link_libraries(snx-test-fake-room PUBLIC scarletnx-net snx_enet)
 
 # sfdnsres and nifm (dns.c, nifm.c) offline, with bsd.c beside them for whether the console is online
 add_executable(snx-test-network-service network_service.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/network/bsd.c")
 snx_test_target(snx-test-network-service 23)
 snx_service_swipc(snx-test-network-service hle/services/network/bsd.swipc hle/services/network/dns.swipc
                   hle/services/network/nifm.swipc)
-target_link_libraries(snx-test-network-service PRIVATE scarletnx-net)
+target_link_libraries(snx-test-network-service PRIVATE scarletnx-ldn snx-test-fake-room)
 add_test(NAME network_service COMMAND snx-test-network-service)
 set_tests_properties(network_service PROPERTIES TIMEOUT 60)
+
+# local wireless over the LAN (common/network/net_ldn.c): the frames, and two consoles on the loopback
+add_executable(snx-test-ldn-lan ldn_lan.c)
+snx_test_target(snx-test-ldn-lan 23)
+target_link_libraries(snx-test-ldn-lan PRIVATE scarletnx-ldn)
+add_test(NAME ldn_lan COMMAND snx-test-ldn-lan)
+set_tests_properties(ldn_lan PROPERTIES TIMEOUT 60)
+
+# an Eden room (common/network/net_room.c) against a room server in the test: the messages, joining, ldn's networks
+# and the game's datagram sockets through it
+add_executable(snx-test-ldn-room ldn_room.c)
+snx_test_target(snx-test-ldn-room 23)
+target_link_libraries(snx-test-ldn-room PRIVATE scarletnx-ldn snx-test-fake-room)
+add_test(NAME ldn_room COMMAND snx-test-ldn-room)
+set_tests_properties(ldn_room PROPERTIES TIMEOUT 120)
+
+# ldn:u (ldn.c): two consoles in one process, one creating a network and the other joining, with bsd.c beside for
+# the address a game socket binds meanwhile; the session id comes from OpenSSL's generator
+if(TARGET OpenSSL::Crypto)
+    add_executable(snx-test-ldn-service ldn_service.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/network/bsd.c")
+    snx_test_target(snx-test-ldn-service 23)
+    snx_service_swipc(snx-test-ldn-service hle/services/network/bsd.swipc hle/services/network/ldn.swipc)
+    target_link_libraries(snx-test-ldn-service PRIVATE scarletnx-ldn snx-test-fake-room OpenSSL::Crypto)
+    add_test(NAME ldn_service COMMAND snx-test-ldn-service)
+    set_tests_properties(ldn_service PROPERTIES TIMEOUT 60)
+    # both tests take 127.0.0.1 and 127.0.0.2 on the ldn port: never at the same time
+    set_tests_properties(ldn_lan ldn_service PROPERTIES RESOURCE_LOCK ldn_port)
+endif()
+
+# the Eden room of ldn=room (room.c): room='s address, users/online.ini's password, what stops the game before joining
+add_executable(snx-test-room-service room_service.c)
+snx_test_target(snx-test-room-service 23)
+target_link_libraries(snx-test-room-service PRIVATE scarletnx-ldn scarletnx-common)
+add_test(NAME room_service COMMAND snx-test-room-service)
 
 # ssl (ssl.c) against a TLS server in the test, on the game's bsd sockets (bsd.c, built beside). OpenSSL comes with
 # the NX, 3DS and hactool builds (cmake/dependencies.cmake), not with a GNU ABI-only one
@@ -415,18 +465,19 @@ if(TARGET OpenSSL::SSL)
     add_executable(snx-test-ssl-service ssl_service.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/network/bsd.c")
     snx_test_target(snx-test-ssl-service 23)
         snx_service_swipc(snx-test-ssl-service hle/services/network/bsd.swipc hle/services/network/ssl.swipc)
-    target_link_libraries(snx-test-ssl-service PRIVATE scarletnx-net OpenSSL::SSL)
+    target_link_libraries(snx-test-ssl-service PRIVATE scarletnx-ldn OpenSSL::SSL)
     add_test(NAME ssl_service COMMAND snx-test-ssl-service)
     set_tests_properties(ssl_service PROPERTIES TIMEOUT 60)
 endif()
 
-# mm:u and the smaller services, hid's IHidServer and acc (misc.c, hid.c, acc.c), with the kernel objects stubbed
-if(TARGET OpenSSL::Crypto)
+# mm:u and the smaller services, hid's IHidServer and acc (misc.c, hid.c, acc.c, whose user picture snx_splash draws),
+# with the kernel objects stubbed
+if(TARGET OpenSSL::Crypto AND TARGET snx_splash)
     add_executable(snx-test-misc-service misc_service.c "${PROJECT_SOURCE_DIR}/src/nx/hle/services/hid_touch.c"
         "${PROJECT_SOURCE_DIR}/src/nx/hle/services/hid_motion.c")
     snx_test_target(snx-test-misc-service 23)
         snx_service_swipc(snx-test-misc-service hle/services/hid.swipc hle/services/misc.swipc hle/services/acc.swipc)
-    target_link_libraries(snx-test-misc-service PRIVATE OpenSSL::Crypto)
+    target_link_libraries(snx-test-misc-service PRIVATE OpenSSL::Crypto snx_splash scarletnx-common)
     if(NOT WIN32)
         target_link_libraries(snx-test-misc-service PRIVATE m)
     endif()
@@ -451,6 +502,19 @@ add_executable(snx-test-am-nacp am_nacp.c am_service_stubs.c)
 snx_test_target(snx-test-am-nacp 23)
 snx_service_swipc(snx-test-am-nacp hle/services/am.swipc)
 add_test(NAME am_nacp COMMAND snx-test-am-nacp)
+
+# acc.c and users.c: the console's users from users/users.ini, as acc lists them, every file that lists none refused,
+# and the picture of a user with none of its own, Wimsy as a 256x256 JPEG (the splash's drawing), decoded by plutovg
+if(NOT SNX_TOOLS_ONLY)
+    add_executable(snx-test-acc-service acc_service.c)
+    snx_test_target(snx-test-acc-service 23)
+    snx_service_swipc(snx-test-acc-service hle/services/acc.swipc)
+    target_link_libraries(snx-test-acc-service PRIVATE snx_splash scarletnx-common)
+    target_include_directories(snx-test-acc-service SYSTEM PRIVATE "${plutovg_SOURCE_DIR}/include")
+    target_compile_definitions(snx-test-acc-service PRIVATE PLUTOVG_BUILD_STATIC)
+    set_target_properties(snx-test-acc-service PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME acc_service COMMAND snx-test-acc-service)
+endif()
 
 # set and set:sys: the firmware version's layout and the language codes (set.c)
 add_executable(snx-test-set-service set_service.c)
@@ -497,7 +561,7 @@ add_executable(snx-test-overlay overlay.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/vpad.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c"
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
 snx_test_target(snx-test-overlay 11)
-target_link_libraries(snx-test-overlay PRIVATE scarletnx-common m)
+target_link_libraries(snx-test-overlay PRIVATE scarletnx-common snx_splash m)
 include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
 target_include_directories(snx-test-overlay PRIVATE "${CMAKE_BINARY_DIR}/generated")
 add_test(NAME overlay COMMAND snx-test-overlay)
@@ -505,7 +569,8 @@ add_test(NAME overlay COMMAND snx-test-overlay)
 add_executable(snx-test-vpad vpad.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/vpad.c"
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
 snx_test_target(snx-test-vpad 11)
-target_link_libraries(snx-test-vpad PRIVATE scarletnx-common m)
+target_link_libraries(snx-test-vpad PRIVATE scarletnx-common snx_splash m)
+target_include_directories(snx-test-vpad PRIVATE "${CMAKE_BINARY_DIR}/generated") # ui.c's theme
 add_test(NAME vpad COMMAND snx-test-vpad)
 
 add_executable(snx-test-ini-deprecated ini_deprecated.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
@@ -525,7 +590,8 @@ include("${PROJECT_SOURCE_DIR}/cmake/pad_sdl.cmake")
 add_executable(snx-test-gamepad gamepad.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/backend/gamepad.c"
     "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/ui.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/ini.c")
 snx_test_target(snx-test-gamepad 11)
-target_link_libraries(snx-test-gamepad PRIVATE scarletnx-common snx_pad_sdl m)
+target_link_libraries(snx-test-gamepad PRIVATE scarletnx-common snx_pad_sdl snx_splash m)
+target_include_directories(snx-test-gamepad PRIVATE "${CMAKE_BINARY_DIR}/generated") # ui.c's theme
 add_test(NAME gamepad COMMAND snx-test-gamepad)
 
 add_executable(snx-test-fatal-screen fatal_screen.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/fatal_screen.c")
@@ -544,14 +610,12 @@ add_executable(snx-test-result-macros result_macros.c)
 snx_test_target(snx-test-result-macros 90)
 add_test(NAME result_macros COMMAND snx-test-result-macros)
 
-# generated and checked in (the controls' atlas, their shaders, the VIC's): their sources must still make them
+# generated and checked in (the controls' atlas, their shaders): their sources must still make them
 if(Python3_Interpreter_FOUND)
     add_test(NAME controls_atlas_current
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-controls.py" --check)
     add_test(NAME ui_shaders_current
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-ui-shaders.py" --check)
-    add_test(NAME vic_shader_current
-        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-vic-shader.py" --check)
     add_test(NAME generators_crlf COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/generators_crlf.py")
     # no keys, dumps, stray binaries, piracy sites or the console maker's name in prose among the tracked files: the
     # checks on planted ones (self test), then on the checkout. Skipped (77) without git or outside a checkout
@@ -562,6 +626,8 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(tracked_material_self_test tracked_material PROPERTIES SKIP_RETURN_CODE 77)
     # which GitHub Actions caches the cleanup workflow deletes (scripts/trim-caches.py)
     add_test(NAME trim_caches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/trim_caches_test.py")
+    # the check that keeps a pull request red while its title says donotmerge (scripts/pr-title.py, pr-title.yml)
+    add_test(NAME pr_title COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/pr_title_test.py")
     # the nightly release's title and notes (scripts/nightly-notes.py)
     add_test(NAME nightly_notes COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/nightly_notes_test.py")
     # the builds published as releases and on Discord (scripts/publish-builds.py), against fakes. Where publish.yml
@@ -659,9 +725,10 @@ snx_test_target(snx-test-run-ticking 90)
 target_link_libraries(snx-test-run-ticking PRIVATE snx_test_common)
 add_test(NAME run_ticking COMMAND snx-test-run-ticking)
 
+# C11 for hactool's headers, which build the synthetic dumps (hac_synth.h); extract.c itself stays C90 in the driver
 add_executable(snx-test-extract extract.c "${PROJECT_SOURCE_DIR}/src/nx/runtime/driver/extract.c")
-snx_test_target(snx-test-extract 90)
-target_link_libraries(snx-test-extract PRIVATE snx_test_common)
+snx_test_target(snx-test-extract 11)
+target_link_libraries(snx-test-extract PRIVATE snx_test_common hactool_internals)
 add_test(NAME extraction_native COMMAND snx-test-extract)
 
 add_executable(snx-test-loader loader_test.c "${PROJECT_SOURCE_DIR}/src/nx/loader/loader.c"
@@ -693,7 +760,10 @@ if(NOT WIN32)
     target_link_libraries(snx-test-ldr-service PRIVATE OpenSSL::Crypto m)
     snx_cpu_helpers_flags(snx-test-ldr-service)
     add_test(NAME ldr_service COMMAND snx-test-ldr-service)
-    set_tests_properties(ldr_service PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77) # 77: a host without 4 KiB pages
+    # again as on a host with 64 KiB pages (PowerPC64), each holding sixteen guest pages
+    add_test(NAME ldr_service_64k_pages COMMAND snx-test-ldr-service)
+    set_tests_properties(ldr_service ldr_service_64k_pages PROPERTIES TIMEOUT 60)
+    set_tests_properties(ldr_service_64k_pages PROPERTIES ENVIRONMENT SNX_HOST_PAGE=65536)
 endif()
 
 # Deterministic FFmpeg API double: no decoder dependency in tools-only builds.
@@ -736,6 +806,12 @@ if(NOT SNX_TOOLS_ONLY)
     snx_test_target(snx-test-tex-upload-rows 23)
     target_link_libraries(snx-test-tex-upload-rows PRIVATE snx_nx_flags)
     add_test(NAME tex_upload_rows COMMAND snx-test-tex-upload-rows)
+    # the file of shaders and pipelines kept across runs (gpu/vk/pipeline_file.c): records back as written, pipelines
+    # by their shaders' records, a cut or changed record ending the reading, another key starting over, a full file
+    add_executable(snx-test-pipeline-file pipeline_file.c)
+    snx_test_target(snx-test-pipeline-file 23)
+    target_link_libraries(snx-test-pipeline-file PRIVATE snx_nx_flags)
+    add_test(NAME pipeline_file COMMAND snx-test-pipeline-file)
 endif()
 
 add_executable(snx_recompiler_test recompiler_native.c)
@@ -744,18 +820,41 @@ target_link_libraries(snx_recompiler_test PRIVATE snx_driver ${CMAKE_DL_LIBS})
 
 # LLVM is always available to the recompiler.
 add_test(NAME native_recompiler COMMAND snx_recompiler_test
-    $<TARGET_FILE:scarletnx> "${PROJECT_SOURCE_DIR}" "${CMAKE_C_COMPILER}")
+    $<TARGET_FILE:scarletnx> "${PROJECT_SOURCE_DIR}" "${SNX_TARGET_C_COMPILER}")
 add_executable(snx-test-llvm-differential llvm_differential.c)
 snx_test_target(snx-test-llvm-differential 11)
 target_link_libraries(snx-test-llvm-differential PRIVATE snx_llvm snx_driver ${CMAKE_DL_LIBS})
 # In shards that run side by side, each a share of the words, all of them started first (COST): a tree with no times
 # of its own (CI's) starts tests in their order, and these are the longest. Fewer, and one runs alone at the end;
-# more, and each pays the compiles' start again
+# more, and each pays the compiles' start again. The _jit shards run the same steps through the JIT's loader
+# (code_loader.c: ELF objects, code_loader_coff.c: Windows' COFF ones)
 foreach(shard RANGE 2)
-    add_test(NAME llvm_differential_${shard} COMMAND snx-test-llvm-differential "${CMAKE_C_COMPILER}"
+    add_test(NAME llvm_differential_${shard} COMMAND snx-test-llvm-differential "${SNX_TARGET_C_COMPILER}"
         "${PROJECT_SOURCE_DIR}" --quiet --shard ${shard}/3)
-    set_tests_properties(llvm_differential_${shard} PROPERTIES TIMEOUT 900 COST 100)
+    add_test(NAME llvm_differential_jit_${shard} COMMAND snx-test-llvm-differential "${CMAKE_C_COMPILER}"
+        "${PROJECT_SOURCE_DIR}" --quiet --jit --shard ${shard}/3)
+    set_tests_properties(llvm_differential_${shard} llvm_differential_jit_${shard} PROPERTIES TIMEOUT 900 COST 100)
 endforeach()
+# the runtime JIT (jit_service.c): misses compiled, published and shared between threads, on that loader
+add_executable(snx-test-jit-service jit_service.c)
+snx_test_target(snx-test-jit-service 11)
+target_link_libraries(snx-test-jit-service PRIVATE snx_llvm Threads::Threads)
+add_test(NAME jit_service COMMAND snx-test-jit-service)
+set_tests_properties(jit_service PROPERTIES TIMEOUT 120)
+# longjmp across the loader's code, which on Windows unwinds through its registered function table
+add_executable(snx-test-code-loader-unwind code_loader_unwind.c)
+snx_test_target(snx-test-code-loader-unwind 11)
+target_link_libraries(snx-test-code-loader-unwind PRIVATE snx_llvm)
+add_test(NAME code_loader_unwind COMMAND snx-test-code-loader-unwind)
+if(NOT WIN32)
+    # the relocations both ELF paths share (elf_object.c), AArch64's included, checked on any ELF host and on macOS,
+    # whose JIT loads ELF objects
+    add_executable(snx-test-elf-relocate elf_relocate.c)
+    snx_test_target(snx-test-elf-relocate 11)
+    target_link_libraries(snx-test-elf-relocate PRIVATE snx_llvm)
+    add_test(NAME elf_relocate COMMAND snx-test-elf-relocate)
+    set_tests_properties(elf_relocate PROPERTIES TIMEOUT 120)
+endif()
 # not a test: timings of the generated code (llvm_bench SCARLETNX REPO CLANG)
 add_executable(snx-llvm-bench llvm_bench.c)
 snx_test_target(snx-llvm-bench 11)
@@ -797,25 +896,8 @@ endif()
 add_executable(snx-test-llvm-module llvm_module.c)
 snx_test_target(snx-test-llvm-module 11)
 target_link_libraries(snx-test-llvm-module PRIVATE snx_driver ${CMAKE_DL_LIBS})
-if(TARGET snx_jit)
-    set(snx_extra_backends gcc)
-    target_link_libraries(snx-test-llvm-differential PRIVATE snx_jit)
-    target_compile_definitions(snx-test-llvm-differential PRIVATE SNX_TEST_GCCJIT)
-    foreach(shard RANGE 1) # as llvm_differential's
-        add_test(NAME gccjit_differential_${shard} COMMAND snx-test-llvm-differential "${CMAKE_C_COMPILER}"
-            "${PROJECT_SOURCE_DIR}" --gccjit --quiet --per-case 2 --simd 100 --states 4 --shard ${shard}/2)
-        set_tests_properties(gccjit_differential_${shard} PROPERTIES TIMEOUT 900 COST 100)
-    endforeach()
-    add_test(NAME native_recompiler_gcc COMMAND snx_recompiler_test
-        $<TARGET_FILE:scarletnx> "${PROJECT_SOURCE_DIR}" "${CMAKE_C_COMPILER}" gcc)
-    # code units in this process and in processes of their own (gccjit/jit_units.c)
-    add_executable(snx-test-gccjit-units gccjit_units.c)
-    snx_test_target(snx-test-gccjit-units 11)
-        target_link_libraries(snx-test-gccjit-units PRIVATE snx_jit)
-    add_test(NAME gccjit_units COMMAND snx-test-gccjit-units)
-endif()
 add_test(NAME llvm_module COMMAND snx-test-llvm-module $<TARGET_FILE:scarletnx> "${PROJECT_SOURCE_DIR}"
-    "${CMAKE_C_COMPILER}" ${snx_extra_backends})
+    "${CMAKE_C_COMPILER}")
 # the recompiler as a library (snx_recompiler.h): A64 on every backend built, A32, from code in memory
 add_executable(snx-test-recompiler-library recompiler_library.c)
 snx_test_target(snx-test-recompiler-library 11)
@@ -823,7 +905,8 @@ target_link_libraries(snx-test-recompiler-library PRIVATE scarletnx-recompiler)
 add_test(NAME recompiler_library COMMAND snx-test-recompiler-library)
 if(APPLE)
     # these build a game module and load it, which needs a Mach-O module the recompiler can't link yet
-    # (src/common/cpu/recompiler/llvm/link.c, docs/APPLE.md), and 4 KiB host pages to run it: not run there
+    # (src/common/cpu/recompiler/llvm/link.c, docs/APPLE.md), and 4 KiB host pages to run it: not run there. The
+    # in-process loader's tests run: it loads ELF objects on macOS too (code_loader.c)
     set_tests_properties(native_recompiler llvm_module recompiler_library llvm_differential_0 llvm_differential_1
                          llvm_differential_2 PROPERTIES DISABLED TRUE)
 endif()
@@ -831,7 +914,13 @@ endif()
 add_executable(snx_codegen_test codegen_test.c)
 snx_test_target(snx_codegen_test 90)
 target_link_libraries(snx_codegen_test PRIVATE snx_driver)
-add_test(NAME native_codegen COMMAND snx_codegen_test "${CMAKE_C_COMPILER}" "${PROJECT_SOURCE_DIR}")
+add_test(NAME native_codegen COMMAND snx_codegen_test "${SNX_TARGET_C_COMPILER}" "${PROJECT_SOURCE_DIR}")
+
+# A64 cases ported from rEden's dynarmic tests, on the AOT and interpreter paths (a64_ported_cases.h)
+add_executable(snx-test-a64-ported a64_ported.c)
+snx_test_target(snx-test-a64-ported 11)
+target_link_libraries(snx-test-a64-ported PRIVATE snx_driver)
+add_test(NAME a64_ported_cases COMMAND snx-test-a64-ported "${CMAKE_C_COMPILER}" "${PROJECT_SOURCE_DIR}")
 
 add_executable(snx-test-astc astc_decode.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc.c")
 snx_test_target(snx-test-astc 23)
@@ -842,6 +931,25 @@ snx_test_target(snx-test-astc-glsl 23)
 target_compile_options(snx-test-astc-glsl PRIVATE -fwrapv)
 target_include_directories(snx-test-astc-glsl PRIVATE glsl)
 add_test(NAME astc_glsl COMMAND snx-test-astc-glsl)
+# the VIC shader's GLSL, both builds, run on the CPU against vic.c's composition of random jobs: no GPU needed
+add_executable(snx-test-vic-glsl glsl/vic_jobs.c glsl/vic_glsl.cpp)
+snx_test_target(snx-test-vic-glsl 23)
+target_compile_options(snx-test-vic-glsl PRIVATE -fwrapv)
+target_include_directories(snx-test-vic-glsl PRIVATE glsl)
+add_test(NAME vic_glsl COMMAND snx-test-vic-glsl)
+
+# single blocks from rEden's ASTC decoder tests, against edenprobe's and astcenc's texels (astc_blocks.c)
+add_executable(snx-test-astc-blocks astc_blocks.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/astc.c")
+snx_test_target(snx-test-astc-blocks 23)
+add_test(NAME astc_blocks COMMAND snx-test-astc-blocks)
+
+add_executable(snx-test-nvn-command-gap nvn_command_gap.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_command_gap.c")
+snx_test_target(snx-test-nvn-command-gap 23)
+add_test(NAME nvn_command_gap COMMAND snx-test-nvn-command-gap)
+
+add_executable(snx-test-nvn-control nvn_control.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_control.c")
+snx_test_target(snx-test-nvn-control 23)
+add_test(NAME nvn_control COMMAND snx-test-nvn-control)
 
 # the shared fonts pl.c hands out when a game folder has none: the stand-ins compiled in (cmake/shared_fonts.cmake)
 if(NOT SNX_TOOLS_ONLY)
@@ -881,6 +989,11 @@ if(UNIX)
     add_test(NAME audren_render COMMAND snx-test-audren)
 endif()
 
+# audren.c's host side with the DSP stubbed: the output device's volume on every renderer's host stream
+add_executable(snx-test-audren-host audren_host.c)
+snx_test_target(snx-test-audren-host 23)
+add_test(NAME audren_host COMMAND snx-test-audren-host)
+
 add_executable(snx-test-render-enable render_enable.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c"
     "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c")
 snx_test_target(snx-test-render-enable 23)
@@ -905,11 +1018,17 @@ add_test(NAME draw_texture COMMAND snx-test-draw-texture)
 if(UNIX)
     add_executable(snx-test-gpu-park gpu_park.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/gpu.c"
         "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/engines.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/maxwell3d.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/write_pages.c"
-        "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/mme.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/dma.c")
+        "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/mme.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/mme_hle.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/gpu/maxwell/dma.c")
     snx_test_target(snx-test-gpu-park 23)
         add_test(NAME gpu_park COMMAND snx-test-gpu-park)
     set_tests_properties(gpu_park PROPERTIES TIMEOUT 30) # a deadlock in the queue would otherwise hang ctest
 endif()
+
+# mme.c's native macros chosen by the hash of their code, the interpreter for unknown code, and the verify mode
+add_executable(snx-test-mme-native mme_native.c)
+snx_test_target(snx-test-mme-native 23)
+add_test(NAME mme_native COMMAND snx-test-mme-native)
 
 add_executable(snx-test-etc2 etc2_decode.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/etc2.c")
 snx_test_target(snx-test-etc2 23)
@@ -926,18 +1045,28 @@ if(UNIX)
     snx_test_target(snx-test-kernel-cores 11)
         add_test(NAME kernel_cores COMMAND snx-test-kernel-cores)
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(snx-test-plat-cpus plat_cpus.c)
+    snx_test_target(snx-test-plat-cpus 11)
+    add_test(NAME plat_cpus COMMAND snx-test-plat-cpus)
+endif()
 
+# EAC worked examples and edenprobe's blocks from rEden's decode_eac test (eac_blocks.c)
+add_executable(snx-test-eac-blocks eac_blocks.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/texture/etc2.c")
+snx_test_target(snx-test-eac-blocks 23)
+add_test(NAME eac_blocks COMMAND snx-test-eac-blocks)
 
 if(UNIX)
     add_executable(snx-test-memory memory_accounting.c
-        "${PROJECT_SOURCE_DIR}/src/nx/memory/mem.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/svc/svc_mem.c")
+        "${PROJECT_SOURCE_DIR}/src/nx/memory/mem.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/svc/svc_mem.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/hle/hle.c")
     snx_test_target(snx-test-memory 11)
         add_test(NAME memory_accounting COMMAND snx-test-memory)
-    set_tests_properties(memory_accounting PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77) # as ldr_service
+    set_tests_properties(memory_accounting PROPERTIES TIMEOUT 60)
     # views through the alias pool, with the real POSIX platform layer (77 where the host has no pool)
     add_executable(snx-test-memory-alias memory_alias.c
         "${PROJECT_SOURCE_DIR}/src/nx/memory/mem.c" "${PROJECT_SOURCE_DIR}/src/nx/hle/svc/svc_mem.c"
-        "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_posix.c"
+        "${PROJECT_SOURCE_DIR}/src/nx/hle/hle.c" "${PROJECT_SOURCE_DIR}/src/nx/runtime/platform/plat_posix.c"
         "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
     snx_test_target(snx-test-memory-alias 11)
     target_link_libraries(snx-test-memory-alias PRIVATE ${CMAKE_DL_LIBS})
@@ -1020,7 +1149,7 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         add_test(NAME shaderdec_spec COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/shaderdec_test.py"
             $<TARGET_FILE:snx-shaderdec> "${PROJECT_SOURCE_DIR}/src/nx/gpu/shader/maxwell_opcodes.def")
     endif()
-    add_executable(snx-test-vulkan-release vulkan_release.c)
+    add_executable(snx-test-vulkan-release vulkan_release.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/vk/pending_pages.c")
     snx_test_target(snx-test-vulkan-release 11)
     add_test(NAME vulkan_release COMMAND snx-test-vulkan-release)
     add_executable(snx-test-vulkan-backing vulkan_backing.c)

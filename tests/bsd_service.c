@@ -6,10 +6,11 @@
 #include <stdarg.h>
 
 #include "nx/hle/services/network/bsd.c"
+#include "nx/hle/hle.c"
 
 u8* g_mem;
 int g_verbose;
-int g_opt_network;
+int g_opt_network, g_opt_airplane;
 static unsigned failures;
 #define CHECK(x)                                                                                                       \
     do {                                                                                                               \
@@ -26,18 +27,18 @@ void logf_(int level, const char* format, ...) {
     (void)level;
     (void)format;
 }
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t size) {
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
     SvcObj* o = calloc(1, sizeof *o);
     o->name = name;
     o->dispatch = dispatch;
     o->refs = 1;
-    if (size) o->data = calloc(1, size);
     return o;
 }
+#include "svcobj_data.h"
 void svcobj_unref(SvcObj* o) {
     if (!o || --o->refs) return;
     if (o->destroy) o->destroy(o);
-    free(o->data);
+    test_svcobj_data_free(o);
     free(o);
 }
 void ipc_out_overflow(IpcCtx* c) {
@@ -114,7 +115,13 @@ static void sockaddr_lo(u64 at, u16 port_be) {
     memcpy(GP(at), s, 16);
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+
 int main(void) {
+    hle_init();
     g_mem = calloc(1, 0x10000);
     network_init();
     snx_net_set_log(NULL);

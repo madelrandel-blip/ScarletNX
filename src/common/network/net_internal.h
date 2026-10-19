@@ -65,6 +65,11 @@ void snx_net_log(const char* fmt, ...)
     __attribute__((format(printf, 1, 2)))
 #endif
     ;
+void snx_net_warn(const char* fmt, ...) /* what the player must hear of */
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 1, 2)))
+#endif
+    ;
 int snx_net_host_error(void);       /* the last socket call's error, -SNX_E* */
 int snx_net_errno_from_host(int e); /* a host errno (POSIX) or Winsock error, -SNX_E* */
 int snx_net_close_fd(SnxHostFd fd);

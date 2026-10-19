@@ -9,6 +9,7 @@ New here? Start with [Build](./BUILD.md), then [Usage](./USAGE.md).
 - **[GUI launcher](./GUI.md)** - the menu and its themes
 - **[Android](./ANDROID.md)**
 - **[macOS and iOS](./APPLE.md)**
+- **[PowerPC64](./PPC64.md)**
 - **[Development](./DEVELOPMENT.md)** - tests and diagnostics
   - **[edenprobe](./EDENPROBE.md)** - hardware probes CI runs against a baseline
 - **[Deprecations](./DEPRECATIONS.md)** - what an older version used, and how it goes away
@@ -30,5 +31,6 @@ New here? Start with [Build](./BUILD.md), then [Usage](./USAGE.md).
   - **[Memory accounting](./MEMORY_ACCOUNTING.md)**
 - GPU:
   - **[ASTC compute uploads](./ASTC.md)**
+  - **[VIC composition on the GPU](./VIC.md)**
   - **[Guest buffers on unified memory](./UMA_MEMORY.md)**
   - **[Shader corrections, batch 001](./shader-audit/fixes-001.md)**

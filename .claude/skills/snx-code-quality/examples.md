@@ -239,6 +239,12 @@ another file needs it). Function-local `static`s are globals too and go in it. W
 declared once in the header next to the file: the struct's type with the global, or a function that
 answers it. Atomics that different threads write still get a cache line each (rule 4), padded inside it.
 
+In `src/nx/hle/` the struct is a member of `g_hle` (`hle/hle.h`) instead of a global of the file: its type
+and its initializer macro (`HLE_IPC_INIT`) are in the header beside the file, `hle.c` defines `g_hle` with
+them, and the code reads `g_hle.ipc.lk`. The objects the file makes and frees are pools in that struct, not
+`malloc`s: a static array with a bound, taken with `POOL_TAKE` under the lock that guards it and made non-zero
+before the lock is let go, freed with `POOL_PUT`.
+
 **Why:** loose globals scatter one subsystem's state over a file, each with its own name, initialization and
 lock, so nothing shows what belongs together or what a lock guards. One struct is one place to read, reset in
 a test, dump in a crash report or move into a context later.

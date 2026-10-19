@@ -11,5 +11,7 @@ void hints_init(void);      /* <exedir><name>.hints, once the game is named */
 void load_hints(void);      /* the file's addresses, so a save keeps them */
 void save_hints(void);      /* the file again, when this run added any. Any thread */
 void snx_fpcr_apply(CPU* c); /* the thread's FPCR as it starts and on each write */
+/* the hints so far, loaded and found, in the order they were found: malloc'd (the caller frees), NULL when none */
+u64* hints_copy(size_t* count);
 
 #endif

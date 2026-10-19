@@ -30,6 +30,7 @@ static const char* const format_keys[] = {"theme/format",
                                           "head/place",
                                           "head/size",
                                           "head/shadow",
+                                          "head/picture",
                                           "head/menu",
                                           "head/games",
                                           "head/keys",
@@ -187,6 +188,7 @@ int main(void) {
            !strcmp(yorha->cursor, "\xe2\x96\xba "));
     assert(def->head_place == GUI_HEAD_TABS && yorha->head_place == GUI_HEAD_TABS);
     assert(def->title_size == 1 && !def->title_shadow && yorha->title_size == 2 && !yorha->title_shadow);
+    assert(def->picture == GUI_PICTURE_ROUND && yorha->picture == GUI_PICTURE_SQUARE);
     assert(!def->grid && yorha->grid && def->tips_place == GUI_TIPS_TOP && yorha->tips_place == GUI_TIPS_TOP);
     assert(!def->tips_box && !def->footer_box && yorha->tips_box && yorha->footer_box);
     assert(def->footer == GUI_STYLE_PLAIN && yorha->footer == GUI_STYLE_BAR && yorha->head_rule && !def->head_rule);
@@ -266,8 +268,13 @@ int main(void) {
     assert(theme.panels == GUI_PANELS_OUTLINE && theme.head_place == GUI_HEAD_BELOW &&
            theme.tips_place == GUI_TIPS_BOTTOM);
     assert(!theme.tips_box && !theme.footer_box && theme.footer == GUI_STYLE_NONE);
-    parse(&theme, "[body]\npanels = round\n[head]\nplace = left\n[tips]\nplace = side\n");
+    parse(&theme, "[body]\npanels = round\n[head]\nplace = left\npicture = oval\n[tips]\nplace = side\n");
     assert(theme.panels == def->panels && theme.head_place == def->head_place && theme.tips_place == def->tips_place);
+    assert(theme.picture == def->picture);
+    parse(&theme, "[theme]\nbase = yorha\n[head]\npicture = none\n");
+    assert(theme.picture == GUI_PICTURE_NONE);
+    parse(&theme, "[theme]\nbase = default\n[head]\npicture = square\n");
+    assert(theme.picture == GUI_PICTURE_SQUARE);
 
     /* a value longer than its field keeps the base's; an unknown base leaves the default */
     memset(longer, 0, sizeof longer);
@@ -385,6 +392,7 @@ int main(void) {
     assert(rgb_hex(yorha->run_colors.failure, SNX_GUI_THEME_YORHA_RUN_FAILURE));
     assert(rgb_hex(yorha->run_colors.warning, SNX_GUI_THEME_YORHA_RUN_WARNING));
     assert(rgb_hex(yorha->splash_page, SNX_GUI_THEME_YORHA_SPLASH_PAGE));
+    assert((int)def->picture == SNX_GUI_THEME_DEFAULT_PICTURE && (int)yorha->picture == SNX_GUI_THEME_YORHA_PICTURE);
     /* docs/GUI.md's example reads, and names no key the format lacks */
     {
         static char keys[8192];

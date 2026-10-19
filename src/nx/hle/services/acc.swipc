@@ -25,7 +25,7 @@ interface nn::account::IAccountServiceForApplication is acc:u0, acc:u1, acc:su {
     @stub [100] InitializeApplicationInfoV0(pid);
     [101] GetBaasAccountManagerForApplication(nn::account::Uid uid)
         -> object<nn::account::baas::IManagerForApplication> manager;
-    @stub [110] StoreSaveDataThumbnail(nn::account::Uid uid, buffer<u8, 5> image);
+    [110] StoreSaveDataThumbnail(nn::account::Uid uid, buffer<u8, 5> image);
     @stub [111] ClearSaveDataThumbnail(nn::account::Uid uid);
     [130] LoadOpenContext(nn::account::Uid uid) -> object<nn::account::baas::IManagerForApplication> manager;
     [131] ListOpenContextStoredUsers(array<nn::account::Uid, 0xa> users);
@@ -37,8 +37,8 @@ interface nn::account::IAccountServiceForApplication is acc:u0, acc:u1, acc:su {
 interface nn::account::profile::IProfile {
     [0] Get(buffer<nn::account::profile::UserData, 0x1a> user_data) -> nn::account::profile::ProfileBase base;
     [1] GetBase() -> nn::account::profile::ProfileBase base;
-    @stub [10] GetImageSize() -> u32 size;
-    @stub [11] LoadImage(buffer<u8, 6> image) -> u32 size;
+    [10] GetImageSize() -> u32 size;
+    [11] LoadImage(buffer<u8, 6> image) -> u32 size;
 }
 
 # the user's network service account: there, but its id token never arrives

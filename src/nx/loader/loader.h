@@ -47,9 +47,11 @@ typedef struct {
     int is_nro, has_mod0;
     SnxMod0 mod0;
     char* eh_error; /* why the unwind table was read only partly, or NULL */
-    /* An NRO's assets (ASET), and its control.nacp and RomFS among them: views into image's allocation */
-    const unsigned char *nro_asset, *nacp_data, *romfs_data;
-    size_t nro_asset_size, nacp_size, romfs_size;
+    /* An NRO's assets (ASET): its control.nacp, owned by the module, and where its RomFS lies in the file, which is
+       never read (it can take gigabytes) */
+    unsigned char* nacp_data;
+    size_t nacp_size;
+    SnxU64 romfs_offset, romfs_size;
 } SnxModuleImage;
 
 /* The NPDM fields the recompiler and the runtime use */
@@ -68,9 +70,8 @@ typedef struct {
     size_t npdm_size;
     SnxNpdm npdm;
     char *entry_path, *exefs_path, *root_path, *romfs_path;
-    /* An NRO's embedded RomFS: a view into modules[0].image, valid until snx_free_program */
-    const unsigned char* romfs_data;
-    size_t romfs_size;
+    /* An NRO's embedded RomFS: where it lies in entry_path, romfs_size 0 when it has none */
+    SnxU64 romfs_offset, romfs_size;
     /* The program's control.nacp, owned by the program, or NULL: an NRO's from its assets, an ExeFS's from beside it
        (<root>/control.nacp, written there by the extraction) */
     unsigned char* nacp;

@@ -686,6 +686,7 @@ static void set_size(SnxModuleImage* m) {
 void snx_free_module(SnxModuleImage* module) {
     free(module->name); /* the path too */
     free(module->image);
+    free(module->nacp_data);
     free(module->symbols);   /* the imports too */
     free(module->functions); /* the relptrs and the FDEs too */
     free(module->eh_error);
@@ -796,8 +797,7 @@ int snx_load_nso32(const char* path, const char* name, SnxModuleImage* module, c
 
 /* The NRO's segments must be the image itself, one after another: text from 0 (at least its header), rodata, then
    data to the image's end. They need not be page aligned: the runtime rounds pages */
-static int decode_nro(SnxModuleImage* m, size_t file_size, char* error, size_t error_size) {
-    const unsigned char* f = m->image;
+static int decode_nro(SnxModuleImage* m, const unsigned char* f, SnxU64 file_size, char* error, size_t error_size) {
     SnxU32 image_size, text_off, text_size, ro_off, ro_size, data_off, data_size;
     if (file_size < NRO_HEADER_SIZE || memcmp(f + 0x10, "NRO0", 4))
         return fail(error, error_size, snx_format("%s: not an NRO", m->path));
@@ -826,40 +826,67 @@ static int decode_nro(SnxModuleImage* m, size_t file_size, char* error, size_t e
     memcpy(m->build_id, f + 0x40, 32);
     m->is_nro = 1;
     set_size(m);
-    /* the assets after the image (icon, control.nacp, RomFS) are optional and never mapped */
-    if (file_size - image_size >= ASET_HEADER_SIZE && !memcmp(f + image_size, "ASET", 4)) {
-        const unsigned char* asset = f + image_size;
-        SnxU64 asset_size = file_size - image_size, off, size;
-        unsigned i;
-        for (i = 0; i < 3; ++i) {
-            off = rd64(asset + 0x08 + i * 0x10);
-            size = rd64(asset + 0x10 + i * 0x10);
-            if (size && !inside(off, size, asset_size))
-                return fail(error, error_size, snx_format("%s: an ASET section lies outside the file", m->path));
-            if (i == 1 && size) {
-                m->nacp_data = asset + off;
-                m->nacp_size = (size_t)size;
-            } else if (i == 2 && size) {
-                m->romfs_data = asset + off;
-                m->romfs_size = (size_t)size;
-            }
+    return 0;
+}
+
+/* the assets after the image (icon, control.nacp, RomFS), optional and never mapped, with file just past the image:
+   the control.nacp read, the RomFS only located */
+static int read_nro_assets(SnxModuleImage* m, FILE* file, SnxU64 file_size, char* error, size_t error_size) {
+    unsigned char asset[ASET_HEADER_SIZE];
+    SnxU64 asset_size = file_size - m->image_size, off, size;
+    unsigned i;
+    if (asset_size < ASET_HEADER_SIZE) return 0;
+    if (fread(asset, 1, sizeof asset, file) != sizeof asset)
+        return fail(error, error_size, snx_format("cannot read %s", m->path));
+    if (memcmp(asset, "ASET", 4)) return 0;
+    for (i = 0; i < 3; ++i) {
+        off = rd64(asset + 0x08 + i * 0x10);
+        size = rd64(asset + 0x10 + i * 0x10);
+        if (size && !inside(off, size, asset_size))
+            return fail(error, error_size, snx_format("%s: an ASET section lies outside the file", m->path));
+        if (i == 1 && size) {
+            m->nacp_data = (unsigned char*)snx_alloc((size_t)size);
+            m->nacp_size = (size_t)size;
+            if (snx_seek(file, m->image_size + off) || fread(m->nacp_data, 1, m->nacp_size, file) != m->nacp_size)
+                return fail(error, error_size, snx_format("cannot read %s's control.nacp", m->path));
+        } else if (i == 2 && size) {
+            m->romfs_offset = m->image_size + off;
+            m->romfs_size = size;
         }
-        m->nro_asset = asset;
-        m->nro_asset_size = (size_t)asset_size;
     }
     return 0;
 }
 
+/* only the image and the control.nacp come into memory: an NRO's RomFS can make it gigabytes */
 int snx_load_nro(const char* path, SnxModuleImage* module, char* error, size_t error_size) {
-    size_t file_size = 0;
+    unsigned char header[NRO_HEADER_SIZE];
+    SnxU64 file_size;
+    FILE* file;
+    int rc;
     memset(module, 0, sizeof(*module));
     set_names(module, "main", path);
-    module->image = snx_read_file(path, &file_size);
-    if (!module->image) {
+    file = snx_fopen(path, "rb");
+    if (!file) {
         snx_free_module(module);
         return fail(error, error_size, snx_format("cannot read %s", path));
     }
-    if (decode_nro(module, file_size, error, error_size) || read_metadata(module, 1, error, error_size)) {
+    file_size = snx_file_size(path);
+    if (fread(header, 1, sizeof header, file) != sizeof header && file_size >= sizeof header)
+        rc = fail(error, error_size, snx_format("cannot read %s", path));
+    else
+        rc = decode_nro(module, header, file_size, error, error_size);
+    if (!rc) {
+        module->image = (unsigned char*)snx_alloc(module->image_size);
+        memcpy(module->image, header, sizeof header);
+        if (fread(module->image + sizeof header, 1, module->image_size - sizeof header, file) !=
+            module->image_size - sizeof header)
+            rc = fail(error, error_size, snx_format("cannot read %s", path));
+    }
+    if (!rc)
+        rc = read_nro_assets(module, file, file_size, error, error_size) ||
+             read_metadata(module, 1, error, error_size);
+    fclose(file);
+    if (rc) {
         snx_free_module(module);
         return -1;
     }
@@ -1012,13 +1039,12 @@ static int load_nro_program(const char* entry, SnxProgram* program, char* error,
         return fail(error, error_size, snx_strdup("modules exceed guest address space"));
     default_npdm(&program->npdm);
     set_paths(program, entry, NULL, NULL, NULL);
-    program->romfs_data = m->romfs_data;
+    program->romfs_offset = m->romfs_offset;
     program->romfs_size = m->romfs_size;
-    if (m->nacp_size) {
-        program->nacp = (unsigned char*)snx_alloc(m->nacp_size);
-        memcpy(program->nacp, m->nacp_data, m->nacp_size);
-        program->nacp_size = m->nacp_size;
-    }
+    program->nacp = m->nacp_data; /* the program's from here */
+    program->nacp_size = m->nacp_size;
+    m->nacp_data = NULL;
+    m->nacp_size = 0;
     return 0;
 }
 

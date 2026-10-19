@@ -265,9 +265,11 @@ int main(void) {
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_START) == 0);
     CHECK(gamepad_button(SDL_GetJoystickID(xbox), SDL_GAMEPAD_BUTTON_EAST) == B);
     SDL_SetJoystickVirtualAxis(xbox, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MAX);
-    CHECK(buttons() == (1ull << 7) && (gamepad_held() & 1u << SNX_PAD_LT)); /* R */
+    CHECK(buttons() == (1ull << 7) && (gamepad_held(-1) & 1u << SNX_PAD_LT)); /* R */
+    /* the Xbox pad's, not the next one's */
+    CHECK(gamepad_held(0) == 1u << SNX_PAD_LT && !gamepad_held(1));
     SDL_SetJoystickVirtualAxis(xbox, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MIN);
-    CHECK(buttons() == 0 && !gamepad_held());
+    CHECK(buttons() == 0 && !gamepad_held(-1) && !gamepad_held(0));
     CHECK(gamepad_ini("gamepad_swap_ab", "1"));
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_SOUTH) == B);
     CHECK(with(xbox, SDL_GAMEPAD_BUTTON_EAST) == A);
@@ -311,9 +313,19 @@ int main(void) {
     pump();
     CHECK(with(fifth, SDL_GAMEPAD_BUTTON_EAST) == A);
     CHECK(!strcmp(gamepad_name(0), SDL_GetJoystickName(xbox)) && !strcmp(gamepad_name(3), SDL_GetJoystickName(fifth)));
+    /* a player's pad by its slot, as the menu's button map draws it: none where one left */
+    CHECK(gamepad_of_player(0) == 0 && gamepad_of_player(2) == -1 && gamepad_of_player(4) == 3);
+    CHECK(gamepad_of_player(5) == -1 && gamepad_of_player(-1) == -1 && gamepad_of_player(SNX_GAMEPADS) == -1);
+    SDL_SetJoystickVirtualButton(fifth, SDL_GAMEPAD_BUTTON_EAST, true);
+    CHECK(buttons() == A && gamepad_held(3) == 1u << SNX_PAD_EAST && !gamepad_held(0));
+    SDL_SetJoystickVirtualButton(fifth, SDL_GAMEPAD_BUTTON_EAST, false);
+    CHECK(buttons() == 0 && !gamepad_held(3));
+    SDL_SetJoystickVirtualButton(pro, SDL_GAMEPAD_BUTTON_EAST, true); /* held as it goes: nothing held after */
+    CHECK(buttons() == A && gamepad_held(-1) == 1u << SNX_PAD_EAST);
     SDL_DetachVirtualJoystick(SDL_GetJoystickID(pro));
     pump();
     CHECK(!strcmp(gamepad_name(2), SDL_GetJoystickName(fifth)) && !gamepad_name(3));
+    CHECK(buttons() == 0 && !gamepad_held(-1));
 
     /* SDL's left and right Joy-Con sensors take precedence over a primary sensor. The guest receives g and rad/s. */
     motion = attach_motion();

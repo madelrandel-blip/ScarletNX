@@ -34,6 +34,7 @@
 // - no images, samplers or floating point: the layer covers the integer compute shaders the tests need.
 #ifndef SNX_TESTS_GLSL_HPP
 #define SNX_TESTS_GLSL_HPP
+#include <atomic>
 #include <barrier>
 #include <cstdint>
 #include <thread>
@@ -244,6 +245,10 @@ struct Invocation {
     uvec3 gl_NumWorkGroups, gl_WorkGroupSize, gl_WorkGroupID, gl_LocalInvocationID, gl_GlobalInvocationID;
     uint gl_LocalInvocationIndex;
 };
+
+// the atomic read-modify-writes on a buffer's word (GLSL 4.60 section 8.11), which return the old value
+inline uint atomicAnd(uint& mem, uint data) { return std::atomic_ref<uint>(mem).fetch_and(data); }
+inline uint atomicOr(uint& mem, uint data) { return std::atomic_ref<uint>(mem).fetch_or(data); }
 
 // runs main() of every invocation of groups workgroups of local_size each, in order. setup(shader) fills in each
 // invocation's push constants and buffers before it runs

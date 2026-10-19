@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* Synthetic NRO -> CLI -> module -> AOT/interpreter execution. No game data.
-   A fourth argument names the backend (llvm by default, gcc). */
+/* Synthetic NRO -> CLI -> module -> AOT execution, and an --interp-only module that holds no code (the runtime JIT
+   compiles all of it: modules carry no interpreter any more). No game data. */
 #include "common/utilities/common.h"
 #include "common/cpu/aarch64/cpu.h"
 #include "nx/loader/module_abi.h"
@@ -38,7 +38,6 @@ static void check_empty(const char* dir) {
     check(!snx_list_dir(dir, &names, &count) && !count, "temporary build directory cleaned up");
     snx_free_strings(names, count);
 }
-static const char* backend;
 static void check_sources(const char* dir, const char* suffix) {
     char** names = NULL;
     size_t count = 0, i, len;
@@ -59,6 +58,12 @@ static void undefined(CPU* c, u64 pc, u32 word) {
     (void)pc;
     (void)word;
     check(0, "unexpected UNDEF");
+}
+/* RtAPI.miss: every function of the fixture is found, so none is missed */
+static void unexpected_miss(CPU* c, u64 pc) {
+    (void)pc;
+    check(0, "unexpected miss");
+    c->pc = 0;
 }
 static void execute_module(const char* path, const unsigned char* image, int interp) {
     typedef const SnxModule* (*ModuleFn)(void);
@@ -83,10 +88,13 @@ static void execute_module(const char* path, const unsigned char* image, int int
     if (!get) goto done;
     mod = get();
     check(mod->abi == SNX_ABI && mod->nmods == 1, "module ABI/metadata");
-    check(interp ? mod->nentries == 0 : mod->nentries >= 1, "AOT/interpreter entry tables");
+    check(interp ? mod->nentries == 0 : mod->nentries >= 1, "AOT/--interp-only entry tables");
+    check(!mod->interp, "no interpreter in the module");
+    if (interp) goto done; /* nothing in it to run */
     memset(&cpu, 0, sizeof(cpu));
     memset(&rt, 0, sizeof(rt));
     rt.undef = undefined;
+    rt.miss = unexpected_miss;
     cpu.rt = &rt;
     cpu.code_lo = mod->code_lo;
     cpu.code_hi = mod->code_hi;
@@ -96,12 +104,8 @@ static void execute_module(const char* path, const unsigned char* image, int int
     if (cpu.mem && cpu.disp) {
         memcpy(cpu.mem + mod->mods[0].base, image, 0x200);
         for (i = 0; i < mod->nentries; ++i) cpu.disp[(mod->entry_addr[i] - mod->code_lo) / 4] = mod->entry_fn[i];
-        if (interp)
-            mod->interp(&cpu, mod->mods[0].base);
-        else {
-            check(cpu.disp[0] != NULL, "entry point discovered");
-            if (cpu.disp[0]) cpu.disp[0](&cpu, mod->mods[0].base);
-        }
+        check(cpu.disp[0] != NULL, "entry point discovered");
+        if (cpu.disp[0]) cpu.disp[0](&cpu, mod->mods[0].base);
         check(cpu.x[0] == 42 && cpu.pc == 0, "MOV/ADD/RET result");
     }
     free(cpu.mem);
@@ -114,8 +118,7 @@ done:
 #endif
 }
 #ifdef __linux__
-/* The module imports nothing (link.h; gcc: -nostdlib): no library and no undefined symbol, so linking it took none of
-   the start files and libraries of the GCC libgccjit was built with, which a packaged libgccjit's system lacks */
+/* The module imports nothing (link.h): no library and no undefined symbol */
 static void check_no_imports(const char* path) {
     size_t size = 0, i, j;
     unsigned char* file = snx_read_file(path, &size);
@@ -155,8 +158,7 @@ int main(int argc, char** argv) {
     char *cached, *source, *nested, *temp, *build;
     size_t cached_size;
     int rc, pass, k;
-    if (argc != 4 && argc != 5) return 2;
-    backend = argc == 5 ? argv[4] : "llvm";
+    if (argc != 4) return 2;
     root = snx_temp_dir(NULL);
     check(root != NULL, "temp fixture");
     if (!root) return 1;
@@ -201,8 +203,6 @@ int main(int argc, char** argv) {
         args[k++] = "Native Fixture";
         args[k++] = "--outdir";
         args[k++] = out;
-        args[k++] = "--backend";
-        args[k++] = backend;
         args[k++] = "--runtime";
         args[k++] = self;
         args[k++] = "--jobs";
@@ -217,7 +217,7 @@ int main(int argc, char** argv) {
         if (pass == 4)
             check(rc != 0, "link output replacement failure");
         else
-            check(!rc, pass == 2 ? "interpreter CLI build" : "AOT CLI build");
+            check(!rc, pass == 2 ? "--interp-only CLI build" : "AOT CLI build");
         data_file = snx_path_join(out, "Native Fixture/Native Fixture.abi");
         check(snx_is_file(data_file) == !rc, "ABI checkpoint published only after a successful build");
         if (!rc) { /* what the driver takes for this build's: the ABI and the commit */
@@ -237,7 +237,7 @@ int main(int argc, char** argv) {
         }
         check_empty(temp);
         if (pass == 5)
-            check_sources(build, !strcmp(backend, "llvm") ? ".ll" : ".c"); /* gcc: libgccjit's dump */
+            check_sources(build, ".ll");
         else
             check(!snx_is_dir(build), "no persistent build directory by default");
         free(text);
@@ -298,6 +298,14 @@ int main(int argc, char** argv) {
         free(text);
         text = NULL;
     }
+    { /* the help names the level a recompile takes without -O (its line ends in \r\n on Windows) */
+        const char* help[] = {argv[1], "--repo", argv[2], "-r", "--help", NULL};
+        check(!snx_run(help, root, NULL, &text) &&
+                  strstr(text, "-O LEVEL               Optimization: 0,1,2,3,s,z (default: 2)"),
+              "-O's default in the help");
+        free(text);
+        text = NULL;
+    }
     { /* no name given: the name the NRO's control.nacp gives it, shown as it is recompiled and in its settings' head,
          its control.nacp in its data for the launcher; its files by the file's name, as an NRO has no title ID */
         static unsigned char named[0x200 + 0x40 + 0x300];
@@ -347,30 +355,6 @@ int main(int argc, char** argv) {
     check(snx_run(args, root, NULL, &text) != 0, "reject zero jobs");
     free(text);
     text = NULL;
-#ifndef _WIN32 /* a Windows child without PATH can't load libgccjit's DLLs, which are in the toolchain's folder */
-    if (!strcmp(backend, "gcc")) { /* without binutils it says so, where GCC's driver would end the process */
-        char* path = getenv("PATH") ? snx_strdup(getenv("PATH")) : NULL;
-        k = 0;
-        args[k++] = argv[1];
-        args[k++] = "--repo";
-        args[k++] = argv[2];
-        args[k++] = "-r";
-        args[k++] = input;
-        args[k++] = "--outdir";
-        args[k++] = out;
-        args[k++] = "--backend";
-        args[k++] = "gcc";
-        args[k] = NULL;
-        environment("PATH", "");
-        rc = snx_run(args, root, NULL, &text);
-        environment("PATH", path);
-        check(rc != 0 && text && strstr(text, "PATH has no as and ld: install binutils"), "missing binutils named");
-        check_empty(temp);
-        free(path);
-        free(text);
-        text = NULL;
-    }
-#endif
     source = snx_path_join(root, "copy source");
     nested = snx_path_join(source, "nested/output");
     check(!snx_mkdirs(source), "copy source fixture");

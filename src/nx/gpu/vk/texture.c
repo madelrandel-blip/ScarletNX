@@ -40,13 +40,30 @@ static u64 bl_level_size(u32 w, u32 h, u32 d, const VkFmt* f, u32 bh, u32 bd, u3
 /* bytes from one layer of a block-linear texture to the next: all its levels, aligned to a block of GOBs that is
    shrunk for a small base level (Ryujinx's AlignLayerSize) */
 static u64 bl_layer_size(u32 w, u32 h, u32 d, const VkFmt* f, u32 bh, u32 bd, u32 levels) {
+    /* the sizes asked last, by shape: every lookup of a texture asks this, and it costs divisions by the block size
+       over each level, the levels' block sizes each a loop of its own */
+    static struct {
+        u32 w, h, d, bh, bd, levels, fbw, fbh, fbpp;
+        u64 sz;
+    } memo[256];
+    u32 m = (u32)(((((u64)w * 0x9E3779B1u) ^ h) * 0x85EBCA77u ^ ((u64)d << 20 | (u64)levels << 14 | bh << 8 | bd << 4) ^
+                   (u64)f->bpp << 24 ^ (u64)f->bw << 28 ^ (u64)f->bh << 32) *
+                      0x9E3779B97F4A7C15ull >>
+                  56);
+    if (memo[m].w == w && memo[m].h == h && memo[m].d == d && memo[m].bh == bh && memo[m].bd == bd &&
+        memo[m].levels == levels && memo[m].fbw == f->bw && memo[m].fbh == f->bh && memo[m].fbpp == f->bpp && w)
+        return memo[m].sz;
+    u32 w0 = w, h0 = h, d0 = d, bh0 = bh, bd0 = bd;
     u64 sz = 0;
     for (u32 l = 0; l < levels; l++) sz += bl_level_size(w, h, d, f, bh, bd, l, NULL, NULL);
     u32 gy = ((h + f->bh - 1) / f->bh + 7) / 8;
     while (bh > 0 && gy <= (1u << (bh - 1))) bh--;
     while (bd > 0 && d <= (1u << (bd - 1))) bd--;
     u64 al = 512ull << (bh + bd);
-    return (sz + al - 1) / al * al;
+    sz = (sz + al - 1) / al * al;
+    memo[m].w = w0, memo[m].h = h0, memo[m].d = d0, memo[m].bh = bh0, memo[m].bd = bd0, memo[m].levels = levels;
+    memo[m].fbw = f->bw, memo[m].fbh = f->bh, memo[m].fbpp = f->bpp, memo[m].sz = sz;
+    return sz;
 }
 
 /* one level of one layer, from guest bytes to tightly packed rows, converted when the format needs it */
@@ -150,15 +167,20 @@ static void astc_rows(void* ctx, u32 z, u32 y, u32 n, u8* out) {
 }
 
 static u32 g_tex_upload_gen;
-static u32 g_tex_inval_gen;
-void vk_tex_invalidate_all(void) { g_tex_inval_gen++; }
 /* the most staging one piece of a level takes: a bigger level is staged in bands of block rows of a slice, as no
    allocation may be bigger than g_vk.alloc_cap (memory.c) and its converted rows needn't all be in memory at once */
 #define TEX_BAND (64ull << 20)
 
 /* 1 when every subresource was copied; 0 when memory or staging ran out, and upload_valid keeps it for a retry */
+static u64 g_tex_uploads, g_tex_upload_bytes; /* for the stats line */
+void vk_tex_stats(u64* uploads, u64* bytes) {
+    *uploads = g_tex_uploads;
+    *bytes = g_tex_upload_bytes;
+}
 static int tex_upload(Surf* t) {
     const VkFmt* f = &t->f;
+    g_tex_uploads++;
+    g_tex_upload_bytes += t->size;
     t->upload_valid = 0;
     t->wgen = ++g_tex_upload_gen; /* even a new texture at a reused address invalidates an old target's copy */
     vk_render_end();              /* copies and clears happen outside rendering passes */
@@ -231,7 +253,7 @@ static int tex_upload(Surf* t) {
                         break;
                     }
                     if (nreg && (buf != regbuf || nreg + 2 > sizeof reg / sizeof reg[0])) {
-                        vkCmdCopyBufferToImage(cb, regbuf, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, nreg, reg);
+                        rec_CmdCopyBufferToImage(cb, regbuf, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, nreg, reg);
                         nreg = 0;
                     }
                     regbuf = buf;
@@ -261,7 +283,7 @@ static int tex_upload(Surf* t) {
         }
     }
 done:
-    if (nreg) vkCmdCopyBufferToImage(cb, regbuf, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, nreg, reg);
+    if (nreg) rec_CmdCopyBufferToImage(cb, regbuf, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, nreg, reg);
     return t->upload_valid = complete;
 }
 
@@ -442,7 +464,7 @@ static Surf* rt_crop(Surf* rt, u32 w, u32 h, const VkFmt* as) {
         r[1] = r[0];
         r[1].srcSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
         r[1].dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-        vkCmdCopyImage(cb, rt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        rec_CmdCopyImage(cb, rt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        rt->f.stencil ? 2 : 1, r);
         c->crop_gen = rt->wgen;
     }
@@ -470,6 +492,82 @@ static VkImageViewType tic_view_type(u32 type, u32 d) {
 
 static u32 g_bud_frame;
 static i64 g_bud;
+/* t, a texture found for a header: still as guest memory has it (re-uploaded where it changed), or NULL when its
+   upload failed. gva is its address */
+static Surf* tex_check(Surf* t, u64 gva) {
+    t->last_used = g_vk_present;
+    /* an upload that ran out of memory or staging (here, or a re-upload below) is tried again once a frame. A
+       texture is only returned whole */
+    if (!t->upload_valid) {
+        if (t->checked != g_vk_present) {
+            t->checked = g_vk_present;
+            tex_rehash(t);
+        }
+        if (!t->upload_valid) return NULL;
+    }
+    /* the GPU front end wrote its memory (DMA, I2M, 2D, compute results): checked now, whatever the schedule
+       below says, as writes within a frame have to show in the same frame. Not written: it still matches as of
+       now, so the next check asks only about later writes */
+    int fresh = 0;
+    if (gpu_mem_dirty_since(t->gw, gva, t->size)) {
+        fresh = 1;
+        if (tex_rehash(t)) t->stable = 0;
+    } else
+        t->gw = gpu_mem_generation();
+    /* the CPU's writes, once a frame and again after each submission or stream wait that can make new ones the
+       stream's to see (vk_ww_epoch): write tracking proves the memory unchanged without hashing its texels */
+    if (t->checked != g_vk_present || t->ww_epoch != vk_ww_epoch()) {
+        u32 wnow = vk_ww_now();
+        int wr = vk_written_since(gmem_ptr(gva, t->size), t->size, t->wseen);
+        int epoch = t->ww_epoch != vk_ww_epoch();
+        t->ww_epoch = vk_ww_epoch();
+        if (wr >= 0) {
+            t->checked = g_vk_present;
+            if (wr && !fresh) tex_rehash(t);
+            t->wseen = wnow + 1; /* this scan's marks are stamped with the clock after wnow */
+            return t->upload_valid ? t : NULL;
+        }
+        /* without it, hashed whole once in each epoch it is used in: what the CPU wrote before a submission or the end
+           of a stream wait reaches the next sample, as with write tracking. The frame's schedule below alone misses
+           that (the write and the sample come between two presents, and a headless run presents nothing). Expiring
+           every texture at the cache invalidation methods did it before, and isn't enough either: edenprobe rewrites
+           texels with only the sampler and header caches invalidated after, never the texture data cache */
+        if (epoch) {
+            t->checked = g_vk_present;
+            if (!fresh && tex_rehash(t)) t->stable = 0;
+            return t->upload_valid ? t : NULL;
+        }
+    }
+    /* without it: often at first, backing off while the texture stays the same, within a per-frame budget */
+    if (t->checked != g_vk_present && (i32)(g_vk_present - t->next_check) >= 0) {
+        if (g_bud_frame != g_vk_present) {
+            g_bud_frame = g_vk_present;
+            g_bud = 24 << 20;
+        }
+        if (t->stable >= 40 && t->size >= 16384 && (i32)(g_vk_present - t->tfull) < 120) {
+            t->checked = g_vk_present;
+            if (vk_sample_hash(gva, t->size) == t->shash) {
+                t->next_check = g_vk_present + 20 + ((u32)(gva >> 9) & 7);
+                return t->upload_valid ? t : NULL;
+            }
+            t->stable = 0;
+        }
+        if (g_bud > 0 || t->stable < 4) {
+            t->checked = g_vk_present;
+            g_bud -= (i64)(t->size >> (t->size > 65536 ? 1 : 0));
+            if (tex_rehash(t))
+                t->stable = 0;
+            else if (t->stable < 100000)
+                t->stable++;
+            if (t->stable >= 39 && t->size >= 16384) {
+                t->shash = vk_sample_hash(gva, t->size);
+                t->tfull = g_vk_present;
+            }
+            t->next_check = g_vk_present + (t->stable < 4 ? 4 : t->stable < 12 ? 8 : 20) + ((u32)(gva >> 9) & 3);
+        }
+    }
+    return t->upload_valid ? t : NULL;
+}
 static Surf* tex_from_tic(const u32* tic, int raw) {
     u64 gva = ((u64)(tic[2] & 0xFFFF) << 32) | tic[1];
     u32 hv = (tic[2] >> 21) & 7;
@@ -582,79 +680,11 @@ texture_from_memory:
             t->fkey != fkey || t->levels != levels || t->type != vt || t->bl != (u32)bl || t->bh != bh || t->bd != bd ||
             t->pitch != pitch || t->layer_size != stride)
             continue;
-        t->last_used = g_vk_present;
-        /* an upload that ran out of memory or staging (here, or a re-upload below) is tried again once a frame. A
-           texture is only returned whole */
-        if (!t->upload_valid) {
-            if (t->checked != g_vk_present) {
-                t->checked = g_vk_present;
-                tex_rehash(t);
-            }
-            if (!t->upload_valid) return NULL;
-        }
-        /* the GPU front end wrote its memory (DMA, I2M, 2D, compute results): checked now, whatever the schedule
-           below says, as writes within a frame have to show in the same frame. Not written: it still matches as of
-           now, so the next check asks only about later writes */
-        int fresh = 0;
-        int invalidated = t->tex_inval_gen != g_tex_inval_gen;
-        if (gpu_mem_dirty_since(t->gw, gva, t->size)) {
-            fresh = 1;
-            if (tex_rehash(t)) t->stable = 0;
-        } else
-            t->gw = gpu_mem_generation();
-        /* Invalidation also checks CPU writes within this frame. It does not imply every texture changed:
-           write tracking can prove its memory is unchanged without hashing all its texels. */
-        if (invalidated || t->checked != g_vk_present) {
-            u32 wnow = vk_ww_now();
-            int wr = vk_written_since(gmem_ptr(gva, t->size), t->size, t->wseen);
-            t->tex_inval_gen = g_tex_inval_gen;
-            if (wr >= 0) {
-                t->checked = g_vk_present;
-                if (wr && !fresh) tex_rehash(t);
-                t->wseen = wnow + 1; /* this scan's marks are stamped with the clock after wnow */
-                return t->upload_valid ? t : NULL;
-            }
-            /* Without write tracking an explicit invalidation must bypass the normal backoff. */
-            if (invalidated) {
-                if (!fresh && tex_rehash(t)) t->stable = 0;
-                t->checked = g_vk_present;
-                return t->upload_valid ? t : NULL;
-            }
-        }
-        /* without it: often at first, backing off while the texture stays the same, within a per-frame budget */
-        if (t->checked != g_vk_present && (i32)(g_vk_present - t->next_check) >= 0) {
-            if (g_bud_frame != g_vk_present) {
-                g_bud_frame = g_vk_present;
-                g_bud = 24 << 20;
-            }
-            if (t->stable >= 40 && t->size >= 16384 && (i32)(g_vk_present - t->tfull) < 120) {
-                t->checked = g_vk_present;
-                if (vk_sample_hash(gva, t->size) == t->shash) {
-                    t->next_check = g_vk_present + 20 + ((u32)(gva >> 9) & 7);
-                    return t->upload_valid ? t : NULL;
-                }
-                t->stable = 0;
-            }
-            if (g_bud > 0 || t->stable < 4) {
-                t->checked = g_vk_present;
-                g_bud -= (i64)(t->size >> (t->size > 65536 ? 1 : 0));
-                if (tex_rehash(t))
-                    t->stable = 0;
-                else if (t->stable < 100000)
-                    t->stable++;
-                if (t->stable >= 39 && t->size >= 16384) {
-                    t->shash = vk_sample_hash(gva, t->size);
-                    t->tfull = g_vk_present;
-                }
-                t->next_check = g_vk_present + (t->stable < 4 ? 4 : t->stable < 12 ? 8 : 20) + ((u32)(gva >> 9) & 3);
-            }
-        }
-        return t->upload_valid ? t : NULL;
+        return tex_check(t, gva);
     }
     if (!format_samples(f.vk)) return NULL;
     Surf* t = tex_create(gva, w, h, layers, d3, levels, vt, f, fkey, bl, bh, bd, pitch, stride);
     if (!t) return NULL;
-    t->tex_inval_gen = g_tex_inval_gen;
     /* this texture's levels in one layer; the layers before the last one take their whole stride */
     u64 sz = 0;
     for (u32 l = 0; l < levels; l++) sz += bl ? bl_level_size(w, h, d3, &f, bh, bd, l, NULL, NULL) : stride;
@@ -665,6 +695,7 @@ texture_from_memory:
     t->gw = gpu_mem_generation();
     t->hash = mem_hash(gva, t->size);
     t->checked = g_vk_present;
+    t->ww_epoch = vk_ww_epoch(); /* hashed in this epoch */
     t->next_check = g_vk_present + 4;
     return tex_upload(t) ? t : NULL;
 }
@@ -771,11 +802,11 @@ VkImageView vk_null_view(VkImageViewType type, int num) {
                     VK_ACCESS_2_TRANSFER_WRITE_BIT);
         VkImageSubresourceRange all = {vk_aspect(&s->f), 0, 1, 0, s->layers};
         if (num == 3) {
-            VkClearDepthStencilValue far = {1.0f, 0};
-            vkCmdClearDepthStencilImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far, 1, &all);
+            VkClearDepthStencilValue farthest = {1.0f, 0}; /* not far: windef.h defines it away */
+            rec_CmdClearDepthStencilImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &farthest, 1, &all);
         } else {
             VkClearColorValue z = {{0, 0, 0, 0}};
-            vkCmdClearColorImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &all);
+            rec_CmdClearColorImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &all);
         }
         vk_surf_use(cb, s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_SAMPLED_STAGES,
                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
@@ -959,7 +990,7 @@ static void copy_layers(VkCommandBuffer cb, Surf* s, Surf* t, u32 l, u32 dst, u3
         from.layerCount = count;
         VkImageCopy c = {
             .srcSubresource = from, .dstSubresource = to, .dstOffset = {0, 0, dz}, .extent = {w, h, z ? count : 1}};
-        vkCmdCopyImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        rec_CmdCopyImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        1, &c);
         return;
     }
@@ -967,7 +998,7 @@ static void copy_layers(VkCommandBuffer cb, Surf* s, Surf* t, u32 l, u32 dst, u3
                      .srcOffsets = {{0, 0, 0}, {(i32)vk_sc(w), (i32)vk_sc(h), 1}},
                      .dstSubresource = to,
                      .dstOffsets = {{0, 0, dz}, {(i32)w, (i32)h, dz + 1}}};
-    vkCmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+    rec_CmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                    &b, VK_FILTER_NEAREST);
 }
 
@@ -1022,7 +1053,7 @@ static void tex_take_drawn(Surf* t) {
                     vk_barrier(cb, mid, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_NONE, 0,
                                VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                    vkCmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mid,
+                    rec_CmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, mid,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
                     vk_barrier(cb, mid, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT,
                                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1032,7 +1063,7 @@ static void tex_take_drawn(Surf* t) {
                     VkImageCopy c = {.srcSubresource = all,
                                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                      .extent = {t->w, t->h, t->depth3d}};
-                    vkCmdCopyImage(cb, mid, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img,
+                    rec_CmdCopyImage(cb, mid, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
                     vk_defer_image(mid, mm, VK_NULL_HANDLE, VK_NULL_HANDLE); /* freed once the frame is done */
                 } else
@@ -1095,6 +1126,12 @@ static void tex_take_drawn(Surf* t) {
 }
 Surf* vk_tex_from_tic(const u32* tic) {
     Surf* t = tex_from_tic(tic, 0);
+    tex_take_drawn(t);
+    return t;
+}
+Surf* vk_tex_recheck(Surf* t) {
+    if (g_cs_any) vk_compute_mem_need(t->gva, t->layer_size * t->layers);
+    t = tex_check(t, t->gva);
     tex_take_drawn(t);
     return t;
 }

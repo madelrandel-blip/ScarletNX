@@ -69,6 +69,8 @@ if(WIN32 OR CMAKE_CROSSCOMPILING)
            (APPLE AND NOT CMAKE_SYSTEM_PROCESSOR AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
         # an iOS build names its architecture in CMAKE_OSX_ARCHITECTURES, CMAKE_SYSTEM_PROCESSOR being optional there
         set(snx_ffmpeg_arch aarch64)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64|ppc64le|powerpc64|powerpc64le)$")
+        set(snx_ffmpeg_arch ppc64)
     else()
         string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" snx_ffmpeg_arch)
     endif()
@@ -95,6 +97,18 @@ if(SNX_APPLE_FLAGS)
     # gets them too
     list(JOIN SNX_APPLE_FLAGS " " snx_ffmpeg_apple_flags)
     list(APPEND snx_ffmpeg_args "--extra-cflags=${snx_ffmpeg_apple_flags}" "--extra-ldflags=${snx_ffmpeg_apple_flags}")
+endif()
+if(SNX_TARGET_FLAGS)
+    # a Linux cross build's target and sysroot and the CPU baseline (cmake/cross.cmake), which configure does not get
+    # from --cc either
+    list(JOIN SNX_TARGET_FLAGS " " snx_ffmpeg_target_flags)
+    list(JOIN SNX_TARGET_LDFLAGS " " snx_ffmpeg_target_ldflags)
+    list(APPEND snx_ffmpeg_args "--extra-cflags=${snx_ffmpeg_target_flags}"
+         "--extra-ldflags=${snx_ffmpeg_target_flags} ${snx_ffmpeg_target_ldflags}")
+endif()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64|ppc64le|powerpc64|powerpc64le)$")
+    # configure's name for both byte orders; its AltiVec and VSX code is chosen by --cpu
+    list(APPEND snx_ffmpeg_args --cpu=power8)
 endif()
 if(CMAKE_CROSSCOMPILING)
     # configure builds a few helper programs for the machine doing the build, which needs its own C compiler

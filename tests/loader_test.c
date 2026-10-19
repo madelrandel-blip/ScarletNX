@@ -329,14 +329,14 @@ static void test_nro_npdm(void) {
     CHECK(!snx_load_program(path, &program, error, sizeof error));
     CHECK(program.module_count == 1 && program.modules[0].is_nro && !strcmp(program.modules[0].name, "main"));
     CHECK(program.modules[0].base == SNX_CODE_BASE && program.romfs_size == 5 &&
-          !memcmp(program.romfs_data, "ROMFS", 5));
+          !memcmp(file_bytes + program.romfs_offset, "ROMFS", 5));
     CHECK(program.npdm.stack == 0x100000 && program.npdm.prio == 44 && program.npdm.is64);
     CHECK(program.npdm.title_id == (((SnxU64)0x01000000UL << 32) | 0x1000));
     snx_free_program(&program);
     /* ASET is optional and never part of the executable mapping. */
     CHECK(!snx_write_file(path, file_bytes, 0x400));
     CHECK(!snx_load_nro(path, &m, error, sizeof error));
-    CHECK(!m.nro_asset_size && !m.romfs_size && m.image_size == 0x400 && m.size == 0x1000);
+    CHECK(!m.nacp_size && !m.romfs_size && m.image_size == 0x400 && m.size == 0x1000);
     snx_free_module(&m);
     for (i = 0; i < 0x80; ++i) {
         CHECK(!snx_write_file(path, file_bytes, i));

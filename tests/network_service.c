@@ -22,11 +22,13 @@ static void test_ipc_in(IpcCtx* c, u32 off, void* dst, u32 n) {
 #define ipc_in test_ipc_in
 #include "nx/hle/services/network/dns.c"
 #include "nx/hle/services/network/nifm.c"
+#include "nx/hle/hle.c"
+#include "fake_room.h"
 #undef ipc_in
 
 u8* g_mem;
 int g_verbose;
-int g_opt_network;
+int g_opt_network, g_opt_airplane;
 static unsigned test_checks, test_objects, test_kobjs;
 
 static void test_fail(const char* expression, int line) {
@@ -46,20 +48,20 @@ void logf_(int level, const char* format, ...) {
     (void)level;
     (void)format;
 }
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t size) {
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
     SvcObj* obj = calloc(1, sizeof *obj);
     CHECK(obj != NULL);
     obj->name = name;
     obj->dispatch = dispatch;
     obj->refs = 1;
-    if (size) obj->data = calloc(1, size);
     test_objects++;
     return obj;
 }
+#include "svcobj_data.h"
 void svcobj_unref(SvcObj* obj) {
     if (!obj || --obj->refs) return;
     if (obj->destroy) obj->destroy(obj);
-    free(obj->data);
+    test_svcobj_data_free(obj);
     free(obj);
     test_objects--;
 }
@@ -321,12 +323,60 @@ static void test_nifm(void) {
     svcobj_unref(nifm);
 }
 
+/* in an Eden room the console's connection is the room's: nifm gives its address and says wireless is on, with the
+   network option off; airplane mode takes both away */
+static void test_nifm_room(void) {
+    FakeRoom* room = fake_room_start();
+    SnxRoom* r;
+    SvcObj *nifm = new_nifm(), *g;
+    int why;
+    CHECK(snx_room_join(&r, "127.0.0.1", fake_room_port(room), "Aogo", "secret", "game", 1, "", &why) == 0);
+    network_set_room(r);
+    request(5);
+    ctx.has_pid = 1;
+    ctx.pid = K_PROCESS_ID;
+    CHECK(nifm->dispatch(nifm, &ctx) == 0 && ctx.nout_objs == 1);
+    g = ctx.out_objs[0];
+    request(12);                                                                     /* GetCurrentIpAddress */
+    CHECK(g->dispatch(g, &ctx) == 0 && ctx.out_size == 4 && reply(0) == 0x0101A8C0); /* 192.168.1.1 */
+    request(17); /* IsWirelessCommunicationEnabled */
+    CHECK(g->dispatch(g, &ctx) == 0 && reply(0) == 1);
+    g_opt_airplane = 1;
+    request(17);
+    CHECK(g->dispatch(g, &ctx) == 0 && reply(0) == 0);
+    request(12);
+    CHECK(g->dispatch(g, &ctx) == RC(110, 300));
+    g_opt_airplane = 0;
+    svcobj_unref(g);
+    svcobj_unref(nifm);
+    network_set_room(NULL);
+    snx_room_leave(r);
+    fake_room_stop(room);
+}
+
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+
 int main(void) {
+    hle_init();
     g_mem = calloc(1, 0x10000);
     CHECK(g_mem != NULL);
     network_init();
     snx_net_set_log(NULL);
     CHECK(!network_online());
+    /* airplane mode is offline with the network option on too: no connection, only the loopback reachable */
+    {
+        SnxSockAddr out = {SNX_AF_INET, 0, 0, {8, 8, 8, 8}, 0}, lo = {SNX_AF_INET, 0, 0, {127, 0, 0, 1}, 0};
+        g_opt_network = 1;
+        g_opt_airplane = 1;
+        CHECK(!network_online() && !network_reachable(&out) && network_reachable(&lo));
+        test_nifm();
+        g_opt_airplane = 0;
+        CHECK(network_reachable(&out));
+        g_opt_network = 0;
+    }
     SvcObj* r = new_sfdnsres();
     test_host_by_name(r);
     test_host_by_addr(r);
@@ -338,6 +388,7 @@ int main(void) {
     CHECK(r->dispatch(r, &ctx) == 0 && ctx.out_size == 8 && reply(0) == 0 && reply(4) == 0);
     svcobj_unref(r);
     test_nifm();
+    test_nifm_room();
     for (u32 i = 0; i < test_nhandles; i++) kobj_unref(&test_handles[i]->o);
     CHECK(test_objects == 0 && test_kobjs == 0);
     free(g_mem);

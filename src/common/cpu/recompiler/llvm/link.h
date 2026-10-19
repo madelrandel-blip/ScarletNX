@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The LLVM backend's linker: relocatable objects (as LLVM and Clang write them: x86-64 or AArch64 ELF on Unix and
-   Android, x86-64 COFF on Windows) into the game module the runtime loads, an ELF shared object or a PE DLL. The
-   module defines everything it uses (rtlib.c), so the linker resolves every symbol itself and writes no imports: only
+/* The LLVM backend's linker: relocatable objects (as LLVM and Clang write them: x86-64, AArch64 or PowerPC64 ELF on
+   Unix and Android, x86-64 COFF on Windows) into the game module the runtime loads, an ELF shared object or a PE DLL.
+   The module defines everything it uses (rtlib.c), so the linker resolves every symbol itself and writes no imports: only
    the relocations position-independent code needs (ELF R_*_RELATIVE, PE base relocations) and an export table */
 #ifndef SNX_RECOMPILER_LLVM_LINK_H
 #define SNX_RECOMPILER_LLVM_LINK_H
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct {
     const unsigned char* data;
@@ -46,5 +47,16 @@ typedef struct {
 int snx_link_find(const SnxLinkNames* names, const char* key, size_t* value);
 void snx_link_insert(SnxLinkNames* names, const char* key, size_t value);
 void snx_link_names_free(SnxLinkNames* names);
+
+/* The writes relocations come down to, shared by link_elf.c, link_coff.c and the JIT loader (code_loader.c):
+   little-endian fields, and a 32-bit PC-relative one that must reach its target. A relocation that cannot be written
+   gives SNX_LINK_RANGE (its value does not fit), SNX_LINK_OUTSIDE (its field is not inside its section),
+   SNX_LINK_UNSUPPORTED (a type the linkers do not know) or SNX_LINK_MISALIGNED (an AArch64 load or store offset that
+   its access size does not divide) */
+enum { SNX_LINK_RANGE = 1, SNX_LINK_OUTSIDE, SNX_LINK_UNSUPPORTED, SNX_LINK_MISALIGNED };
+void snx_link_put32(unsigned char* p, uint32_t value);
+void snx_link_put64(unsigned char* p, uint64_t value);
+/* target - place into the signed 32-bit field at p: 0, or SNX_LINK_RANGE with nothing written when it does not fit */
+int snx_link_rel32(unsigned char* p, uint64_t target, uint64_t place);
 
 #endif

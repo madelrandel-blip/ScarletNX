@@ -148,7 +148,7 @@ static int check_depth_array(void) {
         copies[layer].imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_DEPTH_BIT, 0, layer, 1};
         copies[layer].imageExtent = (VkExtent3D){1, 1, 1};
     }
-    vkCmdCopyImageToBuffer(cb, target->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 3, copies);
+    rec_CmdCopyImageToBuffer(cb, target->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 3, copies);
     vk_finish();
     vk_readback_ready();
     for (u32 layer = 0; layer < 3; layer++) {
@@ -216,7 +216,7 @@ static int check_srgb_write(void) {
         copies[i].imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, i, 1};
         copies[i].imageExtent = (VkExtent3D){1, 1, 1};
     }
-    vkCmdCopyImageToBuffer(cb, target->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 2, copies);
+    rec_CmdCopyImageToBuffer(cb, target->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 2, copies);
     vk_finish();
     vk_readback_ready();
     const u8 expected[8] = {128, 137, 137, 255, 188, 64, 64, 255};
@@ -350,7 +350,8 @@ static int check_direct_spirv(void) {
 }
 
 /* VIC through the compute shader: raw YUV and alpha, odd starts kept, luma-only NV12, an NV21 slot over the background
-   colour, the background with no slot, bytes outside the target and the slots untouched */
+   colour, the background with no slot, bytes outside the target and the slots untouched, a colour matrix, and NV12
+   rows that aren't word aligned (the shader's unaligned build) */
 static int check_vic(void) {
     enum { W = 32, H = 16, SENTINEL = 0xA5 };
     static u8 y[W * H], uv[W * H / 2], out[W * 4 * H];
@@ -363,12 +364,17 @@ static int check_vic(void) {
         }
     static const struct {
         u32 fmt, sx0, sy0, dx0, dy0, w, h; /* w 0: no slot */
-        u32 vu, tx0, ty0, tw, th;          /* an NV21 slot, the target rectangle the background fills */
-    } cases[] = {{0x1F, 0, 0, 0, 0, W, H, 0, 0, 0, 0, 0},
-                 {0x1F, 3, 1, 5, 3, 10, 7, 0, 0, 0, 0, 0},
-                 {0x44, 0, 0, 0, 0, W, H, 0, 0, 0, 0, 0},
-                 {0x1F, 3, 1, 5, 3, 10, 7, 1, 2, 1, 20, 12},
-                 {0x1F, 0, 0, 0, 0, 0, 0, 0, 4, 2, 6, 9}};
+        u32 vu, tx0, ty0, tw, th; /* an NV21 slot, the target rectangle the background fills (and the slot lies in, as
+                                     vic.c's slot_resolve clips it) */
+        u32 pad, mat;             /* bytes added to the output's pitch, the matrix below */
+    } cases[] = {{0x1F, 0, 0, 0, 0, W, H, 0, 0, 0, W, H, 0, 0},   {0x1F, 3, 1, 5, 3, 10, 7, 0, 5, 3, 10, 7, 0, 0},
+                 {0x44, 0, 0, 0, 0, W, H, 0, 0, 0, W, H, 0, 0},   {0x1F, 3, 1, 5, 3, 10, 7, 1, 2, 1, 20, 12, 0, 0},
+                 {0x1F, 0, 0, 0, 0, 0, 0, 0, 4, 2, 6, 9, 0, 0},   {0x20, 2, 2, 5, 3, 10, 7, 0, 2, 1, 20, 12, 0, 1},
+                 {0x44, 2, 2, 4, 2, 20, 9, 0, 2, 2, 26, 12, 1, 1}};
+    /* BT.601 limited range in the 10 bit domain, S12.8, with a shift of 1: out = ((Y*c0 + U*c1 + V*c2) >> 1 + c3) >> 8 */
+    static const int m601[3][4] = {{596, 0, 818, -(298 * 64 + 409 * 512)},
+                                   {596, -200, -416, -(298 * 64) + (100 + 208) * 512},
+                                   {596, 1032, 0, -(298 * 64 + 516 * 512)}};
     static const u32 bg[4] = {1023, 512, 0, 1023}; /* 8 bit 255, 128, 0, 255 */
     for (u32 c = 0; c < sizeof cases / sizeof cases[0]; ++c) {
         const int rgba = cases[c].fmt != 0x44;
@@ -379,7 +385,8 @@ static int check_vic(void) {
         job.fmt = cases[c].fmt;
         job.sw = W;
         job.sh = H;
-        job.oy = (VicPlane){out, (u64)W * bpp * H, W * bpp, H, 0, 0};
+        const u32 pitch = W * bpp + cases[c].pad;
+        job.oy = (VicPlane){out, (u64)pitch * H, pitch, H, 0, 0};
         job.tx0 = cases[c].tx0;
         job.ty0 = cases[c].ty0;
         job.tw = cases[c].tw;
@@ -395,26 +402,42 @@ static int check_vic(void) {
         sl->w = cases[c].w;
         sl->h = cases[c].h;
         sl->alpha = 0x3FF;
-        sl->clamp_hi = 0x3FF;
+        sl->clamp_lo = 64;
+        sl->clamp_hi = 0x3FF - 64;
+        sl->mat_enable = (int)cases[c].mat;
+        sl->mat_shift = 1;
+        memcpy(sl->mat, m601, sizeof m601);
         sl->iy = (VicPlane){y, sizeof y, W, H, 0, 0};
         sl->ic = (VicPlane){uv, sizeof uv, W, H / 2, 0, 0};
         CHECK(g_renderer->vic_compose(&job));
         for (u32 j = 0; j < H; ++j)
             for (u32 i = 0; i < W; ++i) {
-                const u8* o = out + (j * W + i) * bpp;
+                const u8* o = out + j * pitch + i * bpp;
                 const int in = i >= sl->dx0 && i < sl->dx0 + sl->w && j >= sl->dy0 && j < sl->dy0 + sl->h;
                 const int target = i >= job.tx0 && i < job.tx0 + job.tw && j >= job.ty0 && j < job.ty0 + job.th;
-                const u32 sx = sl->sx0 + i - sl->dx0, sy = sl->sy0 + j - sl->dy0;
+                const u32 rb = cases[c].fmt == 0x20 ? 2 : 0; /* A8R8G8B8 stores R and B the other way around */
                 if (!in && !target) {
                     CHECK(o[0] == SENTINEL);
-                } else if (!in) {
-                    CHECK(o[0] == 255 && o[1] == 128 && o[2] == 0 && o[3] == 255);
-                } else if (!rgba) {
-                    CHECK(o[0] == y[sy * W + sx]);
-                } else {
-                    const u8* p = uv + (sy / 2) * W + (sx & ~1u);
-                    CHECK(o[0] == y[sy * W + sx] && o[1] == p[sl->vu] && o[2] == p[1 - sl->vu] && o[3] == 255);
+                    continue;
                 }
+                if (!in) {
+                    CHECK(rgba ? o[rb] == 255 && o[1] == 128 && o[2 - rb] == 0 && o[3] == 255 : o[0] == 255);
+                    continue;
+                }
+                const u32 sx = sl->sx0 + i - sl->dx0, sy = sl->sy0 + j - sl->dy0;
+                const u8* p = uv + (sy / 2) * W + (sx & ~1u);
+                const int q[3] = {y[sy * W + sx] << 2, p[sl->vu] << 2, p[1 - sl->vu] << 2};
+                int v[3];
+                for (int k = 0; k < 3; ++k) {
+                    v[k] = q[k];
+                    if (!sl->mat_enable) continue;
+                    v[k] = (((q[0] * m601[k][0] + q[1] * m601[k][1] + q[2] * m601[k][2]) >> 1) + m601[k][3]) >> 8;
+                    v[k] = v[k] < 64 ? 64 : v[k] > 0x3FF - 64 ? 0x3FF - 64 : v[k];
+                }
+                if (!rgba)
+                    CHECK(o[0] == v[0] >> 2);
+                else
+                    CHECK(o[rb] == v[0] >> 2 && o[1] == v[1] >> 2 && o[2 - rb] == v[2] >> 2 && o[3] == 255);
             }
     }
     return 0;
@@ -445,7 +468,7 @@ int main(int argc, char** argv) {
     u32 epoch = g_vk_epoch;
     u64 finishes = g_vk_finishes;
     for (int kind = 0; kind <= 4; kind++) g_renderer->method_barrier(kind);
-    CHECK(g_vk_epoch == epoch + 2);   /* data and descriptor invalidation each expire cached reads */
+    CHECK(g_vk_epoch == epoch);       /* no barrier expires cached reads: their checks see writes (vkr_method_barrier) */
     CHECK(g_vk_finishes == finishes); /* method barriers order GPU work without forcing a host wait */
     printf("Headless Vulkan device: %s\n", g_vk.props.deviceName);
     /* Make any accidental WSI use during presents/recreation fail the test immediately. */
@@ -499,7 +522,7 @@ int main(int argc, char** argv) {
     free(root);
     free(shot);
     free(ppm);
-    puts("PASS headless Vulkan: viewport orientation, 3 VIC compositions, 8 cropped/transformed readbacks and PPMs, "
+    puts("PASS headless Vulkan: viewport orientation, 7 VIC compositions, 8 cropped/transformed readbacks and PPMs, "
          "no WSI");
     return 0;
 }

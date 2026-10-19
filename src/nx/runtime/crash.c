@@ -2,7 +2,11 @@
    Copyright 2026 the ScarletNX contributors */
 /* The crash report: what failed, where (the game's recompiled code or the runtime itself), on which thread and with
    which registers, then the end of the run. The crash handler calls it with the log in crash mode */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* dladdr, before any header */
+#endif
 #include "nx/runtime/main.h"
+#include "nx/hle/hle.h"
 #include "nx/hle/kernel/kernel.h"
 #include "nx/memory/mem.h"
 #include "nx/runtime/arm.h"
@@ -10,7 +14,12 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #if !defined(_WIN32)
+#include <dlfcn.h>
 #include <signal.h>
+#include <string.h>
+#if !defined(__ANDROID__)
+#include <execinfo.h>
+#endif
 #endif
 
 #if defined(__ELF__)
@@ -90,6 +99,36 @@ static void report_place(void* host_pc) {
         }
     }
 #endif
+#if !defined(_WIN32)
+    /* a library's: which one, at an offset addr2line takes, and the host frames that led there */
+    {
+        Dl_info di;
+        int found = dladdr(host_pc, &di) && di.dli_fbase;
+        if (found) {
+            const char* name =
+                di.dli_fname && strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
+            WARN("  in %s +%llx (%s), on %s\n", name ? name : "?",
+                 (unsigned long long)((const u8*)host_pc - (const u8*)di.dli_fbase), di.dli_sname ? di.dli_sname : "?",
+                 kthread_cur() ? "a game thread" : "one of the runtime's threads");
+        }
+#if !defined(__ANDROID__) && !defined(__FreeBSD__) /* Android's libc has dladdr but not backtrace */
+        {
+            void* bt[24];
+            int n = backtrace(bt, 24);
+            logf_(0, "  host frames:");
+            for (int i = 0; i < n; i++)
+                if (dladdr(bt[i], &di) && di.dli_fbase)
+                    logf_(0, " %s+%llx",
+                          di.dli_fname && strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : "?",
+                          (unsigned long long)((const u8*)bt[i] - (const u8*)di.dli_fbase));
+                else
+                    logf_(0, " %p", bt[i]);
+            logf_(0, "\n");
+        }
+#endif
+        if (found) return;
+    }
+#endif
     WARN("  outside the game's code and the runtime (a library's)\n");
 }
 
@@ -115,7 +154,7 @@ void crash_report(void* host_pc, void* fault, int sig) {
     report_place(host_pc);
     /* the low pages are never mapped: a pointer the game failed to get (an allocation it ran out of memory for) plus
        a field's offset lands there */
-    if (fault && in_guest && guest < ((u64)16 << 20) && g_opt_mem_gb < 6)
+    if (fault && in_guest && guest < ((u64)16 << 20) && g_hle.svcmem.opt_mem_gb < 6)
         WARN("  a null pointer plus an offset: a game short of memory does this, memory_gb=6 in its .ini may help\n");
     if (t) {
         WARN("  thread %llu (%s)\n", (unsigned long long)t->id, t->name);

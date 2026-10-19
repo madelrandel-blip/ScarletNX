@@ -118,8 +118,8 @@ merely from execution without an undefined-instruction exception.
    `0xf800009f`. This follows the TRM, rather than the more permissive Unicorn
    register implementation. Direct specification witnesses test readback.
 
-`SNX_ABI` is **7**. Rebuild the runtime and regenerate game modules; stale AOT
-code must not retain the old decoder/operation semantics.
+`SNX_ABI` is **10** (9 added `RtAPI.svcs`, and 10 moved the dispatch miss to `RtAPI.miss`). Rebuild the runtime and regenerate game modules;
+stale AOT code must not retain the old decoder/operation semantics.
 
 ## Remaining base-instruction failures
 

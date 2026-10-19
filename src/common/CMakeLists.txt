@@ -2,8 +2,8 @@
 # Copyright 2026 the ScarletNX contributors
 add_library(scarletnx-common STATIC
     utilities/common.c utilities/process.c utilities/font.c utilities/ini_lines.c utilities/pad_map.c
-    utilities/pad_screen.c
-    cpu/aarch64/a64.c cpu/recompiler/codegen.c cpu/recompiler/backend.c cpu/execution/execution.c)
+    utilities/pad_screen.c utilities/users.c
+    cpu/aarch64/a64.c cpu/recompiler/codegen.c cpu/execution/execution.c)
 target_compile_definitions(scarletnx-common PRIVATE _CRT_SECURE_NO_WARNINGS
     SNX_HOST_COMPILER="${CMAKE_C_COMPILER}"
     SNX_CPU_INCLUDE="${CMAKE_CURRENT_SOURCE_DIR}/cpu/aarch64"
@@ -34,4 +34,12 @@ if(WIN32)
     target_link_libraries(scarletnx-net PUBLIC ws2_32 iphlpapi)
 elseif(APPLE) # the system resolver's DNS servers (network/net_iface.c)
     target_link_libraries(scarletnx-net PUBLIC resolv)
+endif()
+
+# Local wireless for nx's ldn and bsd (network/net_ldn.h): over the LAN, or through an Eden room (network/net_room.h),
+# which is ENet and zstd, fetched for the NX build and the tests
+if(TARGET snx_enet)
+    add_library(scarletnx-ldn STATIC network/net_ldn.c network/net_room.c)
+    target_compile_options(scarletnx-ldn PRIVATE -fno-strict-aliasing -Wall -Wextra -Werror=missing-prototypes)
+    target_link_libraries(scarletnx-ldn PUBLIC scarletnx-net PRIVATE snx_enet snx_zstd)
 endif()

@@ -1088,8 +1088,10 @@ static void write_inc(int fi, const char* out_dir) {
             if (!cmds[j].stub) emit_prototype(f, &cmds[j], ";\n");
         if (strcmp(f->fallback, "stub_ok") && strcmp(f->fallback, "quiet_ok") && strcmp(f->fallback, "ipc_unknown"))
             emit("static int %s(SvcObj* self, IpcCtx* c); /* the commands it doesn't declare */\n", f->fallback);
-        emit("/* an object of this interface, with data_size bytes of zeroed data */\n");
-        emit("#define %s_new(data_size) svcobj_new(\"%s\", %s_dispatch, (data_size))\n", cn, f->name, cn);
+        emit("/* an object of this interface, and one whose data is a slot of the pool arr (SVCOBJ_NEW_DATA) */\n");
+        emit("#define %s_new() svcobj_new(\"%s\", %s_dispatch)\n", cn, f->name, cn);
+        emit("#define %s_new_data(arr, next, what) SVCOBJ_NEW_DATA(\"%s\", %s_dispatch, arr, next, what)\n", cn,
+             f->name, cn);
         for (j = f->cmd0; j < f->cmd0 + f->ncmds; j++)
             if (!cmds[j].stub && cmds[j].nargs) emit_unpacker(f, &cmds[j]);
         emit("int %s_dispatch(SvcObj* self, IpcCtx* c) {\n    switch (c->cmd) {\n", cn);

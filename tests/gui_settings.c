@@ -9,6 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 /* as scarletnx --settings prints them, and a line of something else, an older runtime's of seven fields, values with
    one missing its word, a Windows line end and no last one */
@@ -61,17 +65,17 @@ int main(int argc, char** argv) {
     GuiSettings s = {0};
     GuiEditor form;
     const char* options[64];
-    int fullscreen, touch, gcc, stub, prepared, launch, page, all;
+    int fullscreen, touch, stub, tmpfs, launch, page, all;
     assert(!gui_settings_read(&s, list));
 
     /* the launcher's two, then a row a setting in the list's order, the other line left out; a page's row and its
        All before its settings */
-    assert(s.count == GUI_SETTINGS_OWN + 15 && !strcmp(s.keys[0].key, "libgccjit") &&
-           !strcmp(s.keys[1].key, "gdbstub"));
-    assert(!strcmp(s.keys[0].section, "Launch") && words(&s.keys[0]) == 1 + SNX_GUI_HAS_GCCJIT);
-    assert(!strcmp(s.keys[0].about, SNX_GUI_HAS_GCCJIT ? "libgccjit will be used instead of llvm"
-                                                       : "Program was not compiled with libgccjit"));
-    assert(!strcmp(s.keys[1].about, "Enables gdbstub on port 1234") && words(&s.keys[1]) == 2);
+    assert(s.count == GUI_SETTINGS_OWN + 15 && !strcmp(s.keys[0].key, "gdbstub"));
+    assert(!strcmp(s.keys[0].section, "Launch") && !strcmp(s.keys[0].about, "Enables gdbstub on port 1234") &&
+           words(&s.keys[0]) == 2);
+    /* shown by its name, kept by its key */
+    assert(!strcmp(s.keys[1].section, "Launch") && !strcmp(s.keys[1].key, "Extract to tmpfs") &&
+           !strcmp(s.values[1].key, "tmpfs") && words(&s.keys[1]) == 2 && strstr(s.keys[1].about, "RomFS"));
     assert(!strcmp(s.keys[2].section, "Display") && !strcmp(s.keys[2].key, "docked"));
     assert(!strcmp(s.keys[2].about, "1 = TV mode") && !strcmp(key(&s, "fullscreen")->about, "1 = start in fullscreen"));
     assert(!strcmp(s.keys[s.count - 1].key, "log") && !strcmp(s.keys[s.count - 1].about, "Log detail"));
@@ -113,7 +117,7 @@ int main(int argc, char** argv) {
     assert(gui_settings_set(&s, "old", "0.5 0.5 100 1") && gui_settings_set(&s, "language", ""));
     assert(!gui_settings_value(&s, "language") && !gui_settings_set(&s, "nothing", "1"));
     assert(!gui_settings_set(&s, "Buttons", ">") && !gui_settings_set(&s, "All", ".ini"));
-    assert(gui_settings_options(&s, 1, 0, options) == 2 && !strcmp(options[0], "--old=0.5 0.5 100 1"));
+    assert(gui_settings_options(&s, 1, options) == 2 && !strcmp(options[0], "--old=0.5 0.5 100 1"));
     assert(!strcmp(options[1], "--touch=1"));
     assert(gui_settings_set(&s, "touch", ".ini") && gui_settings_set(&s, "old", ""));
 
@@ -128,7 +132,7 @@ int main(int argc, char** argv) {
     assert(gui_settings_step_all(&s, all, -1) && !strcmp(shown(&s, "All"), ".ini"));
     assert(gui_settings_step_all(&s, all, 0) && gui_settings_step_all(&s, all, 0) &&
            !strcmp(shown(&s, "All"), "Shown"));
-    assert(gui_settings_options(&s, 0, 0, options) == 2 && !strcmp(options[0], "--controls_a_shown=1"));
+    assert(gui_settings_options(&s, 0, options) == 2 && !strcmp(options[0], "--controls_a_shown=1"));
     /* the page's row, or its All, back to where they started: its rows */
     gui_settings_mark(&s);
     gui_settings_step_all(&s, all, 1);
@@ -149,43 +153,37 @@ int main(int argc, char** argv) {
     assert(!strcmp(gui_settings_value(&s, "fullscreen"), "1"));
     gui_editor_stop(&form);
 
-    /* a run's options: --key=value for each pick in the list's order; the launcher's own with launch, the compiler
-       only for what is not a game from games/ already */
+    /* a run's options: --key=value for each pick in the list's order; the launcher's own with launch */
     for (fullscreen = 0; fullscreen < 3; ++fullscreen)
         for (touch = 0; touch < 4; ++touch)
-            for (gcc = 0; gcc < 2; ++gcc)
-                for (stub = 0; stub < 2; ++stub)
-                    for (prepared = 0; prepared < 2; ++prepared)
-                        for (launch = 0; launch < 2; ++launch) {
-                            static const char* const picks[] = {".ini", "0", "1", "2"};
-                            size_t n, i = 0;
-                            char want[32];
-                            assert(gui_settings_set(&s, "fullscreen", picks[fullscreen]));
-                            assert(gui_settings_set(&s, "touch", picks[touch]));
-                            assert(gui_settings_set(&s, "libgccjit", gcc ? "on" : "off") ==
-                                   (!gcc || SNX_GUI_HAS_GCCJIT));
-                            assert(gui_settings_set(&s, "gdbstub", stub ? "on" : "off"));
-                            /* what R's recompile takes, alone */
-                            assert(gcc && SNX_GUI_HAS_GCCJIT ? !strcmp(gui_settings_backend(&s), "--backend=gcc")
-                                                             : !gui_settings_backend(&s));
-                            n = gui_settings_options(&s, launch, prepared, options);
-                            assert(n <= (size_t)s.count + 1);
-                            if (fullscreen) {
-                                snprintf(want, sizeof want, "--fullscreen=%s", picks[fullscreen]);
-                                assert(i < n && !strcmp(options[i++], want));
-                            }
-                            if (touch) {
-                                snprintf(want, sizeof want, "--touch=%s", picks[touch]);
-                                assert(i < n && !strcmp(options[i++], want));
-                            }
-                            if (launch && gcc && SNX_GUI_HAS_GCCJIT && !prepared)
-                                assert(i < n && !strcmp(options[i++], "--backend=gcc"));
-                            if (launch && stub) {
-                                assert(i < n && !strcmp(options[i++], "-S"));
-                                assert(i < n && !strcmp(options[i++], "-s"));
-                            }
-                            assert(i == n);
+            for (stub = 0; stub < 2; ++stub)
+                for (tmpfs = 0; tmpfs < 2; ++tmpfs)
+                    for (launch = 0; launch < 2; ++launch) {
+                        static const char* const picks[] = {".ini", "0", "1", "2"};
+                        size_t n, i = 0;
+                        char want[32];
+                        assert(gui_settings_set(&s, "fullscreen", picks[fullscreen]));
+                        assert(gui_settings_set(&s, "touch", picks[touch]));
+                        assert(gui_settings_set(&s, "gdbstub", stub ? "on" : "off"));
+                        assert(gui_settings_set(&s, "tmpfs", tmpfs ? "on" : "off"));
+                        assert(tmpfs ? !strcmp(gui_settings_tmpfs(&s), "--tmpfs") : !gui_settings_tmpfs(&s));
+                        n = gui_settings_options(&s, launch, options);
+                        assert(n <= (size_t)s.count + 1);
+                        if (fullscreen) {
+                            snprintf(want, sizeof want, "--fullscreen=%s", picks[fullscreen]);
+                            assert(i < n && !strcmp(options[i++], want));
                         }
+                        if (touch) {
+                            snprintf(want, sizeof want, "--touch=%s", picks[touch]);
+                            assert(i < n && !strcmp(options[i++], want));
+                        }
+                        if (launch && tmpfs) assert(i < n && !strcmp(options[i++], "--tmpfs"));
+                        if (launch && stub) {
+                            assert(i < n && !strcmp(options[i++], "-S"));
+                            assert(i < n && !strcmp(options[i++], "-s"));
+                        }
+                        assert(i == n);
+                    }
     gui_settings_free(&s);
 
     /* kept in a file of the game's sections and keys: what changed from where the rows started, read back over a
@@ -204,7 +202,7 @@ int main(int argc, char** argv) {
         assert(text &&
                strstr(text, "\n[Launch]\ngdbstub=on\n[Display]\nfullscreen=.ini\nlanguage=3\n"
                             "[On-screen controls]\ntouch=2\n[On-screen controls/Buttons]\ncontrols_b_shown=0\n"));
-        assert(!strstr(text, "log=") && !strstr(text, "docked") && !strstr(text, "libgccjit") && !strstr(text, "All"));
+        assert(!strstr(text, "log=") && !strstr(text, "docked") && !strstr(text, "All"));
         free(text);
         gui_settings_free(&s);
         assert(!gui_settings_read(&s, list) && gui_settings_set(&s, "fullscreen", "0"));
@@ -213,13 +211,13 @@ int main(int argc, char** argv) {
         assert(!strcmp(gui_settings_value(&s, "gdbstub"), "on") && !strcmp(gui_settings_value(&s, "language"), "3"));
         assert(!gui_settings_value(&s, "fullscreen") && !strcmp(gui_settings_value(&s, "touch"), "2"));
         assert(!gui_settings_value(&s, "log") && !strcmp(gui_settings_value(&s, "controls_b_shown"), "0"));
-        assert(!strcmp(shown(&s, "All"), "Mixed") && gui_settings_options(&s, 1, 0, options) == 5);
+        assert(!strcmp(shown(&s, "All"), "Mixed") && gui_settings_options(&s, 1, options) == 5);
         /* a row back to where it started, then every one */
         gui_settings_reset(&s, at(&s, "language"));
         assert(!gui_settings_value(&s, "language") && !strcmp(gui_settings_value(&s, "touch"), "2"));
         gui_settings_reset(&s, -1);
         assert(!strcmp(gui_settings_value(&s, "fullscreen"), "0") && !gui_settings_value(&s, "touch"));
-        assert(!gui_settings_value(&s, "gdbstub") && gui_settings_options(&s, 1, 0, options) == 1);
+        assert(!gui_settings_value(&s, "gdbstub") && gui_settings_options(&s, 1, options) == 1);
         assert(!strcmp(shown(&s, "All"), ".ini"));
         gui_settings_load(&s, path);                        /* and the file's picks again */
         gui_settings_load(&s, "/nonexistent/settings.ini"); /* none: nothing changes */
@@ -256,7 +254,39 @@ int main(int argc, char** argv) {
         free(dir);
     }
     assert(!gui_settings_read(&s, "") && s.count == GUI_SETTINGS_OWN); /* no runtime: the launcher's alone */
-    assert(gui_settings_options(&s, 1, 0, options) == 0 && !gui_settings_set(&s, "touch", "1"));
+    assert(gui_settings_options(&s, 1, options) == 0 && !gui_settings_set(&s, "touch", "1"));
+    /* and a pick of theirs kept then: the runtime's picks in the file, which no row has, stay as they were */
+    {
+        char *dir = snx_temp_dir(NULL), *path = snx_path_join(dir, "settings.ini"), *text;
+        const char* picks = "; picks\n[Launch]\ngdbstub=on\n[Display]\nfullscreen = 1\nlanguage=3\n"
+                            "[On-screen controls/Buttons]\ncontrols_b_shown=0\n";
+        const char* theirs = "[Display]\nfullscreen=1\nlanguage=3\n[On-screen controls/Buttons]\ncontrols_b_shown=0\n";
+        size_t size;
+        assert(!snx_write_file(path, picks, strlen(picks)));
+        gui_settings_mark(&s);
+        gui_settings_load(&s, path);
+        assert(!strcmp(gui_settings_value(&s, "gdbstub"), "on") && gui_settings_set(&s, "gdbstub", "off"));
+        assert(!gui_settings_save(&s, path));
+        text = (char*)snx_read_file(path, &size);
+        assert(text && strstr(text, theirs) && !strstr(text, "gdbstub") && !strstr(text, "[Launch]"));
+        free(text);
+        /* the launcher's own again: first, by their section, the runtime's after them */
+        assert(gui_settings_set(&s, "gdbstub", "on") && !gui_settings_save(&s, path));
+        text = (char*)snx_read_file(path, &size);
+        assert(text && strstr(text, "\n[Launch]\ngdbstub=on\n[Display]\nfullscreen=1\n") && strstr(text, theirs));
+        free(text);
+#ifndef _WIN32
+        if (geteuid()) { /* one it cannot read is not written over, which would lose them */
+            assert(!chmod(path, 0) && gui_settings_save(&s, path) && !chmod(path, 0600));
+            text = (char*)snx_read_file(path, &size);
+            assert(text && strstr(text, theirs) && strstr(text, "gdbstub=on"));
+            free(text);
+        }
+#endif
+        assert(!snx_remove_tree(dir));
+        free(path);
+        free(dir);
+    }
     gui_settings_free(&s);
 
     /* the runtime's own list: every line a row, and a page's two; the game's menu's settings named and worded as it

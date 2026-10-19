@@ -12,6 +12,7 @@
 #include <string.h>
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/vk/vk.h"
+#include "nx/gpu/vk/pending_pages.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
@@ -38,6 +39,11 @@ static u32 g_rincr[SYNC_N];  /* increments queued per syncpoint */
 static PMutex g_rlock = PMUTEX_INIT;
 static PCond g_rcv;
 static int g_rthread;
+/* the guest pages queued payloads cover, so a read or write that meets none (almost all) skips the queue: added when a
+   payload is queued, removed when it is written, both under vk_lock, and a mapping change drains the queue before any
+   translation changes (vkr_mapping_begin), so a payload loses the pages it gained */
+static PendPages g_rpages = {.also = &g_pend_any};
+u64 g_vk_release_forwards;
 
 static void perform(Release* r) {
     if (r->samples) { /* the count, as the report's structure size says: one word, or the value and the timestamp */
@@ -72,6 +78,7 @@ static void release_through(u64 gate, u64 cgate) {
         }
         r = g_rq[g_rtail % RQ_N];
         g_rtail++;
+        if (r.gva) pend_add(&g_rpages, r.gva, r.len, -1);
         if (!r.gva) {
             /* release_value sees the transfer from queued to completed atomically. */
             perform(&r);
@@ -141,6 +148,7 @@ static void release(Release* r) {
     }
     g_rq[g_rhead % RQ_N] = *r;
     g_rhead++;
+    if (r->gva) pend_add(&g_rpages, r->gva, r->len, 1);
     if (!r->gva && r->id < SYNC_N) g_rincr[r->id]++;
     __atomic_store_n(&g_gpu_releases, 1, __ATOMIC_RELEASE);
     if (!g_rthread) {
@@ -214,6 +222,10 @@ static void release_match(u64 gva, u64 len, u32 id, int all) {
     int found = 0;
     if (vk_result_landing()) return;
     vk_lock();
+    if (len && !all && !pend_hit(&g_rpages, gva, len)) { /* no queued payload there */
+        vk_unlock();
+        return;
+    }
     pm_lock(&g_rlock);
     for (u64 i = g_rtail; i < g_rhead; i++) {
         const Release* r = &g_rq[i % RQ_N];
@@ -232,8 +244,48 @@ static void release_match(u64 gva, u64 len, u32 id, int all) {
     }
     vk_unlock();
 }
+/* [gva, gva + len) as the stream sees it: memory, then the payloads of the releases queued over it in their order (1),
+   or 0 when none is queued there, or -1 when one there can't be read past now. Under vk_lock, which release_through
+   holds while it takes releases from the queue and writes them, so a release is either still queued or in memory.
+   Storage results still pending there may be newer than the releases (a release lands storage images and puts the
+   compute batch aside before it is queued), so they are waited for instead. The queue is looked at first: almost no
+   read meets a release, and those go on at once */
+int vk_release_read(u64 gva, void* dst, u64 len) {
+    int r = 0;
+    if (!len || vk_result_landing()) return len ? -1 : 0;
+    vk_lock();
+    if (!pend_hit(&g_rpages, gva, len)) {
+        vk_unlock();
+        return 0;
+    }
+    pm_lock(&g_rlock);
+    for (u64 i = g_rtail; i < g_rhead && r >= 0; i++) {
+        const Release* q = &g_rq[i % RQ_N];
+        if (!release_overlaps(q, gva, len)) continue;
+        /* a count the GPU hasn't given yet, or the same memory through another address: not known here */
+        r = !q->samples && gva < q->gva + q->len && q->gva < gva + len && len <= 0x10000 ? 1 : -1;
+    }
+    pm_unlock(&g_rlock);
+    if (r > 0 && (vk_compute_pending(gva, len) || vk_buf_pending(gva, len) || vk_gfx_image_pending(gva, len))) r = -1;
+    if (r > 0) {
+        pm_lock(&g_rlock);
+        gmem_read_raw(gva, dst, len);
+        for (u64 i = g_rtail; i < g_rhead; i++) {
+            const Release* q = &g_rq[i % RQ_N];
+            u64 lo, hi;
+            if (!q->gva || gva >= q->gva + q->len || q->gva >= gva + len) continue;
+            lo = q->gva > gva ? q->gva : gva;
+            hi = q->gva + q->len < gva + len ? q->gva + q->len : gva + len;
+            memcpy((u8*)dst + (lo - gva), q->data + (lo - q->gva), (size_t)(hi - lo));
+        }
+        pm_unlock(&g_rlock);
+        __atomic_add_fetch(&g_vk_release_forwards, 1, __ATOMIC_RELAXED);
+    }
+    vk_unlock();
+    return r;
+}
 void vk_release_need(u64 gva, u64 len) {
-    if (len) release_match(gva, len, 0, 0);
+    if (len && __atomic_load_n(&g_gpu_releases, __ATOMIC_ACQUIRE)) release_match(gva, len, 0, 0);
 }
 void vk_release_drain(void) { release_match(0, 0, 0, 1); }
 void vk_release_retire(u32 id) { release_match(0, 0, id, 0); }

@@ -40,8 +40,21 @@ serialized records have their own wire encoding.
 Host sockets stay nonblocking. Guest blocking is implemented by waiting for
 readiness with receive/send deadlines. The cancellation API wakes blocked waits;
 callers retaining a socket reference can safely finish I/O after a descriptor is
-closed. This library does not provide an Ethernet/IP virtual machine, virtual
-LAN, or Eden multiplayer proxy.
+closed. This library does not provide an Ethernet/IP virtual machine. Local
+wireless (`net_ldn.c`) travels two ways. On the LAN it speaks the protocol of
+the ldn_mitm sysmodule, which Ryujinx's LdnMitm client speaks too, over UDP and
+TCP 11452 on the console's interface. Through an Eden room (`net_room.c`, the
+protocol of Eden's room server) one ENet connection carries ldn's messages and
+the game's UDP datagrams, each datagram's bytes a zstd frame, to the room, which
+relays them to the other members. The console's address is the one the room
+gives it, for ldn, nifm and the game's datagram sockets, which are the room's.
+TCP sockets stay the host's: Eden makes every socket the room's and answers
+TCP's calls without sending anything, and a room carries datagrams alone. A
+datagram carries Eden's protocol number for its socket (1 for a socket opened
+with protocol 0, 4 for UDP) and reaches only a socket of the same one, so an
+Eden and a ScarletNX of one game meet. At exit every ldn closes its network
+before the console leaves the room, since an Eden on the other side hears only
+that, never who left.
 
 ## Runtime behavior
 
@@ -102,6 +115,11 @@ ctest --test-dir build/gnuabi --output-on-failure
 - `bsd_service`: production BSD dispatch with a stubbed kernel; checks guest
   sockaddr/constants, TCP/UDP, poll/select, options, eventfd, offline rejection,
   exact error reply sizes and zero-length receives.
+- `ldn_room`: an Eden room (`net_room.c`) against a room server in the test
+  (`fake_room.c`): the messages, the join and its refusals, ldn's networks and the
+  game's datagram sockets through it.
+- `room_service`: what `ldn=room` reads before it joins (`room.c`): `room`'s address,
+  `users/online.ini`'s password, and what stops the game.
 
 An optional static AArch64 libc fixture exercises the complete ELF-to-native
 execution path, without external DNS or ICMP requirements:

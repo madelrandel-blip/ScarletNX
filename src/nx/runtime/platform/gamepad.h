@@ -43,9 +43,13 @@ void gamepad_store_map(void);              /* the custom map, to the .ini */
 void gamepad_store_player_map(int player); /* a player's own (0 to SNX_GAMEPADS - 1), to the .ini */
 /* the i-th open gamepad's face labels and whether its sticks sit side by side: 1, 0 past the last. Under ui_lock */
 int gamepad_layout(int i, int labels[4], int* symmetric);
-unsigned gamepad_held(void); /* the controls (pad_map.h's) held at the last gamepad_state, a bit each */
+/* the controls (pad_map.h's) the i-th open gamepad held at the last gamepad_state, a bit each; every one's for -1.
+   Under ui_lock */
+unsigned gamepad_held(int i);
 /* the open gamepads' names, from 0 on: NULL past the last. Under ui_lock */
 const char* gamepad_name(int i);
+/* the i that slot's gamepad (its player's) is in the three above, -1 for none. Under ui_lock */
+int gamepad_of_player(int slot);
 extern const IniOpt g_gamepad_ini[];     /* the settings, keys gamepad_* */
 #define SNX_GAMEPAD_PAGE "Controllers"   /* their page in the game's menu and the launcher's Settings */
 #define SNX_GAMEPAD_MAP  "Button map"    /* and the screen of what each button sends */

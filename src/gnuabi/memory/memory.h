@@ -15,6 +15,9 @@ typedef struct GnuMemory {
     unsigned char* base;
     unsigned char* pages;
     uint64_t size, mmap_next, brk_base, brk_current, brk_limit;
+    /* the host's page, which base is aligned to and protected in: GNU_PAGE_SIZE, or larger (16 KiB on Apple silicon
+       and some Android kernels, 64 KiB on PowerPC64), when each host page holds several guest pages (host_protect) */
+    uint64_t host_page;
     /* called before executable pages are remapped, unmapped or have their permissions changed: the JIT's host code
        for them must not run again (gnu_jit_invalidate). Set after gnu_memory_init */
     void (*code_changed)(void* context, uint64_t address, uint64_t length);

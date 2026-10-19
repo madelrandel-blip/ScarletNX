@@ -27,6 +27,9 @@ if(NOT CMAKE_C_COMPILER_ID MATCHES "^(Apple)?Clang$" OR NOT CMAKE_CXX_COMPILER_I
                         "(${CMAKE_C_COMPILER}). Use a preset, or -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ "
                         "in a new build folder.")
 endif()
+# the CPU baseline (POWER8 on PowerPC64) and a Linux cross build's target and sysroot, for FFmpeg, OpenSSL and the
+# recompiler's runtime library
+include(cmake/cross.cmake)
 # the iOS and macOS apps' frontend (src/gui/apple.m and dist/apple's Swift, docs/APPLE.md), which the runtime links
 # with the menu: the languages are enabled where every target that links them is below
 if(APPLE AND (NOT DEFINED SNX_BUILD_GUI OR SNX_BUILD_GUI))
@@ -72,26 +75,27 @@ endif()
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
-set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g")
+# CI's cross builds, which no one debugs, set -O2 -g0: compiles, links and the compiler cache are smaller without
+# the symbols
+set(SNX_OPT_FLAGS "-O2 -g" CACHE STRING "Optimization and debug flags of a RelWithDebInfo build")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "${SNX_OPT_FLAGS}")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${SNX_OPT_FLAGS}")
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 option(SNX_TOOLS_ONLY "Build the C90 extraction/recompilation driver without the runtime" OFF)
-option(SNX_HACTOOL_ONLY "Build only the native container extractor" OFF)
 set(snx_gui_default OFF)
-if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY AND NOT SNX_HACTOOL_ONLY)
+if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     set(snx_gui_default ON)
 endif()
 option(SNX_BUILD_GUI "Build the keyboard-driven SDL3 launcher" ${snx_gui_default})
-if(SNX_BUILD_GUI AND (SNX_TOOLS_ONLY OR SNX_HACTOOL_ONLY))
+if(SNX_BUILD_GUI AND SNX_TOOLS_ONLY)
     message(FATAL_ERROR "SNX_BUILD_GUI requires a runtime build, not a tools-only build")
 endif()
+# Before the dependencies: the tests' network fixtures link ENet and zstd, whatever the build
+include(CTest)
 # Before the sources: the C90 driver of a tools-only build links LZ4 too
 include(cmake/dependencies.cmake)
-if(SNX_HACTOOL_ONLY)
-    return()
-endif()
 # every local include is a path from src/ ("nx/hle/kernel/ipc.h"); generated and third-party headers come with their
 # targets
 include_directories("${PROJECT_SOURCE_DIR}/src")
@@ -99,7 +103,6 @@ add_subdirectory(src/common)
 if(SNX_BUILD_NX)
     add_subdirectory(src/nx/runtime/driver host-tools)
 endif()
-include(CTest)
 include(cmake/build_info.cmake) # the window titles' line; the driver stamps games with its commit
 if(SNX_BUILD_3DS)
     add_subdirectory(src/3ds)
@@ -133,30 +136,25 @@ endif()
 if(BUILD_TESTING AND TARGET hactool_lib)
     add_executable(snx-test-hactool-decrypted tests/hactool_decrypted.c)
     snx_test_target(snx-test-hactool-decrypted 11)
-    target_link_libraries(snx-test-hactool-decrypted PRIVATE hactool_lib)
+    target_link_libraries(snx-test-hactool-decrypted PRIVATE hactool_internals)
     add_test(NAME hactool_decrypted COMMAND snx-test-hactool-decrypted)
-    # the storages cmake/hactool-libhac.patch ports from LibHac, in-process and through the executable
+    # the storages ported from LibHac (src/nx/runtime/driver/hactool/storage.c), and NCAs read in place in a container
     add_executable(snx-test-hactool-layers tests/hactool_layers.c)
     snx_test_target(snx-test-hactool-layers 11)
-    target_link_libraries(snx-test-hactool-layers PRIVATE hactool_lib)
-    add_test(NAME hactool_layers COMMAND snx-test-hactool-layers $<TARGET_FILE:hactool>)
+    target_link_libraries(snx-test-hactool-layers PRIVATE hactool_internals)
+    add_test(NAME hactool_layers COMMAND snx-test-hactool-layers)
     snx_sanitizer_path() # tests/CMakeLists.txt
 endif()
 add_subdirectory(src/nx)
 add_subdirectory(tools)
 
-# `cmake --install` puts the runtime, hactool, the desktop entry and the licenses under CMAKE_INSTALL_PREFIX, which is
+# `cmake --install` puts the runtime, the desktop entry and the licenses under CMAKE_INSTALL_PREFIX, which is
 # what the AppImage and the CI artifacts are made from (.github/workflows/build.yml)
 include(GNUInstallDirs)
 if(IOS) # the app itself (dist/apple), which scripts/ios-app.sh packs
     install(TARGETS scarletnx BUNDLE DESTINATION .)
 elseif(NOT ANDROID) # src/nx puts Android's in the app's libraries
     install(TARGETS scarletnx RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-endif()
-if(TARGET hactool AND ANDROID)
-    install(TARGETS hactool RUNTIME DESTINATION lib/${ANDROID_ABI})
-elseif(TARGET hactool)
-    install(TARGETS hactool RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(NOT WIN32)
     install(FILES dist/scarletnx.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications COMPONENT desktop)
@@ -166,7 +164,7 @@ if(ANDROID) # the app's launcher icon (dist/android)
 endif()
 
 # The licenses go with the binaries: ScarletNX's (GPL-3.0), and those of the libraries and code built into the runtime
-# and hactool, each in a folder named after it
+# and the driver (hactool among them), each in a folder named after it
 set(licenses "${CMAKE_INSTALL_DATADIR}/licenses/scarletnx")
 install(FILES LICENSE DESTINATION ${licenses})
 # FFmpeg's with the change made to it (cmake/ffmpeg-vp9-nvdec.patch), which its LGPL wants carried with the binaries
@@ -178,17 +176,27 @@ install(FILES "${Vulkan-Headers_SOURCE_DIR}/LICENSE.md" DESTINATION ${licenses}/
 install(DIRECTORY "${Vulkan-Headers_SOURCE_DIR}/LICENSES" DESTINATION ${licenses}/Vulkan-Headers)
 install(FILES "${volk_SOURCE_DIR}/LICENSE.md" DESTINATION ${licenses}/volk)
 install(FILES "${VulkanMemoryAllocator_SOURCE_DIR}/LICENSE.txt" DESTINATION ${licenses}/VulkanMemoryAllocator)
+# renderdoc_app.h's license is the comment at the top of the header
+file(READ "${renderdoc_app_SOURCE_DIR}/renderdoc_app.h" renderdoc_app)
+string(FIND "${renderdoc_app}" "*/" renderdoc_app_end)
+string(SUBSTRING "${renderdoc_app}" 0 ${renderdoc_app_end} renderdoc_app)
+file(WRITE "${CMAKE_BINARY_DIR}/renderdoc_app-LICENSE.txt" "${renderdoc_app}*/\n")
+install(FILES "${CMAKE_BINARY_DIR}/renderdoc_app-LICENSE.txt" DESTINATION ${licenses}/renderdoc_app RENAME LICENSE.txt)
 install(FILES "${OpenSSL_SOURCE_DIR}/LICENSE.txt" DESTINATION ${licenses}/OpenSSL)
 # lib/LICENSE is the library's BSD-2-Clause. The top-level LICENSE covers the rest of LZ4 (GPL-2.0-or-later), none
 # of which is built here
 install(FILES "${lz4_SOURCE_DIR}/lib/LICENSE" DESTINATION ${licenses}/lz4)
+if(TARGET snx_enet)
+    install(FILES "${enet_SOURCE_DIR}/LICENSE" DESTINATION ${licenses}/enet)
+    install(FILES "${zstd_SOURCE_DIR}/LICENSE" DESTINATION ${licenses}/zstd)
+endif()
 if(SNX_SDL3_FROM_SOURCE)
     install(FILES "${SDL3_SOURCE_DIR}/LICENSE.txt" DESTINATION ${licenses}/SDL3)
 endif()
-if(TARGET hactool)
-    install(FILES "${hactool_SOURCE_DIR}/LICENSE" DESTINATION ${licenses}/hactool)
+if(TARGET hactool_lib)
+    install(FILES "${hactool_src}/LICENSE" DESTINATION ${licenses}/hactool)
     # cJSON's license is the comment at the top of its header
-    file(READ "${hactool_SOURCE_DIR}/cJSON.h" cjson)
+    file(READ "${hactool_src}/cJSON.h" cjson)
     string(FIND "${cjson}" "*/" cjson_end)
     string(SUBSTRING "${cjson}" 0 ${cjson_end} cjson)
     file(WRITE "${CMAKE_BINARY_DIR}/cJSON-LICENSE.txt" "${cjson}*/\n")

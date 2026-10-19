@@ -3,13 +3,22 @@
 #include "nx/runtime/platform/ui.h"
 #include "nx/runtime/platform/controls_atlas.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/log.h"
 #include "common/utilities/font.h"
+#include "common/utilities/users.h"
+#include "gui/splash.h"
+#include "gui_theme_colors.h"
 #include <stdlib.h>
 #include <string.h>
 
 static PMutex g_lock = PMUTEX_INIT;
 static u32* g_atlas;
 static u32 g_version;
+#define UI_PICTURE_Y SNX_CONTROLS_ATLAS_HEIGHT /* the picture's first row, under the sprites' */
+/* the menu's look's shape for it, GuiPicture's: 0 none, 1 square, 2 round */
+#ifndef SNX_GUI_THEME_YORHA_PICTURE
+#error "the YoRHa theme names no [head] picture"
+#endif
 
 void ui_lock(void) { pm_lock(&g_lock); }
 void ui_unlock(void) { pm_unlock(&g_lock); }
@@ -35,6 +44,31 @@ void ui_sprite(SnxUiList* l, int sprite, float x, float y, float w, float h, u32
     const unsigned short* s = snx_controls_sprites[sprite];
     if (alpha) quad(l, x, y, w, h, s[0], s[1], s[2], s[3], 0x00FFFFFFu | alpha << 24, turn, 0);
 }
+int ui_picture(SnxUiList* l, float x, float y, float side) {
+    if (!SNX_GUI_THEME_YORHA_PICTURE) return 0;
+    quad(l, x, y, side, side, 0, UI_PICTURE_Y, SNX_UI_PICTURE, SNX_UI_PICTURE, 0xFFFFFFFFu, 0, 0);
+    return 1;
+}
+/* the picture of the user playing into the atlas's rows from UI_PICTURE_Y, w texels a row; transparent when there is
+   no user yet or the theme shows none. A JPEG that does not draw shows Wimsy, said */
+static void user_picture(u32* a, int w) {
+    const SnxUser* u = g_user_count ? snx_users_selected() : NULL;
+    const unsigned char* jpeg;
+    uint32_t size = 0;
+    int round = SNX_GUI_THEME_YORHA_PICTURE == 2, i, y;
+    u32* at = a + (size_t)UI_PICTURE_Y * (size_t)w;
+    if (!u || !SNX_GUI_THEME_YORHA_PICTURE) return;
+    jpeg = snx_users_picture(u, &size);
+    if (snx_splash_picture(jpeg, size, SNX_UI_PICTURE, round, at, w * 4)) {
+        WARN("ui: %s's picture could not be drawn, Wimsy shows in the menu\n", u->nickname);
+        snx_splash_picture(NULL, 0, SNX_UI_PICTURE, round, at, w * 4);
+    }
+    for (y = 0; y < SNX_UI_PICTURE; ++y) /* ARGB to R G B A from the low byte, the alpha premultiplied as it was */
+        for (i = 0; i < SNX_UI_PICTURE; ++i) {
+            u32 p = at[(size_t)y * (size_t)w + (size_t)i];
+            at[(size_t)y * (size_t)w + (size_t)i] = (p & 0xFF00FF00u) | (p >> 16 & 0xFFu) | (p & 0xFFu) << 16;
+        }
+}
 void ui_fill(SnxUiList* l, float x, float y, float w, float h, u32 rgba) {
     /* the block's inner texels: a blend at its edge never reaches the transparent ones around it */
     quad(l, x, y, w, h, SNX_CONTROLS_WHITE_X + 1, SNX_CONTROLS_WHITE_Y + 1, 2, 2, rgba, 0, 1);
@@ -54,7 +88,7 @@ void ui_atlas_set(const u32* sprites, int w, int h) {
     int x, y, c, i;
     u32* a;
     if (w != SNX_CONTROLS_ATLAS_WIDTH || h != SNX_CONTROLS_ATLAS_HEIGHT) return; /* not the image the header is for */
-    a = (u32*)malloc((size_t)w * (size_t)h * 4);
+    a = (u32*)calloc((size_t)w * (size_t)(h + SNX_UI_PICTURE), 4);
     if (!a) return;
     for (i = 0; i < w * h; ++i) { /* premultiplied: a blend between a sprite's edge and the clear texels around it */
         u32 p = sprites[i], al = p >> 24;
@@ -68,6 +102,7 @@ void ui_atlas_set(const u32* sprites, int w, int h) {
                     gui_vga_font[c * 16 + y] & (0x80 >> x) ? 0xFFFFFFFFu : 0;
     for (y = 0; y < 4; ++y)
         for (x = 0; x < 4; ++x) a[(SNX_CONTROLS_WHITE_Y + y) * w + SNX_CONTROLS_WHITE_X + x] = 0xFFFFFFFFu;
+    user_picture(a, w);
     ui_lock();
     free(g_atlas);
     g_atlas = a;
@@ -76,7 +111,7 @@ void ui_atlas_set(const u32* sprites, int w, int h) {
 }
 const u32* ui_atlas(int* w, int* h, u32* version) {
     *w = SNX_CONTROLS_ATLAS_WIDTH;
-    *h = SNX_CONTROLS_ATLAS_HEIGHT;
+    *h = SNX_CONTROLS_ATLAS_HEIGHT + SNX_UI_PICTURE;
     *version = g_version;
     return g_atlas;
 }

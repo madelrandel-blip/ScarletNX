@@ -61,15 +61,23 @@ interface nn::am::service::ICommonStateGetter {
     [61] GetDefaultDisplayResolutionChangeEvent() -> handle<copy, event> event;
     @stub [62] GetHdcpAuthenticationState() -> i32 state;
     [63] GetHdcpAuthenticationStateChangeEvent() -> handle<copy, event> event;
-    @stub [66] SetCpuBoostMode(u32 mode);
+    [66] SetCpuBoostMode(u32 mode);
     @stub [67] CancelCpuBoostMode();
     @stub [68] GetBuiltInDisplayType() -> i32 type;
     [91] GetCurrentPerformanceConfiguration() -> u32 configuration;
+    # 21.0.0+
+    [130] EnableStartupLogoDisappearedMessage();
+    # 9.0.0+, a nn::settings::system::PlatformRegion
+    [300] GetSettingsPlatformRegion() -> u32 region;
     @stub [900] SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled();
+    # 19.0.0+
+    [1000] BeginVrMode3d();
+    [1001] EndVrMode3d();
+    [1002] IsVrModeEnabled3d() -> b8 enabled;
 }
 
 # a lock on a system button (the home button's): no home menu here waits for it, so a lock is always granted, and
-# the event is signaled when it is released
+# the event is signaled from the start and when it is released
 interface nn::am::service::ILockAccessor {
     [1] TryLock(b8 return_handle) -> (b8 is_locked, handle<copy, event> event);
     [2] Unlock();
@@ -93,9 +101,11 @@ interface nn::am::service::ISelfController {
     [40] CreateManagedDisplayLayer() -> u64 layer_id;
     @stub [41] IsSystemBufferSharingEnabled();
     [44] CreateManagedDisplaySeparableLayer() -> (u64 layer_id, u64 recording_layer_id);
-    @stub [62] SetIdleTimeDetectionExtension(u32 extension);
-    @stub [63] GetIdleTimeDetectionExtension() -> u32 extension;
-    @stub [69] IsAutoSleepDisabled() -> b8 disabled;
+    [62] SetIdleTimeDetectionExtension(u32 extension);
+    [63] GetIdleTimeDetectionExtension() -> u32 extension;
+    # 5.0.0+
+    [68] SetAutoSleepDisabled(b8 disabled);
+    [69] IsAutoSleepDisabled() -> b8 disabled;
     @stub [90] GetAccumulatedSuspendedTickValue() -> u64 tick;
     [91] GetAccumulatedSuspendedTickChangedEvent() -> handle<copy, event> event;
     @stub [100] SetAlbumImageTakenNotificationEnabled(b8 enabled);

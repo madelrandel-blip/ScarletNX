@@ -13,6 +13,26 @@
             return 1;                                                                                                  \
         }                                                                                                              \
     } while (0)
+#if defined(__linux__)
+/* the host's protection of the page at address, from /proc/self/maps: "rw", "r-" or "--" (absent: "") */
+static const char* host_protection(const void* address) {
+    static char perms[3];
+    char line[512];
+    FILE* maps = fopen("/proc/self/maps", "r");
+    perms[0] = 0;
+    if (!maps) return perms;
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long long lo, hi;
+        char p[5];
+        if (sscanf(line, "%llx-%llx %4s", &lo, &hi, p) == 3 && (uintptr_t)address >= lo && (uintptr_t)address < hi) {
+            perms[0] = p[0], perms[1] = p[1], perms[2] = 0;
+            break;
+        }
+    }
+    fclose(maps);
+    return perms;
+}
+#endif
 static void put16(unsigned char* p, unsigned value) {
     p[0] = (unsigned char)value;
     p[1] = (unsigned char)(value >> 8);
@@ -67,6 +87,26 @@ int main(void) {
     CHECK(gnu_memory_mmap(&p->memory, 0x10001, 4096, 3, 0x32) == -GNU_EINVAL);
     CHECK(gnu_memory_unmap(&p->memory, 0x10000, 4096) == 0);
     gnu_memory_destroy(&p->memory);
+#if defined(__linux__)
+    /* Guest pages sharing a host page (larger than 4 KiB here, or with SNX_HOST_PAGE): it is as permissive as the
+       most permissive of them, and less again when that one changes */
+    CHECK(gnu_memory_init(&p->memory) == 0);
+    if (p->memory.host_page > 4096) {
+        unsigned char* host = p->memory.base + 0x100000;
+        CHECK(gnu_memory_map(&p->memory, 0x100000, 4096, 1, 0) == 0);
+        CHECK(!strcmp(host_protection(host), "r-"));
+        CHECK(gnu_memory_map(&p->memory, 0x101000, 4096, 3, 0) == 0);
+        CHECK(!strcmp(host_protection(host), "rw"));
+        CHECK(gnu_memory_write(&p->memory, 0x100000, marker, 1) == -GNU_EFAULT); /* the guest's own still say no */
+        CHECK(gnu_memory_protect(&p->memory, 0x101000, 4096, 1) == 0);
+        CHECK(!strcmp(host_protection(host), "r-"));
+        CHECK(gnu_memory_unmap(&p->memory, 0x100000, 4096) == 0);
+        CHECK(!strcmp(host_protection(host), "r-") && gnu_memory_read(&p->memory, 0x100000, copy, 1) == -GNU_EFAULT);
+        CHECK(gnu_memory_unmap(&p->memory, 0x101000, 4096) == 0);
+        CHECK(!strcmp(host_protection(host), "--"));
+    }
+    gnu_memory_destroy(&p->memory);
+#endif
     unsigned char bytes[512];
     executable(bytes, 2);
     char error[256] = {0};

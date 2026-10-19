@@ -11,7 +11,9 @@
 #include "nx/hle/services/nvdrv.h"
 #include "nx/memory/mem.h"
 #include "nx/runtime/platform/log.h"
+#include "nx/runtime/platform/plat.h"
 #include "nx/gpu/vk/vk.h"
+#include "nx/gpu/vk/pending_pages.h"
 
 #define SURFH 4096
 static Surf* g_surfh[SURFH];
@@ -73,6 +75,8 @@ u32 vk_sc(u32 v) {
 }
 float vk_scf(float v) { return v * g_vk_scale; }
 
+static u64 g_rt_made; /* for the stats line */
+u64 vk_rt_made(void) { return g_rt_made; }
 static Surf* surf_create(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 bh, u32 pitch, int is_rt, u32 layers) {
     Surf* s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -89,11 +93,14 @@ static Surf* surf_create(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 b
     s->bh = bh;
     s->pitch = pitch;
     s->is_rt = is_rt;
+    if (is_rt) g_rt_made++;
     if (is_rt) s->layer_size = bl ? bl_size(w * f.bpp, h, bh) : (u64)pitch * h;
     s->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageUsageFlags usage =
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (is_rt) usage |= f.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    /* the draws rendering to a color target can sample it, in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL (gpu/vk/render.c) */
+    if (is_rt && !f.depth && g_vk.has_feedback) usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     VkFormatProperties format_props;
     vkGetPhysicalDeviceFormatProperties(g_vk.phys, f.vk, &format_props);
     if (format_props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
@@ -128,6 +135,7 @@ static Surf* surf_create(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 b
     u32 k = hkey(gva);
     s->next = g_surfh[k];
     g_surfh[k] = s;
+    g_vk_surf_epoch++;
     if (is_rt) {
         s->rt_next = g_rt_first;
         g_rt_first = s;
@@ -140,8 +148,13 @@ VkImageView vk_rt_attachment(Surf* s, int srgb_write) {
     VkFormat linear = vk_srgb_as(s->f.vk, 0);
     if (srgb_write || linear == s->f.vk) return s->att;
     if (!s->att_linear) {
-        VkImageViewUsageCreateInfo usage = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-                                            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+        /* an attachment in the feedback-loop layout needs the loop's usage on its view, and sampling
+           (VUID-VkRenderingAttachmentInfo-imageView-10780) */
+        VkImageViewUsageCreateInfo usage = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+            .usage =
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                (g_vk.has_feedback ? VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0)};
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
                                     .pNext = &usage,
                                     .image = s->img,
@@ -154,10 +167,12 @@ VkImageView vk_rt_attachment(Surf* s, int srgb_write) {
 }
 
 Surf* vk_surf_first(u64 gva) { return g_surfh[hkey(gva)]; }
+u32 g_vk_surf_epoch;
 void vk_surf_add(Surf* s) {
     u32 k = hkey(s->gva);
     s->next = g_surfh[k];
     g_surfh[k] = s;
+    g_vk_surf_epoch++;
 }
 
 Surf* vk_rt_find(u64 gva) {
@@ -202,7 +217,7 @@ static void scale_blit(VkCommandBuffer cb, VkImage src, u32 sw, u32 sh, u32 src_
                      .srcOffsets = {{0, 0, 0}, {(i32)sw, (i32)sh, 1}},
                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, dst_layer, 1},
                      .dstOffsets = {{0, 0, 0}, {(i32)dw, (i32)dh, 1}}};
-    vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+    rec_CmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
                    is_int ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
 }
 
@@ -212,7 +227,9 @@ static u64 rt_layer_bytes(const Surf* s) {
     u64 row = (u64)s->w * s->f.bpp;
     return s->bl ? bl_size((u32)row, s->h, s->bh) : (u64)s->pitch * (s->h - 1) + row;
 }
+/* a target's guest bytes, all layers: kept in rt_size once rt_create has made it, as its shape doesn't change */
 static u64 rt_bytes(const Surf* s) {
+    if (s->rt_size) return s->rt_size;
     if (s->volume && s->bl) {
         u64 slice = rt_layer_bytes(s);
         u32 depth = (s->layers + (1u << s->bd) - 1) & ~((1u << s->bd) - 1);
@@ -221,6 +238,13 @@ static u64 rt_bytes(const Surf* s) {
     return s->layer_size * (s->layers - 1) + rt_layer_bytes(s);
 }
 u64 vk_surf_guest_size(const Surf* s) { return s ? rt_bytes(s) : 0; }
+/* the GPU pages the render targets not parked cover, so a write that meets none (almost all) skips the walk over every
+   target in vk_rt_before_write: a target adds its pages when it is made or taken out of parking, and removes them when it
+   is parked or freed */
+static PendPages g_rt_pages;
+static void rt_pages(const Surf* s, int delta) {
+    if (!(s->gva >> 63)) pend_add_va(&g_rt_pages, s->gva, s->rt_size, delta);
+}
 int vk_surf_can_writeback(const Surf* s) { return s && s->f.raw && !s->f.depth && moves_scaled(s); }
 
 void vk_rt_reload(u64 gva) {
@@ -277,13 +301,13 @@ void vk_rt_reload(u64 gva) {
             VmaAllocation tm;
             VkImage t = s->sw == s->w && s->sh == s->h ? VK_NULL_HANDLE : vk_unscaled_image(s, 1, &tm);
             if (!t)
-                vkCmdCopyBufferToImage(cb, buf, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+                rec_CmdCopyBufferToImage(cb, buf, s->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
             else {
                 c.imageSubresource.baseArrayLayer = 0;
                 vk_barrier(cb, t, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
                            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                vkCmdCopyBufferToImage(cb, buf, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+                rec_CmdCopyBufferToImage(cb, buf, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
                 vk_barrier(cb, t, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                            VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                            VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
@@ -305,31 +329,28 @@ void vk_rt_reload(u64 gva) {
 static int depth_copies_raw(const Surf* s) {
     return (s->f.vk == VK_FORMAT_D32_SFLOAT || s->f.vk == VK_FORMAT_D16_UNORM) && s->sw == s->w && s->sh == s->h;
 }
-static void surf_flush(Surf* s, const u8* original) {
-    if (!s || (s->f.depth ? !depth_copies_raw(s) : !s->f.raw) || s->layout == VK_IMAGE_LAYOUT_UNDEFINED) return;
-    u64 gva = s->gva;
-    /* not drawn to since it was last written back or loaded: memory has it already (and a CPU write since then is
-       newer than the target) */
-    if (s->mem_wgen == s->wgen) return;
-    if (!moves_scaled(s)) return;
-    u64 row = (u64)s->w * s->f.bpp;
-    vk_render_end();
-    VkBuffer buf;
-    u64 slice = row * s->h;
-    u8* p = vk_readback_buffer(slice * s->layers, &buf);
-    if (!p) return;
-    VkCommandBuffer cb = vk_cmd();
+/* the bytes s's pixels take read back, or 0 when they don't go to memory: a format guest memory can't hold as it is, no
+   pixels, or not drawn to since it was last written back or loaded (memory has it already, and a CPU write since then
+   is newer than the target) */
+static u64 flush_bytes(const Surf* s) {
+    if (!s || (s->f.depth ? !depth_copies_raw(s) : !s->f.raw) || s->layout == VK_IMAGE_LAYOUT_UNDEFINED) return 0;
+    if (s->mem_wgen == s->wgen || !moves_scaled(s)) return 0;
+    return (u64)s->w * s->f.bpp * s->h * s->layers;
+}
+/* s's pixels copied into buf at at, a layer after another, at the guest's size */
+static void flush_record(VkCommandBuffer cb, Surf* s, VkBuffer buf, u64 at) {
+    u64 slice = (u64)s->w * s->f.bpp * s->h;
     vk_surf_use(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     for (u32 layer = 0; layer < s->layers; layer++) {
         VkBufferImageCopy c = {
-            .bufferOffset = (u64)layer * slice,
+            .bufferOffset = at + (u64)layer * slice,
             .imageSubresource = {s->f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1},
             .imageExtent = {s->w, s->h, 1}};
         VmaAllocation tm;
         VkImage t = s->sw == s->w && s->sh == s->h ? VK_NULL_HANDLE : vk_unscaled_image(s, 1, &tm);
         if (!t)
-            vkCmdCopyImageToBuffer(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+            rec_CmdCopyImageToBuffer(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
         else {
             c.imageSubresource.baseArrayLayer = 0;
             vk_barrier(cb, t, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -339,10 +360,13 @@ static void surf_flush(Surf* s, const u8* original) {
             vk_barrier(cb, t, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
                        VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            vkCmdCopyImageToBuffer(cb, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+            rec_CmdCopyImageToBuffer(cb, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
             vk_defer_image(t, tm, VK_NULL_HANDLE, VK_NULL_HANDLE);
         }
     }
+}
+/* the copies recorded so far done, and their bytes readable by the host */
+static void flush_wait(VkCommandBuffer cb) {
     /* the copy's writes made visible to the host reads below (the fence wait alone doesn't) */
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                            .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -350,9 +374,13 @@ static void surf_flush(Surf* s, const u8* original) {
                            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
                            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-    vkCmdPipelineBarrier2(cb, &di);
+    rec_CmdPipelineBarrier2(cb, &di);
     vk_finish();
     vk_readback_ready();
+}
+/* s's pixels, read back to p, into guest memory in its layout (or over original, a storage image's merge) */
+static void flush_land(Surf* s, const u8* p, const u8* original) {
+    u64 gva = s->gva, row = (u64)s->w * s->f.bpp, slice = row * s->h;
     u64 sz = rt_bytes(s);
     u8* dst = original ? NULL : gmem_ptr(gva, sz);
     u8* tmp = NULL;
@@ -410,6 +438,18 @@ static void surf_flush(Surf* s, const u8* original) {
         s->gw = 0;
     }
 }
+static void surf_flush(Surf* s, const u8* original) {
+    u64 size = flush_bytes(s);
+    VkBuffer buf;
+    if (!size) return;
+    vk_render_end();
+    const u8* p = vk_readback_buffer(size, &buf);
+    if (!p) return;
+    VkCommandBuffer cb = vk_cmd();
+    flush_record(cb, s, buf, 0);
+    flush_wait(cb);
+    flush_land(s, p, original);
+}
 void vk_surf_flush(Surf* s, const u8* original) {
     vk_result_begin();
     surf_flush(s, original);
@@ -421,9 +461,9 @@ void vk_rt_before_write(u64 gva, u64 size) {
     if (!size || g_rt_flushing) return;
     vk_lock();
     g_rt_flushing = 1;
-    for (Surf* s = g_rt_first; s; s = s->rt_next)
-        if (!(s->gva >> 63) && gva < s->gva + rt_bytes(s) && s->gva < gva + size)
-            vk_surf_flush(s, NULL);
+    if (pend_hit_va(&g_rt_pages, gva, size))
+        for (Surf* s = g_rt_first; s; s = s->rt_next)
+            if (!(s->gva >> 63) && gva < s->gva + rt_bytes(s) && s->gva < gva + size) vk_surf_flush(s, NULL);
     g_rt_flushing = 0;
     vk_unlock();
 }
@@ -458,9 +498,15 @@ static Surf* rt_create(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth, u32 
             s->volume == volume && !parked)
             parked = s;
     for (Surf* s = g_surfh[hkey(gva)]; s; s = s->next)
-        if (s->gva == gva && s->is_rt) s->gva = gva | 1ull << 63;
+        if (s->gva == gva && s->is_rt) {
+            rt_pages(s, -1);
+            s->gva = gva | 1ull << 63;
+            g_vk_surf_epoch++;
+        }
     if (parked) {
         parked->gva = gva;
+        g_vk_surf_epoch++;
+        rt_pages(parked, 1);
         parked->last_used = g_vk_present;
         vk_rt_note_read(parked);
         return parked;
@@ -471,6 +517,8 @@ static Surf* rt_create(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth, u32 
     s->layer_size = layer_size;
     s->bd = bd;
     s->volume = volume;
+    s->rt_size = rt_bytes(s);
+    rt_pages(s, 1);
     s->last_used = g_vk_present;
     s->gw = gpu_mem_generation();
     /* the CPU may have written the memory already (a cleared or decoded frame): start from it */
@@ -528,6 +576,10 @@ Surf* vk_rt_for_cpu(u64 cpu_addr, u32 w, u32 h) {
 /* render targets drawn this frame or the last, for a texture made of them (gpu/vk/texture.c) */
 static Surf** g_drawn;
 static int g_ndrawn, g_capdrawn;
+/* the GPU pages they started at when listed, so a texture over none of them (most) skips the list: TotK looked at each
+   of about 30 for each of 13,000 textures a frame. A target parked since still counts its old page, which only lets
+   the walk run */
+static PendPages g_drawn_pages;
 /* Read backing memory directly: asking gmem_read to land pending output here could submit a draw mid-setup. A run of
    pages contiguous in host memory is hashed at once, eight bytes at a time (vk_hash) */
 static u64 rt_mem_hash(const Surf* s) {
@@ -557,8 +609,7 @@ void vk_rt_drawn(Surf* s) {
         s->draw_gw = gpu_mem_generation();
     }
     s->drawn_at = g_vk_present;
-    for (int i = 0; i < g_ndrawn; i++)
-        if (g_drawn[i] == s) return;
+    if (s->in_drawn) return;
     if (g_ndrawn == g_capdrawn) {
         int cap = g_capdrawn ? g_capdrawn * 2 : 64;
         Surf** n = realloc(g_drawn, (size_t)cap * sizeof *n);
@@ -567,6 +618,9 @@ void vk_rt_drawn(Surf* s) {
         g_capdrawn = cap;
     }
     g_drawn[g_ndrawn++] = s;
+    s->in_drawn = 1;
+    s->drawn_from = s->gva;
+    pend_add_va(&g_drawn_pages, s->drawn_from, 1, 1);
 }
 void vk_rt_drawn_full(Surf* s) {
     s->draw_wseen = 0; /* every pixel was replaced, so earlier memory writes no longer matter */
@@ -588,6 +642,7 @@ int vk_rt_drawn_fresh(Surf* s) {
 }
 int vk_rt_drawn_in(u64 lo, u64 hi, Surf** out, int max) {
     int n = 0;
+    if (hi <= lo || !pend_hit_va(&g_drawn_pages, lo, hi - lo)) return 0;
     for (int i = 0; i < g_ndrawn; i++) {
         Surf* s = g_drawn[i];
         /* Generated textures may first be sampled several frames after their draw.
@@ -603,18 +658,23 @@ int vk_rt_drawn_in(u64 lo, u64 hi, Surf** out, int max) {
 
 /* a surface's image and views go when the frame being recorded is done (descriptors in it may name them) */
 static void surf_free(Surf* s) {
+    g_vk_surf_epoch++;
     if (s->is_rt) {
+        rt_pages(s, -1);
         for (Surf** pp = &g_rt_first; *pp; pp = &(*pp)->rt_next)
             if (*pp == s) {
                 *pp = s->rt_next;
                 break;
             }
     }
-    for (int i = 0; i < g_ndrawn; i++)
-        if (g_drawn[i] == s) {
-            g_drawn[i] = g_drawn[--g_ndrawn];
-            break;
-        }
+    if (s->in_drawn) {
+        for (int i = 0; i < g_ndrawn; i++)
+            if (g_drawn[i] == s) {
+                g_drawn[i] = g_drawn[--g_ndrawn];
+                break;
+            }
+        pend_add_va(&g_drawn_pages, s->drawn_from, 1, -1);
+    }
     for (int i = 0; i < s->nsv; i++) vk_defer_image(VK_NULL_HANDLE, VK_NULL_HANDLE, s->sv[i].v, VK_NULL_HANDLE);
     vk_defer_image(s->img, s->mem, s->att, s->att_linear);
     free(s);
@@ -623,7 +683,11 @@ void vk_surf_evict(u32 before) {
     /* A storage image keeps a Surf pointer until its result reaches guest memory. */
     vk_gfx_image_land();
     /* render targets too, parked or not: one not drawn, sampled or presented for as long goes with its contents
-       (guest memory has them as of its last write-back) */
+       (guest memory has them as of its last write-back). They aren't written to memory as they go: memory is shared
+       by targets the GPU drew over one another, parked and freed ones among them, and by textures and buffers that
+       copied from them on the GPU, and the renderer doesn't know them all. Writing an evicted target's pixels, as
+       Mario Kart 8 Deluxe's Mii icons wanted (drawn at boot, shown a minute later), put older pixels over newer ones
+       in Tears of the Kingdom: a black block over Link, and red and green blocks over its textures */
     for (int k = 0; k < SURFH; k++)
         for (Surf** pp = &g_surfh[k]; *pp;) {
             Surf* s = *pp;
@@ -677,7 +741,7 @@ int vk_blit2d(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, 
                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                      .dstOffsets = {{dx, dy, 0}, {X1, Y1, 1}}};
     int linear = scaled && !st->f.is_int && blit_ok(st->f.vk, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
-    vkCmdBlitImage(cb, st->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+    rec_CmdBlitImage(cb, st->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                    &b, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     dt->wgen++;
     if (dx == 0 && dy == 0 && X1 == (i32)dt->sw && Y1 == (i32)dt->sh)

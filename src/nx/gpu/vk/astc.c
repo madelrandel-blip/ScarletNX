@@ -113,7 +113,7 @@ static void scratch_barrier(VkCommandBuffer cb, int before_decode) {
         .size = VK_WHOLE_SIZE};
     VkDependencyInfo d = {
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &b};
-    vkCmdPipelineBarrier2(cb, &d);
+    rec_CmdPipelineBarrier2(cb, &d);
 }
 
 int vk_astc_upload(VkCommandBuffer cb, Surf* t, u32 w, u32 h, u32 depth, u32 level, u32 layer, VkAstcRows rows,
@@ -172,17 +172,17 @@ int vk_astc_upload(VkCommandBuffer cb, Surf* t, u32 w, u32 h, u32 depth, u32 lev
                reuse also needs a WAR dependency on the preceding image copy,
                including when that copy belongs to an earlier frame. */
             scratch_barrier(cb, 1);
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_astc_layout, 0, 1, &set, 0, NULL);
+            rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+            rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_astc_layout, 0, 1, &set, 0, NULL);
             u32 shift = tile_shift(nx, n), tw = 1u << shift, th = 64u >> shift;
             AstcParams p = {w, height, nx, n, t->f.vk == VK_FORMAT_R8G8B8A8_SRGB, shift};
-            vkCmdPushConstants(cb, g_astc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
-            vkCmdDispatch(cb, (nx + tw - 1) / tw, (n + th - 1) / th, nz);
+            rec_CmdPushConstants(cb, g_astc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+            rec_CmdDispatch(cb, (nx + tw - 1) / tw, (n + th - 1) / th, nz);
             scratch_barrier(cb, 0);
             VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
                                       .imageOffset = {0, (i32)(y * bh), (i32)z},
                                       .imageExtent = {w, height, nz}};
-            vkCmdCopyBufferToImage(cb, g_astc_scratch, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            rec_CmdCopyBufferToImage(cb, g_astc_scratch, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
         }
     }
     return 1;

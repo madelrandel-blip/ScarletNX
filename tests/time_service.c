@@ -4,6 +4,7 @@
    times in a fixed-offset zone and back, the zone names, the shared memory the SDK reads, and the spans between
    snapshots. The kernel objects and the guest clock are stand-ins here */
 #include "nx/hle/services/time.c"
+#include "nx/hle/hle.c"
 
 static unsigned checks;
 #define CHECK(x)                                                                                                       \
@@ -44,9 +45,53 @@ int new_event(u32* event, const char* name, int signaled) {
     return 0;
 }
 /* what the dispatchers reach, which the test does not run */
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t datasize) {
-    (void)name, (void)dispatch, (void)datasize;
-    return NULL;
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
+    SvcObj* o = calloc(1, sizeof *o);
+    CHECK(o != NULL);
+    o->name = name;
+    o->dispatch = dispatch;
+    o->refs = 1;
+    return o;
+}
+#include "svcobj_data.h"
+static void test_free(SvcObj* o) {
+    test_svcobj_data_free(o);
+    free(o);
+}
+
+/* time:u, an application's, may write no clock, setting or location, nor may the clocks and time zone service it hands
+   out; time:a and time:s take each write, which changes nothing here */
+static void test_permissions(void) {
+    SvcObj* sessions[2];
+    SvcObj *user, *steady, *zones, *network;
+    nn_time_SystemClockContext context;
+    nn_time_LocationName name;
+    int i, expected;
+    memset(&context, 0, sizeof context);
+    memset(&name, 0, sizeof name);
+    sessions[0] = new_time_user();
+    sessions[1] = new_time();
+    for (i = 0; i < 2; i++) {
+        expected = i ? 0 : (int)TIME_PERMISSION_DENIED;
+        CHECK(nn_timesrv_detail_service_IStaticService_GetStandardUserSystemClock(sessions[i], &user) == 0);
+        CHECK(nn_timesrv_detail_service_IStaticService_GetStandardNetworkSystemClock(sessions[i], &network) == 0);
+        CHECK(nn_timesrv_detail_service_IStaticService_GetStandardSteadyClock(sessions[i], &steady) == 0);
+        CHECK(nn_timesrv_detail_service_IStaticService_GetTimeZoneService(sessions[i], &zones) == 0);
+        CHECK(nn_timesrv_detail_service_ISystemClock_SetCurrentTime(user, 0) == expected);
+        CHECK(nn_timesrv_detail_service_ISystemClock_SetSystemClockContext(user, &context) == expected);
+        CHECK(nn_timesrv_detail_service_ISystemClock_SetCurrentTime(network, 0) == expected);
+        CHECK(nn_timesrv_detail_service_ISteadyClock_SetTestOffset(steady, 0) == expected);
+        CHECK(nn_timesrv_detail_service_ITimeZoneService_SetDeviceLocationName(zones, &name) == expected);
+        CHECK(nn_timesrv_detail_service_IStaticService_SetStandardSteadyClockInternalOffset(sessions[i], 0) ==
+              expected);
+        CHECK(nn_timesrv_detail_service_IStaticService_SetStandardUserSystemClockAutomaticCorrectionEnabled(
+                  sessions[i], 1) == expected);
+        test_free(user);
+        test_free(network);
+        test_free(steady);
+        test_free(zones);
+        test_free(sessions[i]);
+    }
 }
 void out_obj(IpcCtx* c, SvcObj* o) { (void)c, (void)o; }
 void out_copy_h(IpcCtx* c, u32 h) { (void)c, (void)h; }
@@ -88,7 +133,14 @@ static i64 rd64(const u8* p) {
     return v;
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+void pm_init(PMutex* m) { (void)m; }
+
 int main(void) {
+    hle_init();
     nn_time_PosixTime now;
     nn_time_SystemClockContext ctx;
     nn_time_SteadyClockTimePoint tp;
@@ -139,6 +191,12 @@ int main(void) {
     memcpy(z, name.v, 0x24);
     z[0x24] = 0;
     CHECK(!strncmp(z, "UTC", 3) || !strncmp(z, "Etc/GMT", 7));
+    /* the same location, set at the steady clock time of the user clock's context */
+    memset(&name, 0, sizeof name);
+    memset(&tp, 0, sizeof tp);
+    CHECK(nn_timesrv_detail_service_ITimeZoneService_GetDeviceLocationNameAndUpdatedTime(NULL, &name, &tp) == 0);
+    CHECK(!memcmp(name.v, z, 0x24) && tp.value == ctx.timestamp.value &&
+          !memcmp(tp.source_id.v, ctx.timestamp.source_id.v, 16));
 
     /* Tokyo's offset: 2024-02-29 15:04:05 UTC is 2024-03-01 00:04:05 there, a Friday, day 60 of a leap year */
     memset(&name, 0, sizeof name);
@@ -191,6 +249,7 @@ int main(void) {
               year == 2019);
     }
 
+    test_permissions();
     free(g_mem);
     printf("time_service: %u checks passed\n", checks);
     return 0;

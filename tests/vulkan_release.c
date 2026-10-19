@@ -22,6 +22,9 @@ void vk_compute_wait(u64);
 void vk_gfx_image_land(void);
 u64 vk_compute_put_aside(void);
 int vk_buf_pending_any(void);
+int vk_buf_pending(u64, u64);
+int vk_compute_pending(u64, u64);
+int vk_gfx_image_pending(u64, u64);
 int vk_buf_pending_unsubmitted(void);
 void vk_submit(u64, u64, u64);
 u64 vk_last_submit(void);
@@ -34,7 +37,7 @@ u64 vk_query_value(u32, u64, u64);
 int g_gpu_releases;
 static unsigned lock_depth, landing_calls, payload_writes, submits, query_reads;
 static u64 next_compute, next_graphics = 1, waited_compute, waited_graphics;
-static int pending, landing_probe;
+static int pending, landing_probe, other_pending;
 static u32 completed[128];
 static u8 memory[8192];
 static u64 mapping = 4096;
@@ -67,6 +70,15 @@ u64 gmmu_translate(u64 address) {
     if (address >= 0x10000 && address < 0x11000) return mapping + (address & 4095);
     if (address >= 0x20000 && address < 0x21000) return 4096 + (address & 4095);
     return 0;
+}
+/* the queued payloads' page index (pending_pages.c) translates runs of contiguous pages */
+u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
+    u64 n, first = gmmu_translate(gva);
+    if (!max || !first) return 0;
+    *cpu = first;
+    n = 0x1000 - (gva & 0xFFF);
+    while (n < max && gmmu_translate(gva + n) == first + n) n += 0x1000;
+    return n < max ? n : max;
 }
 u32 syncpt_read(u32 id) { return id < 128 ? completed[id] : 0; }
 void syncpt_incr(u32 id) {
@@ -125,6 +137,23 @@ u64 vk_compute_put_aside(void) {
     return value;
 }
 int vk_buf_pending_any(void) { return pending; }
+/* another storage result pending over the range read (vk_release_read waits for it instead) */
+int vk_compute_pending(u64 a, u64 n) {
+    (void)a;
+    (void)n;
+    return other_pending;
+}
+int vk_buf_pending(u64 a, u64 n) {
+    (void)a;
+    (void)n;
+    return 0;
+}
+int vk_gfx_image_pending(u64 a, u64 n) {
+    (void)a;
+    (void)n;
+    return 0;
+}
+void gmem_read_raw(u64 address, void* data, u64 size) { memcpy(data, memory + gmmu_translate(address), size); }
 int vk_buf_pending_unsubmitted(void) { return 0; }
 /* a submit: what was recorded becomes the last submission */
 void vk_submit(u64 a, u64 b, u64 c) {
@@ -191,6 +220,31 @@ int main(void) {
     u32 word;
     memcpy(&word, memory + 1 + 0x30, 4);
     assert(query_reads == 2 && word == 207 && memory[1 + 0x34] == 0);
+    /* a read over queued releases takes their payloads, in their order, without waiting for the work before them or
+       writing memory; the same memory through another address, another pending result there or a samples-passed count
+       not known yet make it decline, and the caller waits as before */
+    mapping = 4096; /* 0x10000 and 0x20000 name the same page */
+    pending = 1;
+    u64 waited = waited_graphics;
+    value = 21;
+    vk_release_write(0x10040, &value, 1);
+    value = 23;
+    vk_release_write(0x10041, &value, 1);
+    value = 25;
+    vk_release_write(0x10040, &value, 1);
+    memory[4096 + 0x42] = 9;
+    u8 got[3] = {0};
+    assert(vk_release_read(0x10040, got, 3) == 1 && got[0] == 25 && got[1] == 23 && got[2] == 9);
+    assert(waited_graphics == waited && memory[4096 + 0x40] == 0 && g_rhead == g_rtail + 3 &&
+           g_vk_release_forwards == 1);
+    assert(vk_release_read(0x20040, got, 1) == -1);
+    other_pending = 1;
+    assert(vk_release_read(0x10040, got, 1) == -1 && vk_release_read(0x10060, got, 1) == 0);
+    other_pending = 0;
+    vk_release_samples(0x10048, 4, 3, 1, 2, 0);
+    assert(vk_release_read(0x10048, got, 4) == -1 && vk_release_read(0x10050, got, 1) == 0);
+    vk_release_drain();
+    assert(memory[4096 + 0x40] == 25 && memory[4096 + 0x41] == 23 && g_rhead == g_rtail);
     assert(lock_depth == 0);
     return 0;
 }

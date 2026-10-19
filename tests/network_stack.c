@@ -224,12 +224,17 @@ static void icmp(void) {
     SnxSockAddr from;
     double t0 = now();
     int64_t n;
-    /* Privileged raw sockets may see our outbound request as well as the reply. */
-    do {
+    /* Privileged raw sockets see our outbound request as well as the reply, and they and macOS's ping socket every
+       ICMP message to the host: a port unreachable for another test's UDP among them. An echo reply is checked */
+    for (;;) {
         n = snx_socket_recv(s, buf, sizeof buf, 0, &from, NULL);
-        if (n >= 32 && buf[20] == 8) continue;
-        break;
-    } while (now() - t0 < 4);
+        size_t ip = n > 0 ? (size_t)(buf[0] & 15) * 4 : 0;
+        if (n <= (int64_t)ip || buf[ip] == 0) break;
+        if (now() - t0 >= 4) {
+            n = -SNX_EAGAIN; /* other messages alone: no reply, as a timeout */
+            break;
+        }
+    }
     CHECK(now() - t0 < 6);
     if (n > 0) {
         size_t ip = (size_t)(buf[0] & 15) * 4;

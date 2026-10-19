@@ -34,6 +34,8 @@ typedef struct Renderer {
     void (*dispatch)(GpuChannel* ch, const u32* q, u64 code); /* a compute launch (q: its QMD) */
     /* gmem_read and gmem_ptr land pending compute or graphics storage writes before reading memory */
     void (*cs_mem_need)(u64 a, u64 n);
+    /* 0 when no pending result or queued release covers [a, a + n): a read needs none of the mem_need hooks */
+    int (*mem_pending)(u64 a, u64 n);
     void (*gfx_mem_need)(u64 a, u64 n);
     void (*before_syncwait)(void); /* the stream is about to wait on a syncpoint: flush everything in flight */
     void (*stream_incr)(u32 id);   /* a syncpoint increment in the stream, after everything before it is done */
@@ -42,6 +44,12 @@ typedef struct Renderer {
     void (*release_write)(u64 gva, const void* data, u32 len);
     /* the stream reads or writes [a, a + n): a release still waiting to write there happens first */
     void (*release_need)(u64 a, u64 n);
+    /* the stream reads [a, a + n) as it stands after every release before it: 1 when it read guest memory with the
+       payloads of the releases queued over it, without waiting for them; 0 when no queued release is there (the caller
+       reads as usual, nothing to wait for from them); -1 when one is there that can't be read past now (a samples-passed
+       count not known yet, another pending result there, the same memory through another GPU address), and the caller
+       waits for it (release_need) */
+    int (*release_read)(u64 a, void* dst, u64 n);
     u32 (*release_value)(u32 id); /* completed and queued increments, read consistently */
     /* the 3D engine's samples-passed counter (occlusion queries), one per channel: it counts from its reset, while
        SampleCounterEnable is on. A report writes the count at gva as a release, len 4 (the count's low word) or 16 (the

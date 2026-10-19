@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The menu's Settings: the launcher's own two (libgccjit, gdbstub), then every setting of the game's .ini as the
+/* The menu's Settings: the launcher's own two (gdbstub, Extract to tmpfs), then every setting of the game's .ini as the
    runtime lists them (scarletnx --settings, its tables), each a row of the form (editor.h), named and its values worded
    as the game's menu shows them. A setting is the .ini's, passed to no run, until one is picked. The picks are kept in
    a file, an .ini of the game's sections and keys, and go to every run as --key=value. A run takes a setting from what
@@ -11,10 +11,7 @@
 #include <stddef.h>
 #include "gui/theme.h"
 
-#ifndef SNX_GUI_HAS_GCCJIT
-#define SNX_GUI_HAS_GCCJIT 0
-#endif
-#define GUI_SETTINGS_OWN 2 /* the launcher's own rows, first: libgccjit and gdbstub */
+#define GUI_SETTINGS_OWN 2 /* the launcher's own rows, first: gdbstub and tmpfs */
 /* a row that is no setting: a page's, which opens the section/page rows listed after it, and its All, first on that
    page, which steps them together */
 enum { GUI_SETTING_PAGE = 1, GUI_SETTING_ALL };
@@ -46,10 +43,12 @@ int gui_settings_set(GuiSettings* settings, const char* key, const char* value);
 void gui_settings_mark(GuiSettings* settings);
 /* the picks of a file of them, global or a game's: each key's row set, the others left as they are */
 void gui_settings_load(GuiSettings* settings, const char* path);
-/* the rows that are not at their start in path, by section; 0, else nonzero */
+/* the rows that are not at their start in path, by section; with the launcher's rows alone (the runtime listed none),
+   the keys path holds that no row has after them, as they were, and nonzero for a path it cannot read. 0, else
+   nonzero */
 int gui_settings_save(const GuiSettings* settings, const char* path);
-/* what the file of picks at path holds that no row takes, which the next save leaves out: a key no row has, or a value
-   its row does not take, as key=value, ", " between. How many */
+/* what the file of picks at path holds that no row takes, which the next save leaves out while the runtime's rows are
+   there: a key no row has, or a value its row does not take, as key=value, ", " between. How many */
 int gui_settings_unread(GuiSettings* settings, const char* path, char* out, size_t size);
 /* row back to its start (a page's or an All's: their rows), every row for -1 */
 void gui_settings_reset(GuiSettings* settings, int row);
@@ -63,9 +62,8 @@ void gui_settings_shown(const GuiSettings* settings, int row, char* out, size_t 
 /* the value picked for key, NULL for the .ini's or no such row */
 const char* gui_settings_value(const GuiSettings* settings, const char* key);
 /* argv's options for a run: --key=value for each setting picked; with launch the launcher's too, -S -s for the stub
-   and --backend=gcc unless prepared (a game made already, recompiled only when another build made it, takes LLVM's).
-   Their count, count + 1 at most */
-size_t gui_settings_options(GuiSettings* settings, int launch, int prepared, const char** argv);
-/* the backend a recompile is asked for: --backend=gcc while libgccjit is on, else NULL (LLVM, the driver's own) */
-const char* gui_settings_backend(const GuiSettings* settings);
+   and --tmpfs. Their count, count + 1 at most */
+size_t gui_settings_options(GuiSettings* settings, int launch, const char** argv);
+/* Extract to tmpfs: --tmpfs while it is on, else NULL (extractions on disk) */
+const char* gui_settings_tmpfs(const GuiSettings* settings);
 #endif

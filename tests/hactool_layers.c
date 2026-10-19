@@ -1,19 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The storage layers cmake/hactool-libhac.patch ports from LibHac into hactool, on synthetic archives encrypted with
-   synthetic keys: compressed and sparse sections, an update with AesCtrEx runs (one of them plaintext) and a
-   relocation table of several entry sets applied to a sparse base, an update with no AesCtrEx entries, a bucket tree
-   with an L2 level, and a gamecard that starts with its key area. With the hactool executable as argument, the update
-   is also extracted through the command line, as scarletnx --extract runs it. */
+/* The storage layers ported from LibHac into hactool (src/nx/runtime/driver/hactool/storage.c), on synthetic archives
+   encrypted with synthetic keys: compressed and sparse sections, an update with AesCtrEx runs (one of them plaintext)
+   and a relocation table of several entry sets applied to a sparse base, an update with no AesCtrEx entries, a bucket
+   tree with an L2 level, and a gamecard that starts with its key area. The update is also extracted with its base read
+   in place in an NSP, through snx_hac.h, as scarletnx --extract runs it. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #if defined(_WIN32)
 #include <direct.h>
-#include <process.h>
 #else
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #endif
 #if defined(_WIN32) && defined(__clang__)
@@ -21,17 +19,18 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Winconsistent-dllimport"
 #endif
-#include "nca.h"
-#include "xci.h"
-#include "sha.h"
-#include "storage.h"
-#include "lz4.h"
+#include "nx/runtime/driver/hactool/nca.h"
+#include "nx/runtime/driver/hactool/hfs0.h"
+#include "nx/runtime/driver/hactool/pfs0.h"
+#include "nx/runtime/driver/hactool/xci.h"
+#include "nx/runtime/driver/hactool/sha.h"
+#include "nx/runtime/driver/hactool/storage.h"
+#include "nx/runtime/driver/hactool/lz4.h"
+#include "nx/runtime/driver/hactool/snx_hac.h"
 #if defined(_WIN32) && defined(__clang__)
 #pragma clang diagnostic pop
 #endif
 
-#define IVFC_BLOCK 0x200
-#define IVFC_BLOCK_LOG2 9
 #define CHUNK 0x40 /* the relocation tables' granularity */
 
 static unsigned checks;
@@ -45,26 +44,7 @@ static void check(int good, const char* expression, int line) {
 }
 #define CHECK(value) check((value) != 0, #value, __LINE__)
 
-typedef struct {
-    unsigned char* data;
-    size_t size;
-} blob_t;
-
-static void* zalloc(size_t size) {
-    void* p = calloc(1, size ? size : 1);
-    CHECK(p != NULL);
-    return p;
-}
-
-static size_t align_up(size_t value, size_t alignment) { return (value + alignment - 1) / alignment * alignment; }
-
-static void put32(unsigned char* p, uint32_t v) {
-    for (unsigned i = 0; i < 4; i++) p[i] = (unsigned char)(v >> (8 * i));
-}
-
-static void put64(unsigned char* p, uint64_t v) {
-    for (unsigned i = 0; i < 8; i++) p[i] = (unsigned char)(v >> (8 * i));
-}
+#include "hac_synth.h"
 
 static uint64_t get_le(const unsigned char* p, unsigned size) {
     uint64_t v = 0;
@@ -159,54 +139,6 @@ static void indirect_entry(unsigned char* entry, uint64_t virtual_offset, uint64
     put32(entry + 0x10, storage);
 }
 
-/* A RomFS of a root directory and its files. */
-typedef struct {
-    const char* name;
-    blob_t content;
-} romfs_file_t;
-
-static blob_t romfs_build(const romfs_file_t* files, unsigned count) {
-    size_t meta = 0;
-    for (unsigned i = 0; i < count; i++) meta += 0x20 + align_up(strlen(files[i].name), 4);
-    size_t data_offset = align_up(0x70 + meta, 0x10);
-    size_t size = data_offset;
-    for (unsigned i = 0; i < count; i++) size = align_up(size, 0x10) + files[i].content.size;
-    blob_t romfs = {zalloc(size), size};
-    unsigned char* h = romfs.data;
-    put64(h, ROMFS_HEADER_SIZE);
-    put64(h + 0x08, 0x50); /* directory hashes */
-    put64(h + 0x10, 4);
-    put64(h + 0x18, 0x54); /* directories */
-    put64(h + 0x20, 0x18);
-    put64(h + 0x28, 0x6C); /* file hashes */
-    put64(h + 0x30, 4);
-    put64(h + 0x38, 0x70); /* files */
-    put64(h + 0x40, meta);
-    put64(h + 0x48, data_offset);
-    put32(h + 0x50, 0);
-    put32(h + 0x54 + 0x4, ROMFS_ENTRY_EMPTY); /* root: no sibling, no child, files from 0 */
-    put32(h + 0x54 + 0x8, ROMFS_ENTRY_EMPTY);
-    put32(h + 0x54 + 0x10, ROMFS_ENTRY_EMPTY);
-    put32(h + 0x6C, 0);
-    size_t entry = 0, data = 0;
-    for (unsigned i = 0; i < count; i++) {
-        unsigned char* f = h + 0x70 + entry;
-        size_t name = strlen(files[i].name);
-        size_t next = entry + 0x20 + align_up(name, 4);
-        data = align_up(data, 0x10);
-        put32(f + 0x4, i + 1 < count ? (uint32_t)next : ROMFS_ENTRY_EMPTY);
-        put64(f + 0x8, data);
-        put64(f + 0x10, files[i].content.size);
-        put32(f + 0x18, ROMFS_ENTRY_EMPTY);
-        put32(f + 0x1C, (uint32_t)name);
-        memcpy(f + 0x20, files[i].name, name);
-        memcpy(h + data_offset + data, files[i].content.data, files[i].content.size);
-        data += files[i].content.size;
-        entry = next;
-    }
-    return romfs;
-}
-
 /* image split into 0x1000-byte blocks stored in LZ4, as zeros (blocks of zeros) or as is (every fifth), followed by
    the compression table. */
 static blob_t compress_build(const blob_t* image, nca_compression_info_t* info) {
@@ -253,43 +185,6 @@ static blob_t compress_build(const blob_t* image, nca_compression_info_t* info) 
     return out;
 }
 
-/* IVFC levels 0 to 4 hashing data (level 5), from offset 0 of a new section image. */
-static blob_t ivfc_build(const blob_t* data, ivfc_hdr_t* hdr) {
-    uint64_t size[IVFC_MAX_LEVEL], offset[IVFC_MAX_LEVEL];
-    size[IVFC_MAX_LEVEL - 1] = data->size;
-    for (int i = IVFC_MAX_LEVEL - 2; i >= 0; i--) size[i] = (size[i + 1] + IVFC_BLOCK - 1) / IVFC_BLOCK * 0x20;
-    CHECK(size[0] <= IVFC_BLOCK);
-    offset[0] = 0;
-    for (unsigned i = 1; i < IVFC_MAX_LEVEL; i++) offset[i] = align_up(offset[i - 1] + size[i - 1], IVFC_BLOCK);
-    blob_t section = {0};
-    section.size = align_up(offset[IVFC_MAX_LEVEL - 1] + size[IVFC_MAX_LEVEL - 1], 0x200);
-    section.data = zalloc(section.size + IVFC_BLOCK);
-    memcpy(section.data + offset[IVFC_MAX_LEVEL - 1], data->data, data->size);
-    for (int i = IVFC_MAX_LEVEL - 2; i >= 0; i--) {
-        for (uint64_t b = 0; b * IVFC_BLOCK < size[i + 1]; b++) {
-            /* A short last block is hashed padded with zeros (hactool's full_block). */
-            unsigned char block[IVFC_BLOCK] = {0};
-            uint64_t n = size[i + 1] - b * IVFC_BLOCK < IVFC_BLOCK ? size[i + 1] - b * IVFC_BLOCK : IVFC_BLOCK;
-            memcpy(block, section.data + offset[i + 1] + b * IVFC_BLOCK, n);
-            sha256_hash_buffer(section.data + offset[i] + b * 0x20, block, IVFC_BLOCK);
-        }
-    }
-    memset(hdr, 0, sizeof(*hdr));
-    hdr->magic = MAGIC_IVFC;
-    hdr->id = 0x20000;
-    hdr->master_hash_size = 0x20;
-    hdr->num_levels = IVFC_MAX_LEVEL + 1;
-    for (unsigned i = 0; i < IVFC_MAX_LEVEL; i++) {
-        hdr->level_headers[i].logical_offset = offset[i];
-        hdr->level_headers[i].hash_data_size = size[i];
-        hdr->level_headers[i].block_size = IVFC_BLOCK_LOG2;
-    }
-    unsigned char block[IVFC_BLOCK] = {0};
-    memcpy(block, section.data, size[0]);
-    sha256_hash_buffer(hdr->master_hash, block, IVFC_BLOCK);
-    return section;
-}
-
 /* An NCA3 of program content: the header in XTS, its key area encrypted with the synthetic key-area key. body holds
    the sections at their offsets from 0xC00. */
 static blob_t nca_build(nca_header_t* header, const blob_t* body) {
@@ -307,12 +202,6 @@ static blob_t nca_build(nca_header_t* header, const blob_t* body) {
     free_aes_ctx(aes);
     memcpy(nca.data + 0xC00, body->data, body->size);
     return nca;
-}
-
-static void section_entry(nca_header_t* header, unsigned i, size_t start, size_t size) {
-    CHECK(start % 0x200 == 0 && size % 0x200 == 0);
-    header->section_entries[i].media_start_offset = (uint32_t)(start / 0x200);
-    header->section_entries[i].media_end_offset = (uint32_t)((start + size) / 0x200);
 }
 
 static FILE* archive(const blob_t* blob) {
@@ -845,46 +734,42 @@ static void hex(char* out, const unsigned char* key, size_t size) {
     for (size_t i = 0; i < size; i++) sprintf(out + 2 * i, "%02x", key[i]);
 }
 
-static void command_line(const char* hactool, const update_t* u) {
+/* The base and its update read where they lie in one NSP, at offsets no NCA would start at in a file of its own, as
+   scarletnx --extract reads them (snx_hac.h): the keys given by name, both headers told apart, and the update's RomFS
+   over the base's written out. */
+static void in_place(const update_t* u) {
     const char* dir = "hactool_layers.tmp";
-    char keys[256], a[80], b[80], arg_base[64], arg_out[64], path[128];
+    char a[80], b[80], path[128];
+    romfs_file_t ncas[3] = {{"padding.bin", {(unsigned char*)"x", 1}}, {"base.nca", u->base}, {"patch.nca", u->patch}};
+    blob_t nsp = partition_build(MAGIC_PFS0, ncas, 3, 0x203);
 #if defined(_WIN32)
     _mkdir(dir);
 #else
     mkdir(dir, 0700);
 #endif
+    sprintf(path, "%s/game.nsp", dir);
+    write_file(path, nsp.data, nsp.size);
+    free(nsp.data);
+    SnxHac* hac = snx_hac_new();
+    CHECK(hac != NULL);
     hex(a, header_key, sizeof(header_key));
     hex(b, key_area_key, sizeof(key_area_key));
-    sprintf(keys, "header_key = %s\nkey_area_key_application_00 = %s\n", a, b);
-    sprintf(path, "%s/prod.keys", dir);
-    write_file(path, keys, strlen(keys));
-    sprintf(path, "%s/base.nca", dir);
-    write_file(path, u->base.data, u->base.size);
-    sprintf(path, "%s/patch.nca", dir);
-    write_file(path, u->patch.data, u->patch.size);
-    sprintf(arg_base, "--basenca=%s/base.nca", dir);
-    sprintf(arg_out, "--romfsdir=%s/romfs", dir);
-    char key_path[96], patch_path[96];
-    sprintf(key_path, "%s/prod.keys", dir);
-    sprintf(patch_path, "%s/patch.nca", dir);
-    CHECK(!fflush(NULL));
-#if defined(_WIN32)
-    char* quoted = zalloc(strlen(hactool) + 3);
-    sprintf(quoted, "\"%s\"", hactool);
-    const char* args[] = {quoted, "--disablekeywarns", "-k", key_path, arg_base, arg_out, patch_path, NULL};
-    CHECK(_spawnv(_P_WAIT, hactool, args) == 0);
-    free(quoted);
-#else
-    pid_t child = fork();
-    CHECK(child >= 0);
-    if (!child) {
-        execl(hactool, hactool, "--disablekeywarns", "-k", key_path, arg_base, arg_out, patch_path, (char*)NULL);
-        _exit(127);
-    }
-    int status;
-    CHECK(waitpid(child, &status, 0) == child);
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-#endif
+    CHECK(snx_hac_set_key(hac, "header_key", a) && snx_hac_set_key(hac, "key_area_key_application_00", b));
+    CHECK(!snx_hac_set_key(hac, "not_a_key", b));
+    int nsp_index = snx_hac_open(hac, path, 0);
+    CHECK(nsp_index == 0);
+    const SnxHacEntry* entries;
+    CHECK(snx_hac_entries(hac, nsp_index, &entries) == 3);
+    CHECK(!strcmp(entries[1].name, "base.nca") && entries[1].size == u->base.size && entries[1].offset % 0x200);
+    CHECK(!strcmp(entries[2].name, "patch.nca") && entries[2].size == u->patch.size && entries[2].offset % 0x200);
+    SnxHacNca base, patch;
+    CHECK(!snx_hac_nca(hac, nsp_index, 1, &base) && !snx_hac_nca(hac, nsp_index, 2, &patch));
+    CHECK(base.type == SNX_HAC_PROGRAM && !base.patch && base.title_id == 0x0100000000AB0000ULL);
+    CHECK(patch.type == SNX_HAC_PROGRAM && patch.patch);
+    CHECK(snx_hac_nca(hac, nsp_index, 0, &base) == -1); /* not an NCA */
+    sprintf(path, "%s/romfs", dir);
+    CHECK(!snx_hac_extract(hac, nsp_index, 2, nsp_index, 1, NULL, path));
+    snx_hac_free(hac);
     for (unsigned i = 0; i < 4; i++) {
         sprintf(path, "%s/romfs/%s", dir, files_b[i].name);
         FILE* file = fopen(path, "rb");
@@ -898,14 +783,12 @@ static void command_line(const char* hactool, const update_t* u) {
     }
     sprintf(path, "%s/romfs", dir);
     CHECK(!rmdir(path));
-    CHECK(!remove(key_path));
-    CHECK(!remove(patch_path));
-    sprintf(path, "%s/base.nca", dir);
+    sprintf(path, "%s/game.nsp", dir);
     CHECK(!remove(path));
     CHECK(!rmdir(dir));
 }
 
-int main(int argc, char** argv) {
+int main(void) {
     CHECK(sizeof(nca_fs_header_t) == 0x200);
     CHECK(sizeof(nca_sparse_info_t) == 0x30 && sizeof(nca_compression_info_t) == 0x28);
     CHECK(offsetof(nca_fs_header_t, sparse_info) == 0x148);
@@ -919,8 +802,8 @@ int main(int argc, char** argv) {
     two_level_tree();
     xts_partition();
     gamecard_key_area();
-    if (argc > 1) command_line(argv[1], &update);
+    in_place(&update);
     update_free(&update);
-    printf("hactool layers: %u checks passed%s\n", checks, argc > 1 ? ", with the command line" : "");
+    printf("hactool layers: %u checks passed\n", checks);
     return 0;
 }

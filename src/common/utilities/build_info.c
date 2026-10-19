@@ -35,6 +35,12 @@
 #define SNX_ARCH "x86_64"
 #elif defined(__aarch64__) || defined(_M_ARM64)
 #define SNX_ARCH "arm64"
+#elif defined(__powerpc64__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define SNX_ARCH "ppc64le"
+#elif defined(__powerpc64__) && defined(_CALL_ELF) && _CALL_ELF == 2
+#define SNX_ARCH "ppc64 (ELFv2)"
+#elif defined(__powerpc64__)
+#define SNX_ARCH "ppc64"
 #elif defined(__alpha__)
 #define SNX_ARCH "alpha"
 #else

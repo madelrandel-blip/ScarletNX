@@ -12,7 +12,7 @@
 
 enum {
 #define LINUX_NET_SYSCALL(number, name) GNU_NR_##name = number,
-#include "gnuabi/network/abi/linux_syscalls.inc"
+#include "gnuabi/abi/linux_syscalls.inc"
 };
 
 /* syscalls.c: true when number is one of abi/linux_syscalls.inc's */

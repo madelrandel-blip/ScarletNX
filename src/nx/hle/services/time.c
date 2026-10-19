@@ -9,12 +9,14 @@
    host's at startup (no daylight saving). The time zone rules the game gets are this file's own: the SDK only hands
    them back */
 #include "nx/hle/services/services_int.h"
+#include "nx/hle/hle.h"
 #include "nx/runtime/clock.h"
 #include <openssl/rand.h>
 #include <time.h>
 
 #include "hle/services/time.swipc.inc"
 
+#define TIME_PERMISSION_DENIED    RC(116, 1)
 #define TIME_CLOCK_MISMATCH      RC(116, 102)
 #define TIME_NOT_FOUND           RC(116, 200)
 #define TIME_OVERFLOW            RC(116, 201)
@@ -25,21 +27,7 @@
 #define TIME_INITIAL_YEAR        2019 /* set:sys's time!standard_user_clock_initial_year on the 12.1.0 set reports */
 #define TIME_AUTOMATIC_CORRECTION 1   /* the console's default: the clock is set from the network */
 
-/* a time zone rule as this file writes it into the game's nn::time::TimeZoneRule */
-typedef struct {
-    char magic[4]; /* "SNXZ" */
-    i32 utc_offset; /* seconds east of UTC */
-    char abbreviation[8];
-} TimeRule;
-
-static struct {
-    KShmem* shm;
-    u8 source_id[16];           /* the steady clock's: the console makes a new one when its RTC resets */
-    i64 base_ns;                /* the steady clock at the guest clock's start */
-    nn_time_SystemClockContext context; /* every system clock's */
-    TimeRule rule;              /* the device's */
-    char location[0x24];
-} tm;
+/* the state, the time zone rule it keeps (TimeRule) and the objects' data (TimeObj): g_hle.time (services_int.h) */
 
 /* ============================================================ the calendar */
 /* days since 1970-01-01 of a proleptic Gregorian date, and back (an era of 400 years is 146097 days) */
@@ -122,8 +110,8 @@ static void make_rule(i32 offset, TimeRule* r) {
 static int find_rule(const char* name, TimeRule* r) {
     int i;
     char z[0x24];
-    if (!strncmp(name, tm.location, sizeof tm.location)) {
-        *r = tm.rule;
+    if (!strncmp(name, g_hle.time.location, sizeof g_hle.time.location)) {
+        *r = g_hle.time.rule;
         R_SUCCEED();
     }
     if (!strcmp(name, "Etc/UTC") || !strcmp(name, "GMT") || !strcmp(name, "Etc/GMT") || !strcmp(name, "UTC")) {
@@ -146,10 +134,10 @@ static int read_rule(IpcBuf b, TimeRule* r) {
 }
 
 /* ============================================================ the clocks */
-static i64 steady_ns(void) { return tm.base_ns + (i64)guest_ns(); }
+static i64 steady_ns(void) { return g_hle.time.base_ns + (i64)guest_ns(); }
 static void steady_point(nn_time_SteadyClockTimePoint* p) {
     p->value = steady_ns() / TIME_NS;
-    memcpy(p->source_id.v, tm.source_id, 16);
+    memcpy(p->source_id.v, g_hle.time.source_id, 16);
 }
 /* a system clock's time from its context and the steady clock now, when they count from the same source */
 static int context_time(const nn_time_SystemClockContext* c, const nn_time_SteadyClockTimePoint* now, i64* t) {
@@ -157,11 +145,19 @@ static int context_time(const nn_time_SystemClockContext* c, const nn_time_Stead
     *t = c->offset + now->value;
     R_SUCCEED();
 }
+/* every system clock's context: taken at the start, on the steady clock's source */
+static nn_time_SystemClockContext system_context(void) {
+    nn_time_SystemClockContext c;
+    c.offset = g_hle.time.context_offset;
+    c.timestamp.value = g_hle.time.context_start;
+    memcpy(c.timestamp.source_id.v, g_hle.time.source_id, 16);
+    return c;
+}
 
 /* one of the shared memory's values the SDK reads without locks: a counter, and two copies the counter's parity
    picks between, at value bytes in */
 static void shm_write(u32 at, u32 value, const void* v, u32 size) {
-    u8* p = kshmem_ptr(tm.shm) + at;
+    u8* p = kshmem_ptr(g_hle.time.shm) + at;
     u32 counter;
     memcpy(&counter, p, 4);
     counter++;
@@ -177,60 +173,90 @@ void time_init(void) {
     u8 adjustment[0x38], automatic = TIME_AUTOMATIC_CORRECTION;
     i64 offset = 0, zero = 0;
 
-    if (RAND_bytes(tm.source_id, 16) != 1) memcpy(tm.source_id, "ScarletNX steady", 16);
-    tm.source_id[6] = (u8)(0x40 | (tm.source_id[6] & 0x0f)); /* a version 4 UUID */
-    tm.source_id[8] = (u8)(0x80 | (tm.source_id[8] & 0x3f));
-    tm.base_ns = (i64)g_t0_ns();
+    if (RAND_bytes(g_hle.time.source_id, 16) != 1) memcpy(g_hle.time.source_id, "ScarletNX steady", 16);
+    g_hle.time.source_id[6] = (u8)(0x40 | (g_hle.time.source_id[6] & 0x0f)); /* a version 4 UUID */
+    g_hle.time.source_id[8] = (u8)(0x80 | (g_hle.time.source_id[8] & 0x3f));
+    g_hle.time.base_ns = (i64)g_t0_ns();
 
     steady_point(&start);
-    tm.context.offset = (i64)now - start.value;
-    tm.context.timestamp = start;
+    g_hle.time.context_offset = (i64)now - start.value;
+    g_hle.time.context_start = start.value;
 
     /* the host's offset from UTC now, in minutes, as a fixed one */
     if (lt)
         offset = days_from_civil(lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday) * 86400 + lt->tm_hour * 3600 +
                  lt->tm_min * 60 + lt->tm_sec - (i64)now;
     offset = (offset + (offset < 0 ? -30 : 30)) / 60 * 60;
-    make_rule((i32)offset, &tm.rule);
+    make_rule((i32)offset, &g_hle.time.rule);
     /* its name, for whole hours; the others have none here, and are called UTC with their own offset */
     zone_name(offset && !(offset % 3600) && offset >= -12 * 3600 && offset <= 14 * 3600 ? (int)(offset / 3600) + 13 : 0,
-              tm.location);
+              g_hle.time.location);
 
     /* the steady clock's base (ns), the system clock contexts, automatic correction, and the continuous adjustment
        newer SDKs compute the steady clock from (Eden's StandardSteadyClockCore: no drift) */
-    tm.shm = kshmem_new(0x1000, "time");
-    kobj_ref(&tm.shm->o);
+    g_hle.time.shm = kshmem_new(0x1000, "time");
+    kobj_ref(&g_hle.time.shm->o);
     {
         nn_time_SteadyClockTimePoint base;
-        base.value = tm.base_ns;
-        memcpy(base.source_id.v, tm.source_id, 16);
+        base.value = g_hle.time.base_ns;
+        memcpy(base.source_id.v, g_hle.time.source_id, 16);
         shm_write(0x00, 8, &base, sizeof base);
     }
-    shm_write(0x38, 8, &tm.context, sizeof tm.context);
-    shm_write(0x80, 8, &tm.context, sizeof tm.context);
+    {
+        nn_time_SystemClockContext context = system_context();
+        shm_write(0x38, 8, &context, sizeof context);
+        shm_write(0x80, 8, &context, sizeof context);
+    }
     shm_write(0xC8, 4, &automatic, 1);
     memset(adjustment, 0, sizeof adjustment);
     offset = (i64)guest_ns();
     memcpy(adjustment, &offset, 8); /* the uptime it was set at */
     memcpy(adjustment + 8, &zero, 8); /* no drift: scale 0, shift 0 */
-    memcpy(adjustment + 0x18, &tm.base_ns, 8); /* the lower and upper bounds */
-    memcpy(adjustment + 0x20, &tm.base_ns, 8);
-    memcpy(adjustment + 0x28, tm.source_id, 16);
+    memcpy(adjustment + 0x18, &g_hle.time.base_ns, 8); /* the lower and upper bounds */
+    memcpy(adjustment + 0x20, &g_hle.time.base_ns, 8);
+    memcpy(adjustment + 0x28, g_hle.time.source_id, 16);
     shm_write(0xD0, 8, adjustment, sizeof adjustment);
-    LOG("time: the time zone is %s (UTC%s)\n", tm.location, tm.rule.abbreviation);
+    LOG("time: the time zone is %s (UTC%s)\n", g_hle.time.location, g_hle.time.rule.abbreviation);
+}
+
+/* ============================================================ writes */
+/* each session's object, and the clocks and time zone service it hands out, carry a TimeObj: read_only for time:u,
+   an application's, which may write no clock, no setting and no location (Eden's time:u has every write permission
+   off) */
+static int time_read_only(const SvcObj* self) { return ((const TimeObj*)self->data)->read_only; }
+static SvcObj* time_child(SvcObj* o, const SvcObj* parent) {
+    ((TimeObj*)o->data)->read_only = time_read_only(parent);
+    return o;
+}
+/* a write time:a or time:s may make: refused to time:u, and not kept for the others, the clocks and the time zone
+   being the host's */
+static int time_write(SvcObj* self, const char* what) {
+    R_UNLESS(!time_read_only(self), TIME_PERMISSION_DENIED);
+    WARN_LIMIT(8, "time: %s is not kept: the clocks and the time zone are the host's\n", what);
+    R_SUCCEED();
 }
 
 /* ============================================================ ISystemClock */
 static int nn_timesrv_detail_service_ISystemClock_GetCurrentTime(SvcObj* self, nn_time_PosixTime* time) {
     nn_time_SteadyClockTimePoint now;
+    nn_time_SystemClockContext context = system_context();
     (void)self;
     steady_point(&now);
-    return context_time(&tm.context, &now, time);
+    return context_time(&context, &now, time);
+}
+static int nn_timesrv_detail_service_ISystemClock_SetCurrentTime(SvcObj* self, nn_time_PosixTime time) {
+    (void)time;
+    return time_write(self, "SetCurrentTime");
+}
+static int nn_timesrv_detail_service_ISystemClock_SetSystemClockContext(SvcObj* self,
+                                                                        const nn_time_SystemClockContext* context) {
+    (void)context;
+    return time_write(self, "SetSystemClockContext");
 }
 static int nn_timesrv_detail_service_ISystemClock_GetSystemClockContext(SvcObj* self,
                                                                         nn_time_SystemClockContext* context) {
     (void)self;
-    *context = tm.context;
+    *context = system_context();
     R_SUCCEED();
 }
 /* the clock is never set: the event never signals */
@@ -247,11 +273,21 @@ static int nn_timesrv_detail_service_ISteadyClock_GetCurrentTimePoint(SvcObj* se
     R_SUCCEED();
 }
 
+static int nn_timesrv_detail_service_ISteadyClock_SetTestOffset(SvcObj* self, nn_TimeSpanType offset) {
+    (void)offset;
+    return time_write(self, "SetTestOffset");
+}
+
 /* ============================================================ ITimeZoneService */
 static int nn_timesrv_detail_service_ITimeZoneService_GetDeviceLocationName(SvcObj* self, nn_time_LocationName* name) {
     (void)self;
-    memcpy(name->v, tm.location, sizeof name->v);
+    memcpy(name->v, g_hle.time.location, sizeof name->v);
     R_SUCCEED();
+}
+static int nn_timesrv_detail_service_ITimeZoneService_SetDeviceLocationName(SvcObj* self,
+                                                                            const nn_time_LocationName* name) {
+    (void)name;
+    return time_write(self, "SetDeviceLocationName");
 }
 static int nn_timesrv_detail_service_ITimeZoneService_GetTotalLocationNameCount(SvcObj* self, i32* count) {
     (void)self;
@@ -291,6 +327,14 @@ static int nn_timesrv_detail_service_ITimeZoneService_GetTimeZoneRuleVersion(Svc
     memcpy(version->v, "2021a", 6); /* the time zone data of firmware 12.1.0, the one set:sys reports */
     R_SUCCEED();
 }
+/* the location was set when the runtime started, at the steady clock time the user clock's context was taken */
+static int nn_timesrv_detail_service_ITimeZoneService_GetDeviceLocationNameAndUpdatedTime(
+    SvcObj* self, nn_time_LocationName* name, nn_time_SteadyClockTimePoint* time_point) {
+    (void)self;
+    memcpy(name->v, g_hle.time.location, sizeof name->v);
+    *time_point = system_context().timestamp;
+    R_SUCCEED();
+}
 static int nn_timesrv_detail_service_ITimeZoneService_GetDeviceLocationNameOperationEventReadableHandle(SvcObj* self,
                                                                                                       u32* event) {
     (void)self;
@@ -307,7 +351,7 @@ static int nn_timesrv_detail_service_ITimeZoneService_ToCalendarTime(SvcObj* sel
 static int nn_timesrv_detail_service_ITimeZoneService_ToCalendarTimeWithMyRule(
     SvcObj* self, nn_time_PosixTime time, nn_time_CalendarTime* calendar, nn_time_sf_CalendarAdditionalInfo* info) {
     (void)self;
-    return time_to_calendar(time, &tm.rule, calendar, info);
+    return time_to_calendar(time, &g_hle.time.rule, calendar, info);
 }
 /* a local time is one posix time in a zone without daylight saving */
 static int to_posix(const nn_time_CalendarTime* calendar, const TimeRule* r, IpcBuf times, i32* count) {
@@ -329,45 +373,39 @@ static int nn_timesrv_detail_service_ITimeZoneService_ToPosixTimeWithMyRule(SvcO
                                                                            const nn_time_CalendarTime* calendar,
                                                                            IpcBuf times, i32* count) {
     (void)self;
-    return to_posix(calendar, &tm.rule, times, count);
+    return to_posix(calendar, &g_hle.time.rule, times, count);
 }
 
 /* ============================================================ IStaticService */
 /* the user's, network, local and ephemeral network clocks are one context here */
-static SvcObj* new_clock(void) { return nn_timesrv_detail_service_ISystemClock_new(0); }
+static SvcObj* new_clock(const SvcObj* self) { return time_child(nn_timesrv_detail_service_ISystemClock_new_data(g_hle.time.objs, g_hle.time.obj_next, "time objects"), self); }
 static int nn_timesrv_detail_service_IStaticService_GetStandardUserSystemClock(SvcObj* self, SvcObj** clock) {
-    (void)self;
-    *clock = new_clock();
+    *clock = new_clock(self);
     R_SUCCEED();
 }
 static int nn_timesrv_detail_service_IStaticService_GetStandardNetworkSystemClock(SvcObj* self, SvcObj** clock) {
-    (void)self;
-    *clock = new_clock();
+    *clock = new_clock(self);
     R_SUCCEED();
 }
 static int nn_timesrv_detail_service_IStaticService_GetStandardSteadyClock(SvcObj* self, SvcObj** clock) {
-    (void)self;
-    *clock = nn_timesrv_detail_service_ISteadyClock_new(0);
+    *clock = time_child(nn_timesrv_detail_service_ISteadyClock_new_data(g_hle.time.objs, g_hle.time.obj_next, "time objects"), self);
     R_SUCCEED();
 }
 static int nn_timesrv_detail_service_IStaticService_GetTimeZoneService(SvcObj* self, SvcObj** service) {
-    (void)self;
-    *service = nn_timesrv_detail_service_ITimeZoneService_new(0);
+    *service = time_child(nn_timesrv_detail_service_ITimeZoneService_new_data(g_hle.time.objs, g_hle.time.obj_next, "time objects"), self);
     R_SUCCEED();
 }
 static int nn_timesrv_detail_service_IStaticService_GetStandardLocalSystemClock(SvcObj* self, SvcObj** clock) {
-    (void)self;
-    *clock = new_clock();
+    *clock = new_clock(self);
     R_SUCCEED();
 }
 static int nn_timesrv_detail_service_IStaticService_GetEphemeralNetworkSystemClock(SvcObj* self, SvcObj** clock) {
-    (void)self;
-    *clock = new_clock();
+    *clock = new_clock(self);
     R_SUCCEED();
 }
 static int nn_timesrv_detail_service_IStaticService_GetSharedMemoryNativeHandle(SvcObj* self, u32* shared_memory) {
     (void)self;
-    *shared_memory = h_new(&tm.shm->o);
+    *shared_memory = h_new(&g_hle.time.shm->o);
     R_SUCCEED();
 }
 static int nn_timesrv_detail_service_IStaticService_GetStandardNetworkClockOperationEventReadableHandle(SvcObj* self,
@@ -385,6 +423,16 @@ static int nn_timesrv_detail_service_IStaticService_IsStandardUserSystemClockAut
     (void)self;
     *enabled = TIME_AUTOMATIC_CORRECTION;
     R_SUCCEED();
+}
+static int nn_timesrv_detail_service_IStaticService_SetStandardSteadyClockInternalOffset(SvcObj* self,
+                                                                                         nn_TimeSpanType offset) {
+    (void)offset;
+    return time_write(self, "SetStandardSteadyClockInternalOffset");
+}
+static int nn_timesrv_detail_service_IStaticService_SetStandardUserSystemClockAutomaticCorrectionEnabled(SvcObj* self,
+                                                                                                         u8 enabled) {
+    (void)enabled;
+    return time_write(self, "SetStandardUserSystemClockAutomaticCorrectionEnabled");
 }
 static int nn_timesrv_detail_service_IStaticService_GetStandardUserSystemClockInitialYear(SvcObj* self, i32* year) {
     (void)self;
@@ -436,19 +484,19 @@ static int snapshot(u8 type, const nn_time_SystemClockContext* user, const nn_ti
     steady_point(&now);
     memcpy(s + SNAP_STEADY, &now, sizeof now);
     s[SNAP_AUTOMATIC] = TIME_AUTOMATIC_CORRECTION;
-    memcpy(s + SNAP_LOCATION, tm.location, sizeof tm.location);
+    memcpy(s + SNAP_LOCATION, g_hle.time.location, sizeof g_hle.time.location);
     R_TRY(context_time(user, &now, &user_time));
     memcpy(s + SNAP_USER_TIME, &user_time, 8);
     memset(&cal, 0, sizeof cal);
     memset(&info, 0, sizeof info);
-    R_TRY(time_to_calendar(user_time, &tm.rule, &cal, &info));
+    R_TRY(time_to_calendar(user_time, &g_hle.time.rule, &cal, &info));
     memcpy(s + SNAP_USER_CALENDAR, &cal, sizeof cal);
     memcpy(s + SNAP_USER_INFO, &info, sizeof info);
     if (R_FAILED(context_time(network, &now, &network_time))) network_time = 0;
     memcpy(s + SNAP_NETWORK_TIME, &network_time, 8);
     memset(&cal, 0, sizeof cal);
     memset(&info, 0, sizeof info);
-    R_TRY(time_to_calendar(network_time, &tm.rule, &cal, &info));
+    R_TRY(time_to_calendar(network_time, &g_hle.time.rule, &cal, &info));
     memcpy(s + SNAP_NETWORK_CALENDAR, &cal, sizeof cal);
     memcpy(s + SNAP_NETWORK_INFO, &info, sizeof info);
     s[SNAP_TYPE] = type;
@@ -456,8 +504,9 @@ static int snapshot(u8 type, const nn_time_SystemClockContext* user, const nn_ti
     R_SUCCEED();
 }
 static int nn_timesrv_detail_service_IStaticService_GetClockSnapshot(SvcObj* self, u8 type, IpcBuf out) {
+    nn_time_SystemClockContext context = system_context();
     (void)self;
-    return snapshot(type, &tm.context, &tm.context, out);
+    return snapshot(type, &context, &context, out);
 }
 static int nn_timesrv_detail_service_IStaticService_GetClockSnapshotFromSystemClockContext(
     SvcObj* self, u8 type, const nn_time_SystemClockContext* user_context,
@@ -518,4 +567,9 @@ static int nn_timesrv_detail_service_IStaticService_CalculateSpanBetween(SvcObj*
     R_SUCCEED();
 }
 
-SvcObj* new_time(void) { return nn_timesrv_detail_service_IStaticService_new(0); }
+SvcObj* new_time(void) { return nn_timesrv_detail_service_IStaticService_new_data(g_hle.time.objs, g_hle.time.obj_next, "time objects"); }
+SvcObj* new_time_user(void) {
+    SvcObj* o = nn_timesrv_detail_service_IStaticService_new_data(g_hle.time.objs, g_hle.time.obj_next, "time objects");
+    ((TimeObj*)o->data)->read_only = 1;
+    return o;
+}

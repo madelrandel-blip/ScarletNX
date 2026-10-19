@@ -2,6 +2,7 @@
    Copyright 2026 the ScarletNX contributors */
 /* vi's buffers on the display, and the game's pace: how long vi holds back the game's next buffer */
 #include "nx/runtime/main.h"
+#include "nx/runtime/cheats.h"
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/renderer.h"
 #include "nx/hle/services/nvdrv.h"
@@ -23,6 +24,7 @@ void vi_show_buffer(u32 nvmap_id, u32 offset, u32 w, u32 h, u32 pitch, u32 layou
     /* the flips are the display's: the guest's buffer is never turned */
     g_renderer->present_buffer(a + offset, w, h, pitch, layout, bhl, fmt, crop, transform);
     __atomic_add_fetch(&g_frames, 1, __ATOMIC_RELAXED);
+    cheats_frame(); /* the cheats run once per frame shown, as dmnt's run on the console */
 }
 
 /* Several threads may queue frames, so the schedule is under a lock; the wait itself is outside it. Called on the

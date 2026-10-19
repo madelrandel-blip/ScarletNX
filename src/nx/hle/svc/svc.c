@@ -9,6 +9,7 @@
 /* the SVC dispatch: each SVC's registers in the 64-bit ABI (and the 32-bit one's, through snx_svc32), the thread's
    entry and exit (its core, pausing), and the SVCs that aren't memory or synchronization */
 #include "nx/hle/kernel/kernel_int.h"
+#include "nx/hle/hle.h"
 #include "nx/runtime/arm.h"
 #include "nx/runtime/clock.h"
 
@@ -17,18 +18,15 @@
 #define R_BADPOINTER   0xE601 /* InvalidPointer */
 
 /* ============================================================ objects only the SVCs make */
-/* svcCreateEvent's writable end: it signals and clears the readable end it holds a reference to */
-typedef struct {
-    KObj o;
-    KEvent* r;
-} KWEvent;
+/* svcCreateEvent's writable end (KWEvent), from g_hle.svc.wevents (KHANDLED_MAX). The process's resource limit, for
+   GetInfo 9, is g_hle.svc.reslimit: one object, never destroyed */
 static void wevent_destroy(KObj* o) {
     kobj_unref(&((KWEvent*)o)->r->o);
     free(o->waiters);
-    free(o);
+    pm_lock(&g_hle.kernel.pool_lk);
+    POOL_PUT((KWEvent*)o);
+    pm_unlock(&g_hle.kernel.pool_lk);
 }
-/* the process's resource limit, for GetInfo 9: one object, never destroyed */
-static KObj g_reslimit = {KO_RESLIMIT, 1, NULL, NULL, NULL, 0, 0, "resource limit"};
 
 /* a handle for o, which has no reference yet: the handle's is its only one. With the table full it is destroyed */
 static u32 give_handle(KObj* o, u32* out) {
@@ -40,8 +38,10 @@ static u32 give_handle(KObj* o, u32* out) {
     *out = h;
     R_SUCCEED();
 }
-static KThread* thread_of(u32 h) { return (KThread*)h_get_type(h, KO_THREAD); }
-static int valid_prio(i32 p) { return p >= 0 && p < 64 && ((g_prio_mask >> p) & 1); }
+/* the thread h names, with a reference the caller drops (thread_put): threads are freed with their last one */
+static KThread* thread_of(u32 h) { return (KThread*)h_get_ref(h, KO_THREAD); }
+static void thread_put(KThread* t) { kobj_unref(t ? &t->o : NULL); }
+static int valid_prio(i32 p) { return p >= 0 && p < 64 && ((g_hle.svcmem.prio_mask >> p) & 1); }
 
 /* ============================================================ entering and leaving an SVC */
 /* svcSetThreadActivity's pause: a paused thread stops at its next SVC, before it (where 1) or on its way out of the
@@ -51,13 +51,13 @@ static int pause_point(KThread* t, int where) {
     int i;
     if (!__atomic_load_n(&t->suspended, __ATOMIC_SEQ_CST)) return 0;
     core_leave(t);
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     t->pause_at = where;
     for (i = 0; i < t->o.nwait; i++)
         if (t->o.waiters[i]->wait_kind == 5) wake(t->o.waiters[i], 0);
-    while (t->suspended) pc_wait(&t->cv, &g_klock, -1);
+    while (t->suspended) pc_wait(&t->cv, &g_hle.kernel.klock, -1);
     t->pause_at = 0;
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
     return 1;
 }
 /* cur (with g_klock held) waits until t, asked to pause, runs no game code: it is inside an SVC, stopped at a pause
@@ -108,22 +108,22 @@ static void svc_leave(KThread* t) {
 /* svcCreateThread: a core of the process's (-2 its default), a priority it may use, then the thread, not started */
 static u32 create_thread(u64 entry, u64 arg, u64 stack_top, i32 prio, i32 core, u32* out) {
     KThread* t;
-    if (core == -2) core = g_default_core;
-    R_UNLESS(core >= 0 && core < NCORES && ((g_core_mask >> core) & 1), R_BADCORE);
+    if (core == -2) core = g_hle.thread.default_core;
+    R_UNLESS(core >= 0 && core < NCORES && ((g_hle.svcmem.core_mask >> core) & 1), R_BADCORE);
     R_UNLESS(valid_prio(prio), R_BADPRIO);
     t = kthread_create(entry, arg, stack_top, prio, core);
-    *out = h_new(&t->o);
-    return *out ? 0 : R_OUTOFHANDLES;
+    return give_handle(&t->o, out);
 }
 static u32 start_thread(u32 h) {
     KThread* t = thread_of(h);
     int st;
     R_UNLESS(t, R_BADHANDLE);
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     st = t->state;
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
+    if (st == 0) kthread_start(t);
+    thread_put(t);
     R_UNLESS(st == 0, R_BADSTATE);
-    kthread_start(t);
     R_SUCCEED();
 }
 /* svcSleepThread: a sleep off the core, or one of the three yields (0 on its core, -1 and -2 to any core) */
@@ -139,10 +139,10 @@ static void sleep_thread(KThread* t, i64 ns) {
         memcpy(t->sleep_x, t->cpu.x, sizeof t->sleep_x);
     }
     if (ns > 0) {
-        pm_lock(&g_klock);
+        pm_lock(&g_hle.kernel.klock);
         t->woken = 0;
         sleep_nl(t, ns);
-        pm_unlock(&g_klock);
+        pm_unlock(&g_hle.kernel.klock);
         return;
     }
     if (ns != 0 && ns != -1 && ns != -2) return;
@@ -155,9 +155,10 @@ static u32 set_thread_priority(u32 h, i32 prio) {
     R_UNLESS(valid_prio(prio), R_BADPRIO);
     t = thread_of(h);
     R_UNLESS(t, R_BADHANDLE);
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     prio_set_base_nl(t, prio);
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
+    thread_put(t);
     R_SUCCEED();
 }
 /* svcSetThreadCoreMask (Eden's svc_thread.cpp): core -2 is the process's default core alone, -3 keeps the ideal core,
@@ -165,10 +166,10 @@ static u32 set_thread_priority(u32 h, i32 prio) {
 static u32 set_thread_core_mask(KThread* cur, u32 h, i32 core, u64 mask) {
     KThread* t;
     if (core == -2) {
-        core = g_default_core;
+        core = g_hle.thread.default_core;
         mask = 1ull << core;
     } else {
-        R_UNLESS((mask | g_core_mask) == g_core_mask, R_BADCORE);
+        R_UNLESS((mask | g_hle.svcmem.core_mask) == g_hle.svcmem.core_mask, R_BADCORE);
         R_UNLESS(mask, R_BADCOMBO);
         if (core >= 0 && core < NCORES) {
             if (!((mask >> core) & 1)) R_THROW(R_BADCOMBO);
@@ -177,18 +178,19 @@ static u32 set_thread_core_mask(KThread* cur, u32 h, i32 core, u64 mask) {
     }
     t = thread_of(h);
     R_UNLESS(t, R_BADHANDLE);
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     if (core == -3) {
         core = t->ideal_core;
         if (core >= 0 && !((mask >> core) & 1)) {
-            pm_unlock(&g_klock);
+            pm_unlock(&g_hle.kernel.klock);
+            thread_put(t);
             R_THROW(R_BADCOMBO);
         }
     }
     __atomic_store_n(&t->ideal_core, core, __ATOMIC_RELAXED);
     __atomic_store_n(&t->affinity, mask, __ATOMIC_RELAXED);
     if (t->state == 0) t->core = core_allowed(t); /* not started: on no core's list yet */
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
     if (t == cur) {
         int k = core >= 0 ? core : (mask >> t->core) & 1 ? t->core : core_allowed(t);
         if (k != t->core) { /* the caller holds its core: nothing else changes its core field meanwhile */
@@ -197,6 +199,7 @@ static u32 set_thread_core_mask(KThread* cur, u32 h, i32 core, u64 mask) {
             core_enter(t);
         }
     }
+    thread_put(t);
     R_SUCCEED();
 }
 /* svcSetThreadActivity: 0 runs a paused thread again, 1 pauses it, and returns once it runs no game code (InvalidState
@@ -207,8 +210,11 @@ static u32 set_thread_activity(KThread* cur, u32 h, u32 act) {
     R_UNLESS(act <= 1, R_BADENUM);
     t = thread_of(h);
     R_UNLESS(t, R_BADHANDLE);
-    R_UNLESS(t != cur, R_BUSY);
-    pm_lock(&g_klock);
+    if (t == cur) {
+        thread_put(t);
+        R_THROW(R_BUSY);
+    }
+    pm_lock(&g_hle.kernel.klock);
     if (t->state != 1 || t->suspended == (int)act)
         r = R_BADSTATE;
     else {
@@ -221,7 +227,8 @@ static u32 set_thread_activity(KThread* cur, u32 h, u32 act) {
         } else
             pause_settle_nl(cur, t);
     }
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
+    thread_put(t);
     return r;
 }
 static void put64(u8* p, u64 v) { memcpy(p, &v, 8); }
@@ -236,13 +243,21 @@ static u32 get_thread_context(KThread* cur, u64 out, u32 h) {
     u8 ctx[0x320];
     u32 w[2];
     int i, inside, at_svc;
+    u32 r = 0;
     R_UNLESS(t, R_BADHANDLE);
-    R_UNLESS(t != cur, R_BUSY);
-    R_UNLESS(out < AS_END && sizeof ctx <= AS_END - out, R_BADPOINTER);
-    pm_lock(&g_klock);
+    if (t == cur)
+        r = R_BUSY;
+    else if (!(out < AS_END && sizeof ctx <= AS_END - out))
+        r = R_BADPOINTER;
+    if (r) {
+        thread_put(t);
+        return r;
+    }
+    pm_lock(&g_hle.kernel.klock);
     pause_settle_nl(cur, t);
     if (t->state != 2 && (t->state != 1 || !t->suspended)) {
-        pm_unlock(&g_klock);
+        pm_unlock(&g_hle.kernel.klock);
+        thread_put(t);
         R_THROW(R_BADSTATE);
     }
     memset(ctx, 0, sizeof ctx);
@@ -288,7 +303,8 @@ static u32 get_thread_context(KThread* cur, u64 out, u32 h) {
         memcpy(ctx + 0x310, w, 8);
         memcpy(ctx + 0x318, &c->tpidr, 8);
     }
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
+    thread_put(t);
     memcpy(GP(out), ctx, sizeof ctx);
     R_SUCCEED();
 }
@@ -296,21 +312,24 @@ static u32 get_thread_context(KThread* cur, u64 out, u32 h) {
 static u32 cancel_sync(u32 h) {
     KThread* t = thread_of(h);
     R_UNLESS(t, R_BADHANDLE);
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     if (t->wait_kind == 1 && !t->woken)
         wake(t, R_CANCELLED);
     else
         t->cancel = 1;
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
+    thread_put(t);
     R_SUCCEED();
 }
 
 /* ============================================================ events */
 static u32 create_event(u32* wh, u32* rh) {
     KEvent* r = kevent_new("event");
-    KWEvent* w = (KWEvent*)calloc(1, sizeof *w);
-    if (!w) fatal("Out of memory for an event");
+    KWEvent* w;
+    pm_lock(&g_hle.kernel.pool_lk);
+    w = (KWEvent*)POOL_TAKE(g_hle.svc.wevents, g_hle.svc.wevent_next, "writable events");
     w->o.type = KO_WEVENT;
+    pm_unlock(&g_hle.kernel.pool_lk);
     w->o.destroy = wevent_destroy;
     w->o.name = "writable event";
     w->r = r;
@@ -343,12 +362,12 @@ static u32 clear_event(u32 h, int reset) {
     else if (o->type != KO_PROCESS || !reset)
         r = R_BADHANDLE;
     if (R_SUCCEEDED(r)) {
-        pm_lock(&g_klock);
+        pm_lock(&g_hle.kernel.klock);
         if (reset && (!e || !e->signaled))
             r = R_BADSTATE;
         else
             e->signaled = 0;
-        pm_unlock(&g_klock);
+        pm_unlock(&g_hle.kernel.klock);
     }
     kobj_unref(o);
     return r;
@@ -442,7 +461,7 @@ static u32 get_info(u32 id0, u32 h, u64 id1, u64* out) {
     if (id0 != 9) return svc_get_info(id0, h, id1, out);
     R_UNLESS(!h, R_BADHANDLE); /* ResourceLimit: always succeeds after its checks */
     R_UNLESS(!id1, R_BADCOMBO);
-    *out = h_new(&g_reslimit);
+    *out = h_new(&g_hle.svc.reslimit);
     R_SUCCEED();
 }
 
@@ -460,8 +479,8 @@ static u32 svc_begin(KThread* t, SvcRec* in, u32 imm, int flags) {
     in->res = 0;
     in->o1 = 0;
     if (!(flags & SVC_QUIET)) {
-        n = __atomic_fetch_add(&g_svc_ring_n, 1, __ATOMIC_RELAXED);
-        g_svc_ring[n & 63] = *in;
+        n = __atomic_fetch_add(&g_hle.kernel.svc_ring_n, 1, __ATOMIC_RELAXED);
+        g_hle.kernel.svc_ring[n & 63] = *in;
     }
     svc_enter(t);
     return n;
@@ -484,9 +503,9 @@ static void svc_end(KThread* t, const SvcRec* in, u32 n, int flags, u64 res, u64
         WARN_LIMIT(20, "svc %02x with an invalid handle (x0=%llx x1=%llx x2=%llx x3=%llx), lr %llx\n", in->imm,
                    (unsigned long long)in->a[0], (unsigned long long)in->a[1], (unsigned long long)in->a[2],
                    (unsigned long long)in->a[3], (unsigned long long)in->lr);
-    if (!(flags & SVC_QUIET) && __atomic_load_n(&g_svc_ring_n, __ATOMIC_RELAXED) - n < 64) { /* not another SVC's yet */
-        g_svc_ring[n & 63].res = (u32)res;
-        g_svc_ring[n & 63].o1 = o1;
+    if (!(flags & SVC_QUIET) && __atomic_load_n(&g_hle.kernel.svc_ring_n, __ATOMIC_RELAXED) - n < 64) { /* not another SVC's yet */
+        g_hle.kernel.svc_ring[n & 63].res = (u32)res;
+        g_hle.kernel.svc_ring[n & 63].o1 = o1;
     }
 }
 
@@ -549,6 +568,7 @@ static u32 svc_GetThreadPriority(i32* out_priority, u32 thread_handle) {
     KThread* o = thread_of(thread_handle);
     R_UNLESS(o, R_BADHANDLE);
     *out_priority = o->prio;
+    thread_put(o);
     R_SUCCEED();
 }
 static u32 svc_SetThreadPriority(u32 thread_handle, i32 priority) {
@@ -559,6 +579,7 @@ static u32 svc_GetThreadCoreMask(i32* out_core_id, u64* out_affinity_mask, u32 t
     R_UNLESS(o, R_BADHANDLE);
     *out_core_id = o->ideal_core;
     *out_affinity_mask = o->affinity;
+    thread_put(o);
     R_SUCCEED();
 }
 static u32 svc_SetThreadCoreMask(u32 thread_handle, i32 core_id, u64 affinity_mask) {
@@ -612,6 +633,7 @@ static u32 svc_GetThreadId(u64* out_thread_id, u32 thread_handle) {
     KThread* o = thread_of(thread_handle);
     R_UNLESS(o, R_BADHANDLE);
     *out_thread_id = o->id;
+    thread_put(o);
     R_SUCCEED();
 }
 static void svc_Break(u32 break_reason, u64 arg, u64 size) { svc_break(&kthread_cur()->cpu, break_reason, arg, size); }

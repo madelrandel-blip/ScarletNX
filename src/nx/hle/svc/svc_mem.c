@@ -9,6 +9,7 @@
 /* the memory SVCs (heap, physical memory, permissions and attributes, MapMemory, shared, transfer and code memory,
    QueryMemory), the process's memory accounting, and GetInfo */
 #include "nx/hle/kernel/kernel_int.h"
+#include "nx/hle/hle.h"
 #include "nx/runtime/clock.h"
 
 #define R_BADPERM    0xD801 /* InvalidNewMemoryPermission */
@@ -24,9 +25,6 @@
 /* MemoryAttribute: Locked, IpcLocked, DeviceShared, Uncached, PermissionLocked */
 #define MA_LOCKED   1u
 #define MA_SET_MASK 0x18u /* what SetMemoryAttribute may change: Uncached and PermissionLocked */
-
-int g_opt_mem_gb;
-u64 g_core_mask = 0xF, g_prio_mask = 0xFFFFFFFFFFFFFFF0ull; /* until the npdm says (main.c): an application's */
 
 /* ============================================================ helpers */
 static int in_region(u64 a, u64 size, u64 base, u64 rsize) { return a >= base && size <= rsize && a - base <= rsize - size; }
@@ -92,18 +90,18 @@ static int user_writable(u64 a, u64 size) {
 /* The application pool for each memory_gb (Mesosphere's KSystemControl application pool sizes for the 4, 6 and 8 GiB
    boards), see docs/MEMORY_ACCOUNTING.md */
 u64 mem_total(void) {
-    if (g_opt_mem_gb >= 8) return 6964 * MIB;
-    if (g_opt_mem_gb >= 6) return 4916 * MIB;
+    if (g_hle.svcmem.opt_mem_gb >= 8) return 6964 * MIB;
+    if (g_hle.svcmem.opt_mem_gb >= 6) return 4916 * MIB;
     return 3285 * MIB;
 }
 /* the loaded images, the main thread's stack, the heap, physical memory and the system resource, charged once */
 u64 used_memory(void) {
     return g_code_memory + g_main_stack_size + __atomic_load_n(&g_heap_size, __ATOMIC_ACQUIRE) +
-           __atomic_load_n(&g_phys_mapped, __ATOMIC_ACQUIRE) + g_sysres_size;
+           __atomic_load_n(&g_phys_mapped, __ATOMIC_ACQUIRE) + g_hle.kernel.sysres_size;
 }
 /* what the heap and physical memory may use between them */
 static u64 heap_budget(void) {
-    u64 fixed = g_code_memory + g_main_stack_size + g_sysres_size, total = mem_total();
+    u64 fixed = g_code_memory + g_main_stack_size + g_hle.kernel.sysres_size, total = mem_total();
     return fixed < total ? total - fixed : 0;
 }
 static u32 mem_result(int r) {
@@ -142,7 +140,7 @@ static u32 check_physical(u64 addr, u64 size) {
     R_UNLESS(!(addr & 0xFFF), R_BADADDR);
     R_UNLESS(size && !(size & 0xFFF), R_BADSIZE);
     R_UNLESS(addr + size > addr, R_BADREGION);
-    R_UNLESS(g_sysres_size, R_BADSTATE);
+    R_UNLESS(g_hle.kernel.sysres_size, R_BADSTATE);
     R_UNLESS(in_region(addr, size, ALIAS_BASE, ALIAS_SIZE), R_BADREGION);
     R_SUCCEED();
 }
@@ -252,19 +250,24 @@ static void shm_destroy(KObj* o) {
     else
         free(s->host);
     free(o->waiters);
-    free(s);
+    pm_lock(&g_hle.kernel.pool_lk);
+    POOL_PUT(s);
+    pm_unlock(&g_hle.kernel.pool_lk);
 }
-/* with no reference: the first handle takes one, or the service that keeps it */
+/* with no reference: the first handle takes one, or the service that keeps it. The object is from g_hle.svcmem.shmems
+   (KSHMEM_MAX), its pages (host) of the size the service asks for its own */
 KShmem* kshmem_new(u64 size, const char* name) {
-    KShmem* s = (KShmem*)calloc(1, sizeof *s);
+    KShmem* s;
     u64 off;
-    if (!s) fatal("Out of memory for the shared memory %s", name);
+    pm_lock(&g_hle.kernel.pool_lk);
+    s = (KShmem*)POOL_TAKE(g_hle.svcmem.shmems, g_hle.svcmem.shmem_next, "shared memories");
+    s->o.type = KO_SHMEM;
+    pm_unlock(&g_hle.kernel.pool_lk);
     s->size = size;
     if ((s->host = mem_pool_host(shm_whole(s), &off)) != NULL)
         s->pool = off + 1;
     else if (!(s->host = (u8*)calloc(1, (size_t)shm_whole(s))))
         fatal("Out of memory for the shared memory %s", name);
-    s->o.type = KO_SHMEM;
     s->o.destroy = shm_destroy;
     s->o.name = name;
     s->perm = PERM_RW;
@@ -322,10 +325,10 @@ u32 svc_map_shm(u32 h, u64 addr, u64 size, u32 perm) {
         r = m == -2 ? R_OUTOFMEM : R_BADMEMSTATE;
         __atomic_store_n(&s->gsize, 0, __ATOMIC_RELEASE);
     } else {
-        pm_lock(&g_klock);
+        pm_lock(&g_hle.kernel.klock);
         memcpy(GP(addr), s->host, (size_t)s->size);
         __atomic_store_n(&s->gaddr, addr, __ATOMIC_RELEASE);
-        pm_unlock(&g_klock);
+        pm_unlock(&g_hle.kernel.klock);
     }
     kobj_unref(&s->o);
     return r;
@@ -354,10 +357,10 @@ u32 svc_unmap_shm(u32 h, u64 addr, u64 size) {
     } else if (__atomic_load_n(&s->gaddr, __ATOMIC_ACQUIRE) != addr)
         r = R_BADMEMSTATE;
     else {
-        pm_lock(&g_klock);
+        pm_lock(&g_hle.kernel.klock);
         memcpy(s->host, GP(addr), (size_t)s->size);
         __atomic_store_n(&s->gaddr, 0, __ATOMIC_RELEASE);
-        pm_unlock(&g_klock);
+        pm_unlock(&g_hle.kernel.klock);
         mem_unmap(addr, __atomic_load_n(&s->gsize, __ATOMIC_ACQUIRE));
         __atomic_store_n(&s->gsize, 0, __ATOMIC_RELEASE);
     }
@@ -374,9 +377,10 @@ u32 svc_tmem_new(u64 addr, u64 size, u32 perm, KTmem** out) {
     if (perm != PERM_NONE && perm != PERM_R && perm != PERM_RW) R_THROW(R_BADPERM);
     if (!in_region(addr, size, 0, AS_END) || !range_ok(addr, size, 0, MSF_CAN_TRANSFER, PERM_RW, ~0u, 0))
         R_THROW(R_BADMEMSTATE);
-    m = (KTmem*)calloc(1, sizeof *m);
-    if (!m) fatal("Out of memory for a transfer memory");
+    pm_lock(&g_hle.kernel.pool_lk);
+    m = (KTmem*)POOL_TAKE(g_hle.svcmem.tmems, g_hle.svcmem.tmem_next, "transfer memories");
     m->o.type = KO_TMEM;
+    pm_unlock(&g_hle.kernel.pool_lk);
     m->o.destroy = tmem_destroy;
     m->o.name = "transfer memory";
     m->addr = addr;
@@ -392,18 +396,17 @@ void tmem_destroy(KObj* o) {
     mem_set_attr(m->addr, m->size, MA_LOCKED, 0);
     set_perm(m->addr, m->size, PERM_RW);
     free(o->waiters);
-    free(m);
+    pm_lock(&g_hle.kernel.pool_lk);
+    POOL_PUT(m);
+    pm_unlock(&g_hle.kernel.pool_lk);
 }
 
 /* ============================================================ code memory */
 /* svcCreateCodeMemory and svcControlCodeMemory, for games with a JIT: the source is locked, and the owner (read-write)
    and slave (executable) mappings are views of it, as MapMemory's is: with the alias pool all three are the same
    pages, so code the game writes through the owner is in the slave at once. Without the pool they are copies, the
-   slave of the owner when it is mapped, and code written after the slave is mapped doesn't reach it */
-typedef struct {
-    KObj o;
-    u64 addr, size, owner, slave;
-} KCodeMem;
+   slave of the owner when it is mapped, and code written after the slave is mapped doesn't reach it. A KCodeMem, from
+   g_hle.svcmem.codemems (KHANDLED_MAX) */
 static void codemem_destroy(KObj* o) {
     KCodeMem* c = (KCodeMem*)o;
     if (c->owner) mem_alias_unmap(c->owner, c->size, c->addr);
@@ -412,7 +415,9 @@ static void codemem_destroy(KObj* o) {
     mem_set_attr(c->addr, c->size, MA_LOCKED, 0);
     set_perm(c->addr, c->size, PERM_RW);
     free(o->waiters);
-    free(c);
+    pm_lock(&g_hle.kernel.pool_lk);
+    POOL_PUT(c);
+    pm_unlock(&g_hle.kernel.pool_lk);
 }
 u32 svc_codemem_new(u64 addr, u64 size, KObj** out) {
     KCodeMem* c;
@@ -420,9 +425,10 @@ u32 svc_codemem_new(u64 addr, u64 size, KObj** out) {
     if (!in_region(addr, size, 0, AS_END) || !range_ok(addr, size, 0, MSF_CAN_CODE_MEMORY, PERM_RW, ~0u, 0))
         R_THROW(R_BADMEMSTATE);
     R_TRY(mem_result(mem_alias_begin(addr, size)));
-    c = (KCodeMem*)calloc(1, sizeof *c);
-    if (!c) fatal("Out of memory for a code memory");
+    pm_lock(&g_hle.kernel.pool_lk);
+    c = (KCodeMem*)POOL_TAKE(g_hle.svcmem.codemems, g_hle.svcmem.codemem_next, "code memories");
     c->o.type = KO_CODEMEM;
+    pm_unlock(&g_hle.kernel.pool_lk);
     c->o.destroy = codemem_destroy;
     c->o.name = "code memory";
     c->addr = addr;
@@ -460,9 +466,9 @@ u32 svc_codemem_control(KObj* o, u32 op, u64 addr, u64 size, u32 perm) {
 /* ============================================================ GetInfo */
 /* RandomEntropy: four words fixed for the run, from the clock at their first use (splitmix64) */
 static u64 entropy(u32 i) {
-    static u64 e[4];
-    static int made;
-    if (!__atomic_load_n(&made, __ATOMIC_ACQUIRE)) {
+    u64* e = g_hle.svcmem.entropy;
+    int* made = &g_hle.svcmem.entropy_made;
+    if (!__atomic_load_n(made, __ATOMIC_ACQUIRE)) {
         u64 s = plat_ns() ^ 0x9E3779B97F4A7C15ull, v[4];
         int k;
         for (k = 0; k < 4; k++) {
@@ -471,22 +477,22 @@ static u64 entropy(u32 i) {
             z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
             v[k] = (z ^ (z >> 31)) | 1;
         }
-        pm_lock(&g_klock);
-        if (!made) {
-            memcpy(e, v, sizeof e);
-            __atomic_store_n(&made, 1, __ATOMIC_RELEASE);
+        pm_lock(&g_hle.kernel.klock);
+        if (!*made) {
+            memcpy(e, v, sizeof v);
+            __atomic_store_n(made, 1, __ATOMIC_RELEASE);
         }
-        pm_unlock(&g_klock);
+        pm_unlock(&g_hle.kernel.klock);
     }
     return e[i];
 }
 /* UserExceptionContextAddress: the process's local region, a kernel page of its own, made on first use */
 static u64 process_local_region(void) {
-    static u64 a;
-    u64 v = __atomic_load_n(&a, __ATOMIC_ACQUIRE), none = 0;
+    u64* a = &g_hle.svcmem.local_region;
+    u64 v = __atomic_load_n(a, __ATOMIC_ACQUIRE), none = 0;
     if (v) return v;
     v = kmem_alloc(0x1000, MS_TLS, PERM_RW);
-    if (!__atomic_compare_exchange_n(&a, &none, v, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    if (!__atomic_compare_exchange_n(a, &none, v, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         mem_unmap(v, 0x1000);
         v = none;
     }
@@ -496,8 +502,8 @@ static u64 process_local_region(void) {
    the process's handle (InvalidHandle) */
 static u32 process_info(u32 id, u64* out) {
     switch (id) {
-        case 0: *out = g_core_mask; R_SUCCEED();
-        case 1: *out = g_prio_mask; R_SUCCEED();
+        case 0: *out = g_hle.svcmem.core_mask; R_SUCCEED();
+        case 1: *out = g_hle.svcmem.prio_mask; R_SUCCEED();
         case 2: *out = ALIAS_BASE; R_SUCCEED();
         case 3: *out = ALIAS_SIZE; R_SUCCEED();
         case 4: *out = HEAP_BASE; R_SUCCEED();
@@ -508,17 +514,17 @@ static u32 process_info(u32 id, u64* out) {
         case 13: *out = AS_END - AS_BASE; R_SUCCEED();
         case 14: *out = STACK_BASE; R_SUCCEED();
         case 15: *out = STACK_SIZE; R_SUCCEED();
-        case 16: *out = g_sysres_size; R_SUCCEED();
+        case 16: *out = g_hle.kernel.sysres_size; R_SUCCEED();
         case 17: { /* no slab allocator here: the page tables the mapped memory would take, within the resource */
-            u64 used = (used_memory() - g_sysres_size) / 512;
+            u64 used = (used_memory() - g_hle.kernel.sysres_size) / 512;
             used = (used + 0xFFFF) & ~0xFFFFull;
-            *out = used < g_sysres_size ? used : g_sysres_size;
+            *out = used < g_hle.kernel.sysres_size ? used : g_hle.kernel.sysres_size;
             R_SUCCEED();
         }
-        case 18: *out = g_title_id; R_SUCCEED();
+        case 18: *out = g_hle.kernel.title_id; R_SUCCEED();
         case 20: *out = process_local_region(); R_SUCCEED();
-        case 21: *out = mem_total() - g_sysres_size; R_SUCCEED();
-        case 22: *out = used_memory() - g_sysres_size; R_SUCCEED();
+        case 21: *out = mem_total() - g_hle.kernel.sysres_size; R_SUCCEED();
+        case 22: *out = used_memory() - g_hle.kernel.sysres_size; R_SUCCEED();
         case 23: *out = 1; R_SUCCEED(); /* IsApplication */
         case 24: {                   /* FreeThreadCount */
             int live = kthread_live_count();

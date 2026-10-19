@@ -30,41 +30,41 @@ enum {
 static int domain_in(uint32_t d) {
 #define LINUX_DOMAIN(guest, name)                                                                                      \
     if (d == guest) return SNX_AF_##name;
-#include "gnuabi/network/abi/linux_domain.inc"
+#include "gnuabi/abi/linux_domain.inc"
     return -1;
 }
 static uint16_t domain_out(int d) {
 #define LINUX_DOMAIN(guest, name)                                                                                      \
     if (d == SNX_AF_##name) return guest;
-#include "gnuabi/network/abi/linux_domain.inc"
+#include "gnuabi/abi/linux_domain.inc"
     return 0;
 }
 static int msg_in(uint64_t f) {
     int r = 0;
 #define LINUX_MSG(guest, name)                                                                                         \
     if (f & guest) r |= SNX_MSG_##name;
-#include "gnuabi/network/abi/linux_msgflag.inc"
+#include "gnuabi/abi/linux_msgflag.inc"
     return r;
 }
 static uint32_t msg_out(int f) {
     uint32_t r = 0;
 #define LINUX_MSG(guest, name)                                                                                         \
     if (f & SNX_MSG_##name) r |= guest;
-#include "gnuabi/network/abi/linux_msgflag.inc"
+#include "gnuabi/abi/linux_msgflag.inc"
     return r;
 }
 uint16_t gnu_net_poll_in(uint32_t e) {
     uint16_t r = 0;
 #define LINUX_POLL(guest, name)                                                                                        \
     if (e & guest) r |= SNX_POLL##name;
-#include "gnuabi/network/abi/linux_poll.inc"
+#include "gnuabi/abi/linux_poll.inc"
     return r;
 }
 uint32_t gnu_net_poll_out(uint16_t e) {
     uint32_t r = 0;
 #define LINUX_POLL(guest, name)                                                                                        \
     if (e & SNX_POLL##name) r |= guest;
-#include "gnuabi/network/abi/linux_poll.inc"
+#include "gnuabi/abi/linux_poll.inc"
     return r;
 }
 enum { LAYOUT_SAME, LAYOUT_MREQN, LAYOUT_IFADDR };
@@ -72,7 +72,7 @@ static int sockopt_in(uint64_t level, uint64_t name, int* l, int* n, int* layout
     int sl = -1;
 #define LINUX_LEVEL(guest, nm)                                                                                         \
     if (level == guest) sl = SNX_SOL_##nm;
-#include "gnuabi/network/abi/linux_sockopt.inc"
+#include "gnuabi/abi/linux_sockopt.inc"
     if (sl < 0) return -SNX_ENOPROTOOPT;
     *l = sl;
 #define LINUX_SOCKOPT(lv, guest, nm, lay)                                                                              \
@@ -81,7 +81,7 @@ static int sockopt_in(uint64_t level, uint64_t name, int* l, int* n, int* layout
         *layout = LAYOUT_##lay;                                                                                        \
         return 0;                                                                                                      \
     }
-#include "gnuabi/network/abi/linux_sockopt.inc"
+#include "gnuabi/abi/linux_sockopt.inc"
     return -SNX_ENOPROTOOPT;
 }
 

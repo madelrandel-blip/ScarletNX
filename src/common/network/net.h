@@ -82,8 +82,10 @@ int snx_net_init(void);
    exits, or a debugger that stops it */
 void snx_net_cancel(void);
 void snx_net_restart(void);
-/* Where the stack's messages go: stderr by default. The runtime points it at its log */
+/* Where the stack's messages go: stderr by default. The runtime points them at its log, and the warnings, what the
+   player must hear of (a room that put the console out), at its warnings */
 void snx_net_set_log(void (*log)(const char* message));
+void snx_net_set_warn(void (*warn)(const char* message));
 
 /* Sockets. type is SNX_SOCK_*, without flags. A raw or datagram ICMP socket the host refuses becomes an emulated one */
 int snx_socket_open(SnxSocket** out, int domain, int type, int protocol);

@@ -90,6 +90,31 @@ int main(void) {
     pend_add(t, 0x200000, 0x1000, -1);
     check(pend_empty(t) && !pend_hit(t, 0x600000, 0x1000), "until it is removed");
 
+    /* by GPU address, no translation: the alias above doesn't meet it, the page itself does */
+    pend_add_va(t, 0x104000, 0x2000, 1);
+    check(pend_hit_va(t, 0x105FFF, 1) && !pend_hit_va(t, 0x106000, 0x1000) && !pend_hit_va(t, 0x400000, 0x2000),
+          "pages by GPU address");
+    pend_add_va(t, 0x104000, 0x2000, -1);
+    check(pend_empty(t), "and their removal");
+
+    /* a table counted in another as well: the other sees what either holds, and empties when both do */
+    {
+        PendPages* u = calloc(1, sizeof(PendPages));
+        PendPages* a = calloc(1, sizeof(PendPages));
+        if (!u || !a) return 1;
+        a->also = u;
+        pend_add(a, 0x104000, 0x1000, 1);
+        pend_add(u, 0x109000, 0x1000, 1);
+        check(pend_hit(u, 0x104000, 1) && pend_hit(u, 0x109000, 1) && !pend_hit(a, 0x109000, 1),
+              "a table's pages in the one it is counted in too");
+        pend_add(a, 0x104000, 0x1000, -1);
+        check(!pend_hit(u, 0x104000, 1) && pend_hit(u, 0x109000, 1) && pend_empty(a), "and its removal there");
+        pend_add(u, 0x109000, 0x1000, -1);
+        check(pend_empty(u), "the other empty once both are");
+        free(a);
+        free(u);
+    }
+
     /* a range to the top of the address space ends there */
     check(!pend_hit(t, ~0ull - 0xFFF, ~0ull), "a range that would wrap");
     if (failures) return 1;

@@ -12,17 +12,30 @@
    with a count per page, the pages of each group of 64 that have one, and its pages in all, so a lookup skips what no
    result covers. Zeroed is empty. Not locked: the caller serializes (vk_lock) */
 typedef struct PendLeaf PendLeaf;
-typedef struct {
+typedef struct PendPages PendPages;
+struct PendPages {
     PendLeaf* leaf[1u << 16];
-    u64 total; /* every page's count added up */
+    u64 total;    /* every page's count added up */
+    u64 adds;     /* results added so far: unchanged, no result covers what was checked without a hit since */
     u64 overflow; /* pages past 2^40 results cover, read as covering every page */
-} PendPages;
+    /* a table every page this one gains or loses is counted in as well, NULL for none: one table then answers whether
+       anything at all is pending on a page (g_pend_any) */
+    PendPages* also;
+};
+/* the guest pages pending compute results, graphics results and queued releases cover, all together: a read that meets
+   none of them needs none of their checks (vk_mem_pending) */
+extern PendPages g_pend_any;
 /* the guest pages behind [gva, gva + size) (a GPU range, translated through the GMMU now) gain a result (delta 1) or
    lose one (-1). A result loses its pages with the mappings it gained them with: a mapping change lands every result
    over it first */
 void pend_add(PendPages* t, u64 gva, u64 size, int delta);
 /* nonzero when a result covers a guest page behind [gva, gva + size) */
 int pend_hit(const PendPages* t, u64 gva, u64 size);
+/* one guest page (an address >> 12) gains or loses a result: for results that keep their own translated pages */
+void pend_add_page(PendPages* t, u64 page, int delta);
+/* the same for pages counted by their GPU address, with no translation: for what is compared by GPU address */
+void pend_add_va(PendPages* t, u64 gva, u64 size, int delta);
+int pend_hit_va(const PendPages* t, u64 gva, u64 size);
 /* nonzero when no result covers any page: once every result is removed, each with the mappings it was added with */
 int pend_empty(const PendPages* t);
 

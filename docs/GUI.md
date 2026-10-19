@@ -8,13 +8,15 @@
 * [Output and resource use](#output-and-resource-use)
 * [Themes](#themes)
   * [Theme formats](#theme-formats)
+* [Languages](#languages)
 * [Building and testing](#building-and-testing)
 
 `scarletnx` started with no arguments (or a model's name, or the AppImage), with no game of its
 name beside it, opens its launcher: a small SDL3 menu for the command-line drivers. A copy named
 after a game, without its code, says so and never opens it. It uses an
-embedded public-domain 8x16 VGA BIOS font, nearest-neighbor integer scaling, and
-English text only. No font files or localization packages are needed.
+embedded public-domain 8x16 VGA BIOS font, with GNU Unifont's 8x16 glyphs fitted to it for the Latin letters its CP437
+lacks, and nearest-neighbor integer scaling; its words are English or a language compiled into it
+([Languages](#languages)). No font files or localization packages are needed.
 
 ```sh
 ./build/scarletnx
@@ -53,7 +55,8 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   keys': a click on its blinking **[ Pick or drop a file ]**, or Enter, opens the system's file
   picker (on Linux the desktop's, else zenity's). Dropping a file on the window and Ctrl+V with
   a path work too. ESC returns to the menu. On Android the picker opens at once. A dump not extracted yet takes
-  about its size for the extraction and, for a Switch game, as much again for the RomFS its folder gets; when its
+  about its size, a Switch dump's extracted straight into its game's folder (as much again only with an
+  **Extractions** folder picked, which keeps a copy, and in the temporary folder with *Extract to tmpfs*); when its
   disks have less free, the menu says how much it needs and *Run anyway* takes a second press.
 - **Load 3DS CIA** uses `scarletnx-3ds`. Its `games/` browser lists CIA inputs,
   not host executables. The driver extracts supported decrypted application CIAs.
@@ -75,7 +78,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   did, *Installed* or *Not installed* and why, and goes back to the menu by itself after 3 seconds
   (10 after a failure, while another file can still be picked); ESC cancels without changing them.
 - **Settings** opens on its groups, Enter opening one and ESC coming back: **App**, then
-  **Launch** (the launcher's two), then a group per section of the game's `.ini` (Display,
+  **Launch** (the launcher's three), then a group per section of the game's `.ini` (Display,
   Graphics, Performance, On-screen controls, Controllers, Network, Debug), as `scarletnx --settings`
   prints them from the runtime's own tables. The game's menu's settings have its names and words
   (*Scale* 100%, *Touch screen* Fingers), and its **Buttons** page, whose **All** steps every row;
@@ -93,7 +96,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   dead zone, background input, Joy-Cons). A player's *Controller* is *Any*, the next to connect, until Enter on it
   and a press on a controller give it that one (ESC leaves it as it was, Del makes it *Any* again); its *Button
   map* is the page above on its own keys, its A and B as its *Swap A/B* says.
-  **App** holds **Theme** and **Text size**, which Left/Right or Enter go round either way, **Theme editor**, which comes back to App, and **Library**: first `games/`,
+  **App** holds **Theme**, **Text size** and **Language**, which Left/Right or Enter go round either way, **Theme editor**, which comes back to App, and **Library**: first `games/`,
   where recompiled games go: Enter there picks another, as **Folders > Games** does; at its default it stays on the
   list (the foot's Del greyed), and a folder picked goes back to the default with Del pressed twice, only the setting
   changing. Then the player's own folders, whose games the `games/` browser lists after
@@ -117,7 +120,8 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   gives a game's `.ini` for the keys it no longer uses (in the config folder's `games/`, in `games/`
   and in the player's folders), the keys of `settings.ini` that no setting of the runtime's takes
   (only while the runtime lists its settings) and those of `app.ini` the menu does not know. A box
-  over the screen then lists each file and what was done to it, or why not, until a key closes it;
+  over the screen then lists each file and what was done to it, or why not, Up/Down and the wheel going over those
+  that do not fit, until another key closes it;
   Share log lists them too. A group of settings shows
   a row each, its help above, Left/Right going round its values, Enter typing one. A setting not picked shows the runtime's default and `[default]` (*Off [default]*):
   the run takes the game's `.ini`'s, which starts as that; one picked goes to every
@@ -128,18 +132,24 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   `.ini`. Del puts a setting back to its default, and the groups' last row, **Reset all to the
   defaults**, every one. The launcher's own choices start picked: `fullscreen` 0, `controls` 0 (on Android 1,
   and `fullscreen` puts the launcher itself on the whole screen too).
-  **libgccjit** passes `--backend=gcc` when preparing a dump (it stays off in a build without
-  libgccjit; a game of `games/` another build made is recompiled with LLVM), **gdbstub** passes `-S` and `-s`, the
-  runtime's stub on port 1234 waiting for the debugger at startup (UNIX only). None of them
-  reaches the Linux or the 3DS driver.
+  **gdbstub** passes `-S` and `-s`, the
+  runtime's stub on port 1234 waiting for the debugger at startup (UNIX only), and **Extract to tmpfs**
+  passes `--tmpfs`: a dump's extraction goes to `/tmp/scarletnx/work/<title ID>` (`$TMPDIR` when set, the
+  temporary folder on Windows) instead of the game's folder, and the game reads its RomFS from there, its ExeFS and
+  saves staying in its folder. Off, the default, it is extracted to disk. The room a run asks about is then the temporary
+  folder's, without the second copy. Either way the game's folder gets `<name>.source`, a link to the dump, which
+  the RomFS is extracted again from when tmpfs was emptied (a reboot), or moved by when the setting changes. A game
+  without one, made before, says *Can't be extracted to tmpfs due to missing symlink* and runs from what it has.
+  None of them reaches the Linux or the 3DS driver.
 - The Status box, after the RAM and the CPU, says what ScarletNX's folders take (games/,
   work/ and themes/ of the data folder, and on Linux its config, state and cache folders, else
   the menu's own) and what is left on that disk, counted as the menu opens and after each run.
 - Settings > App's **Theme** switches to the next theme, or the one before: the built-in Default
   and YoRHa, then each folder of `themes/` (see [Themes](#themes)). The menu opens in YoRHa until one is picked.
   It is kept for the next start,
-  as is Text size, in `app.ini` beside `settings.ini`: `[app]` with `theme` (a theme's folder
-  name) and `text_size` (`auto` or 1 to 4), and once one is picked `[folders]` with Folders' `data`, `games` and
+  as are Text size and Language, in `app.ini` beside `settings.ini`: `[app]` with `theme` (a theme's folder
+  name), `text_size` (`auto` or 1 to 4) and `language` (`auto`, `en` or a language's code, as `pt_BR`), and once one
+  is picked `[folders]` with Folders' `data`, `games` and
   `work` (a full path, nothing for the default). A value the
   menu does not know, or a theme no longer there, is named in the menu's message as it opens and
   left out; a file that cannot be written is named in App's note.
@@ -156,6 +166,11 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
 - Settings > App's **Text size** steps the menu's letters through Auto (fit the screen) and four
   sizes. Bigger letters scroll the menu. The foot's letters (its keys, and the tips when they are
   there) are a size under the rest's, 1x at the least.
+- Settings > App's **Language** goes round Auto, English and each language compiled in, by its own name. Auto,
+  the default, takes the first of the system's languages (SDL's preferred locales) the menu has: that language for
+  that country, else the language with no country of its own, else the language for another country (Portuguese of
+  Portugal reads `pt_BR` when it is the only Portuguese), else English; the row says which it took. The words change
+  at once; a phrase the language has not translated stays English.
 - **Share log** saves the last run's output and game log to `scarletnx.log`. On the
   desktop it goes in the working folder with its path copied. On Android it goes to the
   data folder's `state/` and is shared.
@@ -168,8 +183,9 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   under it the space it takes, counted as the box shows (*counting* until then). They are the menu's `gui/`, `work/`, each game laid out
   beside the others in `games/` or a Library folder (`games/<id>/` now), a portable copy's `games/`
   beside the program, and a build tree's `games/`, `work/` and keys in its checkout
-  ([USAGE](USAGE.md#folders)). Any key, click or tap closes it; nothing is moved, and it shows again at the next
-  start for as long as they are there.
+  ([USAGE](USAGE.md#folders)). Up/Down, PgUp/PgDn and the wheel go over those that do not fit (an arrow at the
+  right of the first says some are above it, *and N more* the ones under), any other key, click or tap closes it;
+  nothing is moved, and it shows again at the next start for as long as they are there.
   **Share log** lists them all, each with where it goes now. On Android the menu's own files an older version kept
   in the app's own files, out of the Files app's reach, are listed a file at a time, and under them the box says how
   they go while the app is in testing: Android's Settings > Apps > ScarletNX > Storage > Clear storage, which takes
@@ -212,7 +228,7 @@ cannot be read is named and the others still listed.
   App > Library. Under it the recent games, then the page's games. ESC returns to the menu.
 - Up/Down go round Add a folder, the recent games and the page's files. Enter/Space opens one.
 - **R** (on Android a tap on *Recompile* at the foot) recompiles the Switch game in focus, recent or on the page,
-  where it is, or prepares its dump again: `scarletnx -r`, with libgccjit when **libgccjit** is on. It plays nothing;
+  where it is, or prepares its dump again: `scarletnx -r`. It plays nothing;
   Enter then does. On another row, or a 3DS game, it says why it does nothing.
 - Left/Right and PgUp/PgDown go to the previous/next page. The page number and
   total file count are shown. Paging stops at the first and last pages.
@@ -265,12 +281,16 @@ and to the run, which is **compiling** until the runner prints its `ScarletNX - 
 
 The screens are boxes side by side, nothing over another, the default framing them in thin lines and YoRHa
 filling them. At the top the tabs, Menu, Games and Settings, and the screen's title after them against the
-right (`[head] place = tabs`) or on a row of its own under them (`below`). Under them the list, each entry a box
+right (`[head] place = tabs`) or on a row of its own under them (`below`), and at its right the user games play as
+(Settings > User): a box framed as the others are holding their nickname and their picture, `users/<uid>.jpg` or Wimsy
+without one ([USAGE](USAGE.md#users)), square or round (`[head] picture`; `none` for no box). A click on it opens
+the users over the screen, each with their picture; the one picked is Settings' user from then on, and ESC or a click
+off them leaves it as it was. Under them the list, each entry a box
 of its own, the focused one framed in the focus colour or inverted, with the theme's cursor in the margin;
 beside it a box with what the focus is about (a recent game's path, Games' folders, the keys in use, the last
 run's output) and under that one the Status box. The tips have a row of their own under the head (`[tips] place =
 top`, both built-ins'), or go to the foot under the list's column with `bottom`, where they take one row, a long one
-sliding, or wrap over its rows with `[tips] wrap`. At the foot the screen's keys, the whole width, or under the side
+sliding, or wrap over its rows with `[tips] wrap`, the last sliding what does not fit. At the foot the screen's keys, the whole width, or under the side
 box's column beside the tips, in letters a size under the rest's; the tips and the keys each in a box with a bar down
 its left (`[tips] box`, `[footer] box`) or on the page. Games lists Add a folder, the recent games and a
 page of the games, as many as the list's box holds, the focused one's path and kind beside them; the keys'
@@ -280,7 +300,7 @@ rows: Enter, or a click on a row, opens the group, its rows taking the focus und
 takes as ESC, the group shown as the focused one; a click on another group opens that one. The theme editor lists its keys, the preview beside them. The list's column is two fifths of
 every screen (`[body] sizing = fixed`), and a window too narrow for both shows the list alone; with `adaptive` the
 column is as wide as its entries and the side box goes under the list. A text too long for its box wraps over
-its rows, or takes one that slides with `[body] text = slide`. A run of the console layout shows the driver's output in a box sized to it,
+its rows, its last sliding what is left, or takes one that slides with `[body] text = slide`. A run of the console layout shows the driver's output in a box sized to it,
 beside it what runs and how it ended over the status, the file in the tips and the ESC line where the keys
 go, which a tap aborts. The button map draws the pad in the box between the head and the foot. A question, or
 the files an older version left, comes in a box over the screen darkened.
@@ -293,11 +313,11 @@ dots and a turning ring; each step the driver and the runner report (unpack, ext
 recompile with its blocks, built, launch, GPU) typed down the page, with turning dots
 while it runs and `...OK` or `...FAILED` once it ends, the cursor blinking on the current
 one, and the other lines it printed indented under it (`[run] bar` adds a progress bar
-with the running step's percentage). A step that counts, the unpack and the extraction by
+with the running step's percentage). A step that counts, the extraction by
 what hactool has written, the recompile by its blocks, shows how far it is on its line as
 `[run] progress` says: `amount` (`1.2 / 4.0 GB`, `3 / 6`), `percent` (`30%`, YoRHa's) or
 `time`, what is left at its pace so far (`01:23 left`). With `layout = console` the
-driver's own row says it, `unpacked 1229 of 4096 MB (30%)`, written over itself each second. The menu fades out to black as a run starts and the run fades in from it; ESC
+driver's own row says it, `extracted 1229 of 4096 MB (30%)`, written over itself each second. The menu fades out to black as a run starts and the run fades in from it; ESC
 fades the run out and the menu back in.
 
 A theme is also a folder holding a `theme.ini`, the folder's name its id, in
@@ -340,6 +360,8 @@ place = tabs
 ; the title's letters, times the text's (1 to 3), and a shadow under them in the dim colour
 size = 2
 shadow = true
+; the user at the head's right, their nickname and picture in a box: none | square | round
+picture = round
 ; the title per screen: menu, games, keys, compiling, loading
 menu = NIGHT  /  MENU
 [body]
@@ -458,6 +480,39 @@ ErET needs `[theme] layout`, so the built-in files carry one: `debug` and `menu`
   files never lean on a built-in's values, which may change. It reads an older file as that
   format reads, and writes it in the current one.
 
+## Languages
+
+The menu's phrases are English in its code, each through `snx_tr` (`src/gui/i18n.h`). `po/scarletnx.pot` lists
+them, made from the code by `scripts/build-languages.py --pot`; the `gui_languages_pot` test fails when it is not what
+the code says. A language is a `po/<code>.po` (`pt_BR.po`, `de.po`), gettext's format: the build makes each one a
+catalog of gettext's `.mo` format compiled into the menu, which reads it with musl's `__mo_lookup`
+(`src/gui/i18n.c`). A new one starts as a copy of the `.pot` whose header names it, in UTF-8:
+
+```po
+"Language: de\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"X-Language-Name: Deutsch\n"
+```
+
+`X-Language-Name` is what Settings > App > Language shows. `msgmerge -U po/de.po po/scarletnx.pot` (gettext's tools)
+brings a translation up to the code; a phrase it leaves empty, or marks `fuzzy`, stays English. The build refuses a
+`.po` that:
+
+- changes a phrase's printf conversions (`%s`, `%d`, `%zu`, `%.*s`) in number, order or type, uses numbered ones
+  (`%1$s`) or `%n`, or has a `%` its English does not: C's printf takes the arguments in the order the code gives;
+- changes the keys of a foot's sentences (`#, snx-keys`, "Key: what it does."): each key stays as it is, or as the
+  same file translates it (`#, snx-key`, as `Back`), since a click on the foot finds a key by its word, and a sentence
+  greyed (`~`, one its screen cannot do now) stays greyed;
+- has a letter the menu's font does not draw, which would show as `?`: the font is CP437 and the Latin letters of
+  U+00A0 to U+024F past it, GNU Unifont's (`src/gui/unifont-latin.hex`, which `scripts/build-glyphs.py --from` keeps
+  from a Unifont `.hex`, and the build draws with the VGA font's stems and baseline; the `gui_glyphs_kept` test checks
+  it holds each of them once);
+- has contexts (`msgctxt`), plurals (`msgid_plural`), a phrase twice, or is not UTF-8.
+
+The runtime's settings stay as the runtime names them (their groups, names, help and words come from
+`scarletnx --settings`), as do the Controllers' button map page, drawn as the game's menu draws it, the theme
+editor's rows (the file's own keys) and the lines Share log adds for us.
+
 ## Building and testing
 
 The NX build enables `SNX_BUILD_GUI` by default. Disable it with
@@ -475,7 +530,7 @@ ctest --test-dir build/gui -R '^gui_' --output-on-failure
 
 For just the GUI and Linux runtime, use `-DSNX_BUILD_NX=OFF -DSNX_BUILD_GUI=ON`: the launcher is
 then `scarletnx-gui`, a program of its own, which looks for `scarletnx` as it does for the other drivers.
-Tools-only and hactool-only builds cannot enable the GUI.
+Tools-only builds cannot enable the GUI.
 Supported host platforms are Linux, FreeBSD, Windows (llvm-mingw) and Android (`dist/android`).
 SDL3 handles window creation, keyboard/mouse input, rendering, clipboard and drag-and-drop
 on every host. The platform-specific code only handles child processes and resource
@@ -487,6 +542,10 @@ accounting and process-tree cleanup. Browser tests cover filtering, missing/empt
 directories, pagination, resizing, Back/ESC, launching selected files and R's recompile.
 Key setup tests cover installation, replacement, invalid drops, failed writes,
 self-copy safety, cancellation, and the bright-red overwrite warning.
+Language tests cover a catalog's search in either byte order, catalogs cut or pointing out of themselves, the language
+Auto picks from the system's locales, English where a language has none, the Language row and `app.ini`'s key, and
+the script's refusals; they use a language of their own, `tests/po/xx.po`. Glyph tests cover the Latin letters'
+lookup, each way the menu draws a line with them, and the script that keeps them.
 Settings tests cover the runtime's list read into rows, picks, the options each combination
 passes, and the screens of its groups and App; menu tests cover mouse hover versus explicit
 activation, the menu without the games and Games with Add a folder and the recent games' show-more row,

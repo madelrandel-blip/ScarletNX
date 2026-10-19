@@ -2,7 +2,7 @@
 # Copyright 2026 the ScarletNX contributors
 # The recompiler as a library (snx_recompiler.h): the backends and the function discovery behind one C interface,
 # without the Switch runtime. One archive holds everything of this tree the interface needs (the objects of the
-# backends' libraries), so a consumer links it and the external libraries (LLVM, libgccjit when built in) and nothing
+# backends' libraries), so a consumer links it and the external libraries (LLVM) and nothing
 # else. Added after the backends exist (the host-tools CMakeLists), so a tools-only build (-DSNX_TOOLS_ONLY=ON) has
 # it too. SNX_RECOMPILER_SHARED also builds the shared library, which needs the parts compiled as position-independent
 # code.
@@ -14,11 +14,6 @@ include(GNUInstallDirs)
 set(snx_recompiler_parts scarletnx-common snx_llvm snx_arm_llvm snx_arm_rt)
 set(snx_recompiler_external ${SNX_LLVM_LIBS} ${SNX_LLVM_SYSTEM_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
 set(snx_recompiler_defines _CRT_SECURE_NO_WARNINGS)
-if(TARGET snx_jit)
-    list(APPEND snx_recompiler_parts snx_jit)
-    list(APPEND snx_recompiler_external "${SNX_GCCJIT_LIBRARY}")
-    list(APPEND snx_recompiler_defines SNX_WITH_GCCJIT)
-endif()
 if(WIN32)
     list(APPEND snx_recompiler_external advapi32)
 else()
@@ -51,9 +46,6 @@ foreach(kind IN LISTS snx_recompiler_kinds)
         target_include_directories(${target} PRIVATE "$<TARGET_PROPERTY:${part},INTERFACE_INCLUDE_DIRECTORIES>")
     endforeach()
     target_include_directories(${target} SYSTEM PRIVATE "${SNX_LLVM_INCLUDE_DIR}")
-    if(TARGET snx_jit)
-        target_include_directories(${target} SYSTEM PRIVATE "${SNX_GCCJIT_INCLUDE_DIR}")
-    endif()
     target_compile_options(${target} PRIVATE -Wall -Wextra -Werror=missing-prototypes)
     target_compile_definitions(${target} PRIVATE ${snx_recompiler_defines})
     target_link_directories(${target} PUBLIC "${SNX_LLVM_LIBRARY_DIR}")

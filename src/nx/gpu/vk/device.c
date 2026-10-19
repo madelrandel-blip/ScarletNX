@@ -294,9 +294,10 @@ static int create_device(void) {
     g_shader_stage_point_size = want->shaderTessellationAndGeometryPointSize != 0;
     g_shader_geometry = want->geometryShader != 0;
     g_shader_tessellation = want->tessellationShader != 0;
-    const char* ext[5];
+    const char* ext[12];
+    int has_budget = 0;
     u32 next = 0;
-    int has_shader_clock = 0;
+    int has_shader_clock = 0, has_feedback_dynamic = 0;
     if (!g_opt_headless) ext[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     {
         u32 n = 0;
@@ -307,11 +308,21 @@ static int create_device(void) {
             if (!strcmp(e[i].extensionName, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME)) g_vk.has_divisor = 1;
             if (!strcmp(e[i].extensionName, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME)) g_vk.has_border_color = 1;
             if (!strcmp(e[i].extensionName, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) has_shader_clock = 1;
+            if (!strcmp(e[i].extensionName, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME))
+                g_vk.has_feedback = 1;
+            if (!strcmp(e[i].extensionName, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME))
+                has_feedback_dynamic = 1;
+            if (!strcmp(e[i].extensionName, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
+                g_vk.has_local_read = 1;
+            /* the driver's budget for each heap, the other processes' use taken out, for VMA: without it VMA took
+               80% of a heap's size as its budget, blind to what the desktop and other programs hold */
+            if (!strcmp(e[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) has_budget = 1;
             /* a portability driver's subset must be enabled when it has one (MoltenVK) */
             if (!strcmp(e[i].extensionName, "VK_KHR_portability_subset")) ext[next++] = "VK_KHR_portability_subset";
         }
         free(e);
     }
+    if (has_budget) ext[next++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT fdiv = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT fbc = {
@@ -331,8 +342,31 @@ static int create_device(void) {
         *tail = &fbc;
         tail = &fbc.pNext;
     }
+    VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT qloop = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
+    VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT qloop_dyn = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT};
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR qlocal = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    if (g_vk.has_feedback) {
+        *tail = &qloop;
+        tail = &qloop.pNext;
+    }
+    if (has_feedback_dynamic) {
+        *tail = &qloop_dyn;
+        tail = &qloop_dyn.pNext;
+    }
+    if (g_vk.has_local_read) {
+        *tail = &qlocal;
+        tail = &qlocal.pNext;
+    }
     if (has_shader_clock) *tail = &qclock;
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
+    /* the dynamic state and the barriers within a pass only serve feedback loops */
+    g_vk.has_feedback = g_vk.has_feedback && qloop.attachmentFeedbackLoopLayout;
+    g_vk.has_feedback_dynamic =
+        g_vk.has_feedback && has_feedback_dynamic && qloop_dyn.attachmentFeedbackLoopDynamicState;
+    g_vk.has_local_read = g_vk.has_feedback && g_vk.has_local_read && qlocal.dynamicRenderingLocalRead;
     g_shader_clock_scopes =
         has_shader_clock ? (qclock.shaderSubgroupClock ? 1 : 0) | (qclock.shaderDeviceClock ? 2 : 0) : 0;
     g_vk.has_divisor = g_vk.has_divisor && fdiv.vertexAttributeInstanceRateDivisor;
@@ -395,6 +429,31 @@ static int create_device(void) {
         chain = &fclock;
         ext[next++] = VK_KHR_SHADER_CLOCK_EXTENSION_NAME;
     }
+    VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT floop = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT,
+        .pNext = chain,
+        .attachmentFeedbackLoopLayout = VK_TRUE};
+    if (g_vk.has_feedback) {
+        chain = &floop;
+        ext[next++] = VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME;
+    }
+    VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT floop_dyn = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT,
+        .pNext = chain,
+        .attachmentFeedbackLoopDynamicState = VK_TRUE};
+    if (g_vk.has_feedback_dynamic) {
+        chain = &floop_dyn;
+        ext[next++] = VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME;
+    }
+    /* a barrier within a vkCmdBeginRendering pass needs this feature (VUID-vkCmdPipelineBarrier2-None-09553) */
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR flocal = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR,
+        .pNext = chain,
+        .dynamicRenderingLocalRead = VK_TRUE};
+    if (g_vk.has_local_read) {
+        chain = &flocal;
+        ext[next++] = VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
+    }
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                               .pNext = chain,
                               .queueCreateInfoCount = g_vk.compute_family == g_vk.gfx_family ? 1 : 2,
@@ -415,7 +474,8 @@ static int create_device(void) {
                                   .instance = g_vk.instance,
                                   .preferredLargeHeapBlockSize = g_vk.alloc_cap < (256ull << 20) ? g_vk.alloc_cap : 0,
                                   .vulkanApiVersion = VK_API_VERSION_1_3,
-                                  .pVulkanFunctions = &vf};
+                                  .pVulkanFunctions = &vf,
+                                  .flags = has_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0};
     if (!VK_OK(vmaCreateAllocator(&vai, &g_vk.vma))) return 0;
     LOG("vulkan: %s, Vulkan %u.%u.%u, driver %08x, graphics queue family %u, compute %u%s\n", g_vk.props.deviceName,
         VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion),
@@ -423,6 +483,13 @@ static int create_device(void) {
         g_vk.compute_family != g_vk.gfx_family ? " (separate family)"
         : second                               ? " (a second queue)"
                                                : " (the graphics queue)");
+    if (g_vk.has_feedback)
+        LOG("vulkan: draws sample the color targets they render to in place (attachment feedback loops, %s, %s)\n",
+            g_vk.has_feedback_dynamic ? "enabled by dynamic state" : "enabled per pipeline",
+            g_vk.has_local_read ? "ordered by barriers within the pass" : "ordered by beginning the pass again");
+    else
+        LOG("vulkan: draws that sample a color target they render to read a copy of it (no attachment feedback "
+            "loops)\n");
     return 1;
 }
 
@@ -444,6 +511,7 @@ static void swapchain_retire(void) {
 /* the window's surface made anew, its swapchain to follow: Android destroys a window's surface while the app is in
    the background, and the Vulkan surface on it is lost for good */
 int vk_surface_recreate(void) {
+    vk_rec_sync(); /* the device wait covers only what was submitted */
     vkDeviceWaitIdle(g_vk.dev);
     if (g_vk.swapchain) swapchain_retire();
     vkDestroySurfaceKHR(g_vk.instance, g_vk.surface, NULL);
@@ -467,6 +535,7 @@ int vk_window_release(void) {
         if (++waited == 200) return 0;
         plat_sleep_ns(10000000);
     }
+    vk_rec_sync();
     vkDeviceWaitIdle(g_vk.dev); /* a lost device answers at once */
     if (g_vk.swapchain) swapchain_retire();
     if (g_vk.surface) vkDestroySurfaceKHR(g_vk.instance, g_vk.surface, NULL);
@@ -552,7 +621,10 @@ int vk_swapchain_create(int srgb) {
                                                   ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
                                                   : caps.currentTransform;
     VkSwapchainKHR old = g_vk.swapchain;
-    if (old) vkDeviceWaitIdle(g_vk.dev);
+    if (old) {
+        vk_rec_sync();
+        vkDeviceWaitIdle(g_vk.dev);
+    }
     VkSwapchainCreateInfoKHR ci = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
                                    .surface = g_vk.surface,
                                    .minImageCount = count,
@@ -621,6 +693,7 @@ int vk_init(void) {
         }
         volkInitializeCustom(gipa);
     }
+    vk_renderdoc_load(); /* its capture layer is enabled when the instance is created */
     if (!create_instance()) return 0;
     if (!g_opt_headless && !backend_vk_surface(g_vk.instance, &g_vk.surface)) {
         WARN("vulkan: the window backend could not create a surface\n");

@@ -13,7 +13,7 @@
 #   NASM 3.02             FFmpeg's assembly
 #   Strawberry Perl 5.42  OpenSSL's Configure (only its perl\bin goes on PATH, not the GCC it carries)
 #   w64devkit 2.10.0      only its sh and patch (busybox) and GNU make: FFmpeg's configure and Makefiles need sh and
-#                         make, and CPM patches hactool with patch
+#                         make, and the build patches FFmpeg with patch
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # Invoke-WebRequest is many times slower with its progress bar
 

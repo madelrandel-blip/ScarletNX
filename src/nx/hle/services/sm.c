@@ -4,6 +4,7 @@
    SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
    SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project (GPL-2.0-or-later) */
 /* sm:, the service manager: the session to a service by its name */
+#include "nx/hle/hle.h"
 #include "nx/hle/services/services_int.h"
 
 #include "hle/services/sm.swipc.inc"
@@ -28,12 +29,18 @@ static int sm_name(const nn_sm_ServiceName* in, char out[9]) {
 /* a service the runtime doesn't have: every command answers success (stub_ok logs it as [undeclared], or
    fails it with UnknownCommandId when auto_stub_ipc is off), under the service's own name. The console's sm would
    keep the client waiting for the service to register, which never happens here */
-static SvcObj* sm_stand_in(const char* name) {
-    SvcObj* o = svcobj_new(name, stub_ok, 9);
-    strcpy((char*)o->data, name);
-    o->name = (const char*)o->data;
-    return o;
+/* The stand-in's name, kept for the process: IPC's crash ring keeps the names of objects already gone */
+static const char* stand_in_name(const char* name) {
+    const char* r = "(a service missing from the runtime)";
+    int i;
+    pm_lock(&g_hle.sm.lk);
+    for (i = 0; i < g_hle.sm.n && strcmp(g_hle.sm.name[i], name); i++) {}
+    if (i == g_hle.sm.n && i < STAND_IN_NAMES) strcpy(g_hle.sm.name[g_hle.sm.n++], name);
+    if (i < g_hle.sm.n) r = g_hle.sm.name[i];
+    pm_unlock(&g_hle.sm.lk);
+    return r;
 }
+static SvcObj* sm_stand_in(const char* name) { return svcobj_new(stand_in_name(name), stub_ok); }
 
 static int nn_sm_detail_IUserInterface_GetServiceHandle(SvcObj* self, const nn_sm_ServiceName* name, u32* session) {
     char s[9];
@@ -72,4 +79,4 @@ static int nn_sm_detail_IUserInterface_UnregisterService(SvcObj* self, const nn_
     R_THROW(SM_NOT_ALLOWED);
 }
 
-SvcObj* new_sm(void) { return nn_sm_detail_IUserInterface_new(0); }
+SvcObj* new_sm(void) { return nn_sm_detail_IUserInterface_new(); }

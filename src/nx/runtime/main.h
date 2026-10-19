@@ -10,8 +10,9 @@ int snx_main(int argc, char** argv); /* runs the game the arguments or the progr
 /* the launcher's menu (src/gui), for an executable built with it: a bare start of the runtime opens it, with the
    program's own path */
 extern int (*snx_menu)(const char* self);
-/* Saves what outlives the run (the hints, the renderer's pipeline cache) before a clean exit: the main loop's, the
-   unattended limit's, svcExitProcess. The first caller saves; one that comes while it does waits, then does nothing */
+/* Saves what outlives the run (the hints, the renderer's pipeline cache) and reports SNX_NVN_TRACE before a clean exit:
+   the main loop's, the unattended limit's, svcExitProcess. The first caller saves; one that comes while it does waits,
+   then does nothing */
 void snx_save_before_exit(void);
 /* The game's folders, each ending in a separator (g_exedir may be empty), and its name: <g_exedir><g_exename>_code.so
    is its code, <g_exedir><g_exename>_data/ (g_datadir) its files */

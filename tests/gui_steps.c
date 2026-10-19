@@ -15,8 +15,8 @@ int main(void) {
     const GuiNote* notes[8];
     gui_steps_reset(&s);
     assert(gui_steps_percent(&s) == -1);
-    feed(&s, "Unpacking Game.nsp\nBuilding hactool\r\nExtracting the base ", 10);
-    assert(s.count == 2 && !strcmp(at(&s, 0)->label, "UNPACK") && !strcmp(at(&s, 0)->detail, "Game.nsp"));
+    feed(&s, "Extracting the update\nRecompiling Tool (1 modules)\r\nExtracting the base ", 10);
+    assert(s.count == 2 && !strcmp(at(&s, 0)->label, "EXTRACT") && !strcmp(at(&s, 0)->detail, "the update"));
     assert(at(&s, 0)->state == GUI_STEP_DONE && at(&s, 1)->state == GUI_STEP_ACTIVE && at(&s, 1)->shown_ms == 10);
     feed(&s, "game\nan unknown line\nRecompiling Game (1 modules)\nFunctions: 9  instructions: 99\n", 20);
     assert(s.count == 4 && !strcmp(at(&s, 2)->label, "EXTRACT") && !strcmp(at(&s, 2)->detail, "the base game"));
@@ -87,19 +87,19 @@ int main(void) {
     assert(s.count == 2 && !strcmp(at(&s, 1)->label, "READY") && !strcmp(at(&s, 1)->detail, "Game"));
     assert(at(&s, 1)->state == GUI_STEP_DONE && gui_steps_percent(&s) == 100);
 
-    /* the driver's row a second while hactool unpacks and extracts, each over the last (\r): the step's value and total
-       in MB, its percent the bar's, no note under it; a row of another step's word is a plain line */
+    /* the driver's row a second while hactool extracts, each over the last (\r): the step's value and total in MB, its
+       percent the bar's, no note under it; a row of another step's word is a plain line */
     gui_steps_reset(&s);
-    feed(&s, "Unpacking Game.xci\n", 1);
-    assert(gui_steps_percent(&s) == -1); /* nothing said yet */
-    feed(&s, "  unpacked 1024 of 4096 MB (25%)\r  unpacked 2048 of 4096 MB (50%)\r", 2);
+    feed(&s, "Reading Game.xci\nExtracting the base game\n", 1);
+    assert(s.count == 1 && gui_steps_percent(&s) == -1); /* nothing said yet */
+    feed(&s, "  extracted 1024 of 4096 MB (25%)\r  extracted 2048 of 4096 MB (50%)\r", 2);
     assert(at(&s, 0)->value == 2048 && at(&s, 0)->total == 4096 && at(&s, 0)->megabytes);
     assert(gui_steps_percent(&s) == 50 && gui_step_notes(&s, at(&s, 0), notes, 8) == 0);
-    feed(&s, "  unpacked 4000 of 4096 MB (97%)\r\nExtracting the base game\n", 3);
-    assert(at(&s, 0)->state == GUI_STEP_DONE && at(&s, 0)->value == 4000 && gui_steps_percent(&s) == -1);
-    feed(&s, "  unpacked 9 of 9 MB (100%)\n  extracted 300 of 400 MB (75%)\r", 4);
-    assert(at(&s, 1)->value == 300 && at(&s, 1)->total == 400 && gui_steps_percent(&s) == 75);
-    assert(gui_step_notes(&s, at(&s, 1), notes, 8) == 1 && !strcmp(notes[0]->text, "unpacked 9 of 9 MB (100%)"));
+    feed(&s, "  extracted 4000 of 4096 MB (97%)\r\nRecompiling Game (1 modules)\n", 3);
+    assert(at(&s, 0)->state == GUI_STEP_DONE && at(&s, 0)->value == 4000 && gui_steps_percent(&s) == 0);
+    feed(&s, "  extracted 9 of 9 MB (100%)\n  compiled block 3/4: code_002 (1.0 s)\n", 4);
+    assert(at(&s, 1)->value == 3 && at(&s, 1)->total == 4 && gui_steps_percent(&s) == 75);
+    assert(gui_step_notes(&s, at(&s, 1), notes, 8) == 2 && !strcmp(notes[0]->text, "extracted 9 of 9 MB (100%)"));
 
     /* a step's progress on its line, as the theme says: amount in MB, GB past 1024 of them, blocks bare; percent;
        the time left at its pace so far, once a second of it has gone; nothing while it has no total */
@@ -142,7 +142,7 @@ int main(void) {
     assert(gui_steps_percent(&s) == 100);
     for (i = 0; i < GUI_STEPS_MAX + 3; ++i) {
         char line[64];
-        snprintf(line, sizeof line, "Unpacking part%d\nnote of part%d\n", i, i);
+        snprintf(line, sizeof line, "Extracting part%d\nnote of part%d\n", i, i);
         feed(&s, line, (uint64_t)i);
     }
     assert(s.count == GUI_STEPS_MAX && !strcmp(at(&s, GUI_STEPS_MAX - 1)->detail, "part26"));

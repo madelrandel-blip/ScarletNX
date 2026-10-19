@@ -8,6 +8,7 @@
 /* the dumps: a thread's registers with a backtrace named from the game's symbols, the last SVCs and IPC requests, and
    every thread's state (threads.txt, F5) */
 #include "nx/hle/kernel/kernel_int.h"
+#include "nx/hle/hle.h"
 #include "nx/runtime/arm.h"
 #include "nx/runtime/loader.h"
 
@@ -31,12 +32,7 @@ static int readable(u64 a, u64 n) {
 /* ============================================================ symbols */
 /* The game's exported functions, from each module's dynamic symbol table as Eden's Symbols::GetSymbols finds it: the
    MOD0 header named at offset 4 of the image, its dynamic section, and the symbols from DT_SYMTAB up to DT_STRTAB. A
-   name stays in guest memory (read-only module data), kept as its address there */
-typedef struct {
-    u64 addr, size, name;
-} Sym;
-static Sym* g_syms;
-static u32 g_nsyms;
+   name stays in guest memory (read-only module data), kept as its address there (Sym, in g_hle.debug.syms) */
 
 static int sym_cmp(const void* a, const void* b) {
     u64 x = ((const Sym*)a)->addr, y = ((const Sym*)b)->addr;
@@ -50,7 +46,7 @@ static u16 gr16(u64 a) {
 }
 static void module_symbols(const SnxModInfo* mi, int wide) {
     u64 base = mi->base, end = mi->base + mi->size, mod0, dyn, symtab = 0, strtab = 0, syment = wide ? 24 : 16, s;
-    u32 cap = g_nsyms;
+    u32 cap = g_hle.debug.nsyms;
     if (!readable(base, 8)) return;
     mod0 = base + gr32(base + 4);
     if (mod0 + 8 > end || !readable(mod0, 8) || gr32(mod0) != 0x30444F4Du) return; /* "MOD0" */
@@ -71,25 +67,32 @@ static void module_symbols(const SnxModInfo* mi, int wide) {
         u8 info = wide ? GP(s)[4] : GP(s)[12];
         u64 value = wide ? gr64(s + 8) : gr32(s + 4), size = wide ? gr64(s + 16) : gr32(s + 8);
         if ((info & 15) != 2 || !value || value >= mi->size) continue; /* defined functions (STT_FUNC) */
-        if (g_nsyms == cap) {
+        if (g_hle.debug.nsyms == cap) {
             Sym* n;
             cap = cap ? cap * 2 : 1024;
-            n = realloc(g_syms, sizeof *n * (size_t)cap);
+            n = realloc(g_hle.debug.syms, sizeof *n * (size_t)cap);
             if (!n) return;
-            g_syms = n;
+            g_hle.debug.syms = n;
         }
-        g_syms[g_nsyms].addr = base + value;
-        g_syms[g_nsyms].size = size;
-        g_syms[g_nsyms].name = base + strtab + name;
-        g_nsyms++;
+        g_hle.debug.syms[g_hle.debug.nsyms].addr = base + value;
+        g_hle.debug.syms[g_hle.debug.nsyms].size = size;
+        g_hle.debug.syms[g_hle.debug.nsyms].name = base + strtab + name;
+        g_hle.debug.nsyms++;
     }
 }
 void kernel_load_symbols(void) {
     u32 i;
     if (!g_mod) return;
     for (i = 0; i < g_mod->nmods; i++) module_symbols(&g_mod->mods[i], !g_arm_mod);
-    if (g_nsyms) qsort(g_syms, g_nsyms, sizeof *g_syms, sym_cmp);
-    LOG("symbols: %u functions named\n", g_nsyms);
+    if (g_hle.debug.nsyms) qsort(g_hle.debug.syms, g_hle.debug.nsyms, sizeof *g_hle.debug.syms, sym_cmp);
+    LOG("symbols: %u functions named\n", g_hle.debug.nsyms);
+}
+/* the address of the function the game exports as name (nvn_trace.c finds nvnBootstrapLoader so), 0 when none */
+u64 kernel_find_symbol_exact(const char* name) {
+    size_t len = strlen(name) + 1;
+    for (u32 i = 0; i < g_hle.debug.nsyms; i++)
+        if (readable(g_hle.debug.syms[i].name, len) && !memcmp(GP(g_hle.debug.syms[i].name), name, len)) return g_hle.debug.syms[i].addr;
+    return 0;
 }
 /* the length of the guest string at a, at most max, when it is readable and ends within max; else 0 */
 static int gstr(u64 a, int max) {
@@ -102,17 +105,17 @@ static int gstr(u64 a, int max) {
 }
 /* "<name+off>" for a code address: the function it is in, or the module and the offset into it; "" outside them */
 static void sym_name(u64 a, char* out, size_t n) {
-    u32 lo = 0, hi = g_nsyms, i;
+    u32 lo = 0, hi = g_hle.debug.nsyms, i;
     out[0] = 0;
     while (lo < hi) { /* the last symbol at or below a */
         u32 mid = lo + (hi - lo) / 2;
-        if (g_syms[mid].addr <= a)
+        if (g_hle.debug.syms[mid].addr <= a)
             lo = mid + 1;
         else
             hi = mid;
     }
-    if (lo && (!g_syms[lo - 1].size || a < g_syms[lo - 1].addr + g_syms[lo - 1].size)) {
-        const Sym* s = &g_syms[lo - 1];
+    if (lo && (!g_hle.debug.syms[lo - 1].size || a < g_hle.debug.syms[lo - 1].addr + g_hle.debug.syms[lo - 1].size)) {
+        const Sym* s = &g_hle.debug.syms[lo - 1];
         int len = gstr(s->name, 160);
         if (len && (s->size || a - s->addr < 0x10000)) {
             snprintf(out, n, "<%.*s+%llx>", len, (const char*)GP(s->name), (unsigned long long)(a - s->addr));
@@ -171,25 +174,28 @@ static void dump_code(int lvl, const char* what, u64 lo, u64 hi, u64 mark) {
         logf_(lvl, "  %s %llx:%s\n", what, (unsigned long long)a, line);
     }
 }
-/* words 32-bit words at what each register that points into mapped memory (aligned, above 0x10000) points at */
+/* words 32-bit words at what each register that points into mapped memory (aligned, above 0x10000) points at. The
+   registers can be a running thread's (a sleep's saved ones are rewritten at its next sleep): each is read once, and
+   the value checked is the one used. Reading r[i] again after the check let a thread dump read guest address 0x1c */
 static void dump_pointees(int lvl, const char* reg, const u64* r, int nr, int words) {
     int i, k;
     for (i = 0; i < nr; i++) {
         char line[8 * 9 + 1];
         size_t l = 0;
-        if (r[i] < 0x10000 || (r[i] & 3) || !readable(r[i], 4 * (u64)words)) continue;
-        for (k = 0; k < words && k < 8; k++) l += (size_t)sprintf(line + l, " %08x", gr32(r[i] + 4 * (u64)k));
-        logf_(lvl, "  mem %s%d %llx:%s\n", reg, i, (unsigned long long)r[i], line);
+        u64 a = __atomic_load_n(&r[i], __ATOMIC_RELAXED);
+        if (a < 0x10000 || (a & 3) || !readable(a, 4 * (u64)words)) continue;
+        for (k = 0; k < words && k < 8; k++) l += (size_t)sprintf(line + l, " %08x", gr32(a + 4 * (u64)k));
+        logf_(lvl, "  mem %s%d %llx:%s\n", reg, i, (unsigned long long)a, line);
     }
 }
 /* the last 40 SVCs (the ring svc.c's dispatch fills) and 32 IPC requests, oldest first. Each ring's count is read
    once: other threads go on filling them */
 static void dump_rings(int lvl) {
-    u32 n = __atomic_load_n(&g_svc_ring_n, __ATOMIC_RELAXED), i, first;
+    u32 n = __atomic_load_n(&g_hle.kernel.svc_ring_n, __ATOMIC_RELAXED), i, first;
     first = n > 40 ? n - 40 : 0;
     logf_(lvl, "  last SVCs:\n");
     for (i = first; i < n; i++) {
-        const SvcRec* r = &g_svc_ring[i & 63];
+        const SvcRec* r = &g_hle.kernel.svc_ring[i & 63];
         logf_(lvl, "    svc %02x (%llx %llx %llx %llx) -> %x, %llx  lr=%llx\n", r->imm, (unsigned long long)r->a[0],
               (unsigned long long)r->a[1], (unsigned long long)r->a[2], (unsigned long long)r->a[3], r->res,
               (unsigned long long)r->o1, (unsigned long long)r->lr);
@@ -197,7 +203,11 @@ static void dump_rings(int lvl) {
     n = ipc_ring_count();
     first = n > 32 ? n - 32 : 0;
     logf_(lvl, "  last IPC requests:\n");
-    for (i = first; i < n; i++) logf_(lvl, "    %.160s\n", ipc_ring_entry(i));
+    for (i = first; i < n; i++) {
+        char line[200];
+        ipc_ring_text(i, line, sizeof line);
+        logf_(lvl, "    %s\n", line);
+    }
 }
 static void dump_regs32(const KThread* t) {
     const SnxArmCPU* a = &t->arm;
@@ -312,11 +322,7 @@ static const char* thread_state(const KThread* t, char* s, size_t n) {
 }
 /* A thread that called svcSleepThread 100 times or more since the last dump polls something: its registers at its last
    sleep, what they point at, and the code around the sleep's return address and its three callers'. Counted per
-   table slot, from 0 again when a new thread takes the slot */
-static struct {
-    const KThread* t;
-    u64 n;
-} g_sleeps[256];
+   thread slot (g_hle.debug.sleeps), from 0 again when a new thread takes the slot */
 static void dump_sleeps(const KThread* t, u64 since) {
     char ls[200];
     u64 f[3];
@@ -335,18 +341,20 @@ static void dump_sleeps(const KThread* t, u64 since) {
     n = frames(t->sleep_x[29], 1, f, 3);
     for (i = 0; i < n; i++) dump_code(1, "code at a caller", f[i] - 0x20, f[i] + 0x20, f[i]);
 }
-/* Read without g_klock: the dump is how a hang is diagnosed, and a hang may be a thread that keeps the lock. The
-   values can be a moment stale or mid-change, which is all a dump needs. Mutex owners are named from the thread a
-   waiter recorded, which needs no handle lookup: threads are never freed */
+/* Read without g_klock or the pool's lock: the dump is how a hang is diagnosed, and a hang may be a thread that keeps
+   the lock. The values can be a moment stale or mid-change (a slot freed or taken meanwhile), which is all a dump
+   needs. Mutex owners are named from the thread a waiter recorded, which needs no handle lookup: the waiter holds a
+   reference to it */
 void kernel_dump_threads(void) {
-    int i, n = g_nthreads;
+    int i, n = 0;
+    for (i = 0; i < KTHREAD_MAX; i++) n += g_hle.thread.threads[i].o.type == KO_THREAD;
     LOG("threads (%d):\n", n);
-    for (i = 0; i < n; i++) {
-        const KThread* t = g_threads[i];
+    for (i = 0; i < KTHREAD_MAX; i++) {
+        const KThread* t = &g_hle.thread.threads[i];
         char name[64], st[240], ps[200], ls[200], mask[48];
         int wide = !g_arm_mod, k, nf;
         u64 pc, lr, sp, fp, f[10];
-        if (t->state == 2) continue;
+        if (t->o.type != KO_THREAD || t->state == 2) continue;
         if (!sdk_name(t, name, sizeof name)) snprintf(name, sizeof name, "%s", t->name);
         mask[0] = 0;
         if (t->affinity != 1ull << t->core)
@@ -354,9 +362,9 @@ void kernel_dump_threads(void) {
         LOG("  thread %llu '%s' prio %d (base %d) core %d%s: %s%s%s\n", (unsigned long long)t->id, name, t->prio,
             t->base_prio, t->core, mask, thread_state(t, st, sizeof st),
             t->on_core == -2 ? " (waiting for its core)" : "", t->suspended ? " (paused by svcSetThreadActivity)" : "");
-        if (g_sleeps[i].t != t) {
-            g_sleeps[i].t = t;
-            g_sleeps[i].n = 0;
+        if (g_hle.debug.sleeps[i].tid != t->id) {
+            g_hle.debug.sleeps[i].tid = t->id;
+            g_hle.debug.sleeps[i].n = 0;
         }
         if (t->state == 0) continue;
         pc = wide ? t->cpu.pc : t->arm.r[15];
@@ -372,10 +380,10 @@ void kernel_dump_threads(void) {
             sym_name(f[k], ls, sizeof ls);
             LOG("    #%d %llx %s\n", k + 1, (unsigned long long)f[k], ls);
         }
-        if (t == g_main) /* the main thread's callers: where it waits on the rest of the game */
+        if (t->id == g_hle.thread.main_tid) /* the main thread's callers: where it waits on the rest of the game */
             for (k = 0; k < nf && k < 3; k++) dump_code(1, "code at a caller", f[k] - 0x20, f[k] + 0x20, f[k]);
-        if (t->sleep_n - g_sleeps[i].n >= 100) dump_sleeps(t, t->sleep_n - g_sleeps[i].n);
-        g_sleeps[i].n = t->sleep_n;
+        if (t->sleep_n - g_hle.debug.sleeps[i].n >= 100) dump_sleeps(t, t->sleep_n - g_hle.debug.sleeps[i].n);
+        g_hle.debug.sleeps[i].n = t->sleep_n;
     }
     dump_rings(1);
 }

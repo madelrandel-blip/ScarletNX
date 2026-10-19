@@ -33,6 +33,78 @@
       }
     },
     {
+      "name": "linux-ppc64-base",
+      "hidden": true,
+      "inherits": "base",
+      "description": "A Linux PowerPC64 cross build: SNX_SYSROOT names a sysroot from scripts/ppc64-sysroot.sh, whose pkg-config files the libraries are found by",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Linux",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_AR": "llvm-ar",
+        "CMAKE_RANLIB": "llvm-ranlib",
+        "CMAKE_NM": "llvm-nm",
+        "CMAKE_SYSROOT": "$env{SNX_SYSROOT}",
+        "CMAKE_FIND_ROOT_PATH_MODE_PROGRAM": "NEVER",
+        "CMAKE_FIND_ROOT_PATH_MODE_LIBRARY": "ONLY",
+        "CMAKE_FIND_ROOT_PATH_MODE_INCLUDE": "ONLY",
+        "CMAKE_FIND_ROOT_PATH_MODE_PACKAGE": "ONLY",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_MODULE_LINKER_FLAGS": "-fuse-ld=lld",
+        "SNX_LLVM_CONFIG": "${sourceDir}/scripts/ppc64-llvm-config.sh",
+        "SNX_DEPLOY": "OFF"
+      }
+    },
+    {
+      "name": "linux-ppc64le-cross",
+      "displayName": "Linux ppc64le (ELFv2), cross-built with Clang",
+      "inherits": "linux-ppc64-base",
+      "environment": {
+        "PKG_CONFIG_LIBDIR": "$env{SNX_SYSROOT}/usr/lib/powerpc64le-linux-gnu/pkgconfig:$env{SNX_SYSROOT}/usr/lib/pkgconfig:$env{SNX_SYSROOT}/usr/share/pkgconfig",
+        "PKG_CONFIG_SYSROOT_DIR": "$env{SNX_SYSROOT}",
+        "QEMU_LD_PREFIX": "$env{SNX_SYSROOT}"
+      },
+      "cacheVariables": {
+        "CMAKE_SYSTEM_PROCESSOR": "ppc64le",
+        "CMAKE_C_COMPILER_TARGET": "powerpc64le-linux-gnu",
+        "CMAKE_CXX_COMPILER_TARGET": "powerpc64le-linux-gnu",
+        "CMAKE_CROSSCOMPILING_EMULATOR": "qemu-ppc64le;-L;$env{SNX_SYSROOT}"
+      }
+    },
+    {
+      "name": "linux-ppc64-cross",
+      "displayName": "Linux ppc64 big-endian with glibc (ELFv1, Debian ports), cross-built with Clang",
+      "inherits": "linux-ppc64-base",
+      "environment": {
+        "PKG_CONFIG_LIBDIR": "$env{SNX_SYSROOT}/usr/lib/powerpc64-linux-gnu/pkgconfig:$env{SNX_SYSROOT}/usr/lib/pkgconfig:$env{SNX_SYSROOT}/usr/share/pkgconfig",
+        "PKG_CONFIG_SYSROOT_DIR": "$env{SNX_SYSROOT}",
+        "QEMU_LD_PREFIX": "$env{SNX_SYSROOT}"
+      },
+      "cacheVariables": {
+        "CMAKE_SYSTEM_PROCESSOR": "ppc64",
+        "CMAKE_C_COMPILER_TARGET": "powerpc64-linux-gnu",
+        "CMAKE_CXX_COMPILER_TARGET": "powerpc64-linux-gnu",
+        "CMAKE_CROSSCOMPILING_EMULATOR": "qemu-ppc64;-L;$env{SNX_SYSROOT}"
+      }
+    },
+    {
+      "name": "linux-ppc64-musl-cross",
+      "displayName": "Linux ppc64 big-endian with musl (ELFv2), cross-built with Clang",
+      "inherits": "linux-ppc64-base",
+      "environment": {
+        "PKG_CONFIG_LIBDIR": "$env{SNX_SYSROOT}/usr/lib/pkgconfig:$env{SNX_SYSROOT}/usr/share/pkgconfig",
+        "PKG_CONFIG_SYSROOT_DIR": "$env{SNX_SYSROOT}",
+        "QEMU_LD_PREFIX": "$env{SNX_SYSROOT}"
+      },
+      "cacheVariables": {
+        "CMAKE_SYSTEM_PROCESSOR": "ppc64",
+        "CMAKE_C_COMPILER_TARGET": "powerpc64-linux-musl",
+        "CMAKE_CXX_COMPILER_TARGET": "powerpc64-linux-musl",
+        "CMAKE_CROSSCOMPILING_EMULATOR": "qemu-ppc64;-L;$env{SNX_SYSROOT}"
+      }
+    },
+    {
       "name": "macos",
       "displayName": "macOS on Apple silicon, Xcode's Clang (docs/APPLE.md)",
       "inherits": "base",
@@ -78,12 +150,56 @@
       "configurePreset": "windows-cross"
     },
     {
+      "name": "linux-ppc64le-cross",
+      "configurePreset": "linux-ppc64le-cross"
+    },
+    {
+      "name": "linux-ppc64-cross",
+      "configurePreset": "linux-ppc64-cross"
+    },
+    {
+      "name": "linux-ppc64-musl-cross",
+      "configurePreset": "linux-ppc64-musl-cross"
+    },
+    {
       "name": "macos",
       "configurePreset": "macos"
     },
     {
       "name": "ios",
       "configurePreset": "ios"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "linux-ppc64le-cross",
+      "configurePreset": "linux-ppc64le-cross",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "timeout": 900
+      }
+    },
+    {
+      "name": "linux-ppc64-cross",
+      "configurePreset": "linux-ppc64-cross",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "timeout": 900
+      }
+    },
+    {
+      "name": "linux-ppc64-musl-cross",
+      "configurePreset": "linux-ppc64-musl-cross",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "timeout": 900
+      }
     }
   ]
 }

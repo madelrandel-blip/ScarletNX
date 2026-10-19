@@ -23,19 +23,15 @@ static void set_method(GpuMme* m, u32 v) {
     m->method = v & 0xFFF;
     m->incr = (v >> 12) & 0x3F;
 }
-static void send(GpuChannel* ch, u32 v) {
+/* rec: recorded instead of sent (mme_out) */
+static void send(GpuChannel* ch, MmeRec* rec, u32 v) {
     GpuMme* m = &ch->mme;
     u32 at = m->method;
     m->method = (m->method + m->incr) & 0xFFF;
-    /* a send to a macro method only sets its register, as Ryujinx's interpreter does: starting a call over the
-       parameters the running macro is still reading is nothing the hardware does (Eden would nest one) */
-    if (at >= 0xE00)
-        ch->r3d[at] = v;
-    else
-        maxwell3d_method(ch, at, v, 1);
+    mme_out(ch, rec, at, v);
 }
 /* the result operation (bits 4-6) of an ALU, add or bitfield step */
-static void result(GpuChannel* ch, u32 op, u32 dst, u32 v) {
+static void result(GpuChannel* ch, MmeRec* rec, u32 op, u32 dst, u32 v) {
     GpuMme* m = &ch->mme;
     switch (op) {
         case 0: set_reg(m, dst, fetch_param(ch)); break; /* fetch, the result unused */
@@ -46,11 +42,11 @@ static void result(GpuChannel* ch, u32 op, u32 dst, u32 v) {
             break;
         case 3: /* fetch, and send the result */
             set_reg(m, dst, fetch_param(ch));
-            send(ch, v);
+            send(ch, rec, v);
             break;
         case 4: /* move, and send it */
             set_reg(m, dst, v);
-            send(ch, v);
+            send(ch, rec, v);
             break;
         case 5: /* fetch, and the result as the method address */
             set_reg(m, dst, fetch_param(ch));
@@ -59,12 +55,12 @@ static void result(GpuChannel* ch, u32 op, u32 dst, u32 v) {
         case 6: /* move, the method address, and send a parameter */
             set_reg(m, dst, v);
             set_method(m, v);
-            send(ch, fetch_param(ch));
+            send(ch, rec, fetch_param(ch));
             break;
         default: /* move, the method address, and send bits 12-17 of the result */
             set_reg(m, dst, v);
             set_method(m, v);
-            send(ch, (v >> 12) & 0x3F);
+            send(ch, rec, (v >> 12) & 0x3F);
             break;
     }
 }
@@ -92,7 +88,7 @@ static u32 alu(GpuMme* m, u32 op, u32 a, u32 b) {
     return (u32)r;
 }
 /* one instruction */
-static void step(GpuChannel* ch) {
+static void step(GpuChannel* ch, MmeRec* rec) {
     GpuMme* m = &ch->mme;
     u32 insn = ch->mme_code[m->pc & 0x1FFF], at = m->pc;
     u32 op = insn & 7, rop = (insn >> 4) & 7, dst = (insn >> 8) & 7;
@@ -108,18 +104,18 @@ static void step(GpuChannel* ch) {
         m->pc = m->target;
     }
     switch (op) {
-        case 0: result(ch, rop, dst, alu(m, (insn >> 17) & 31, a, b)); break;
-        case 1: result(ch, rop, dst, a + (u32)imm); break;
+        case 0: result(ch, rec, rop, dst, alu(m, (insn >> 17) & 31, a, b)); break;
+        case 1: result(ch, rec, rop, dst, a + (u32)imm); break;
         case 2: /* insert bits of b at src_bit into a at dst_bit */
-            result(ch, rop, dst, (a & ~(mask << dst_bit)) | (((b >> src_bit) & mask) << dst_bit));
+            result(ch, rec, rop, dst, (a & ~(mask << dst_bit)) | (((b >> src_bit) & mask) << dst_bit));
             break;
         case 3: /* extract at a register's bit, shift left by an immediate */
-            result(ch, rop, dst, ((b >> (a & 31)) & mask) << dst_bit);
+            result(ch, rec, rop, dst, ((b >> (a & 31)) & mask) << dst_bit);
             break;
         case 4: /* extract at an immediate's bit, shift left by a register */
-            result(ch, rop, dst, ((b >> src_bit) & mask) << (a & 31));
+            result(ch, rec, rop, dst, ((b >> src_bit) & mask) << (a & 31));
             break;
-        case 5: set_reg(m, dst, ch->r3d[(a + (u32)imm) & 0xFFF]); break; /* read a register */
+        case 5: set_reg(m, dst, mme_reg(ch, rec, a + (u32)imm)); break; /* read a register */
         case 7: {                                                      /* branch on a zero (bit 4 clear) or not */
             int zero = !a;
             if (((insn >> 4) & 1) ? !zero : zero) {
@@ -151,7 +147,8 @@ static void step(GpuChannel* ch) {
         m->slot = 1;
     }
 }
-void mme_resume(GpuChannel* ch) {
+/* runs the macro until it ends or a method it sent makes the stream wait (rec: recording, which never waits) */
+static void mme_go(GpuChannel* ch, MmeRec* rec) {
     GpuMme* m = &ch->mme;
     while (m->running && !ch->park) {
         if (++m->steps > MME_STEPS) {
@@ -159,10 +156,12 @@ void mme_resume(GpuChannel* ch) {
             m->running = 0;
             return;
         }
-        step(ch);
+        step(ch, rec);
     }
 }
-void mme_run(GpuChannel* ch, u32 idx, u32 np) {
+void mme_resume(GpuChannel* ch) { mme_go(ch, NULL); }
+/* runs macro idx through the interpreter, sending as mme_out does (rec records instead) */
+static void mme_interpret(GpuChannel* ch, MmeRec* rec, u32 idx, u32 np) {
     GpuMme* m = &ch->mme;
     memset(m, 0, sizeof *m);
     m->pc = ch->mme_start[idx & 0x7F];
@@ -170,5 +169,183 @@ void mme_run(GpuChannel* ch, u32 idx, u32 np) {
     m->regs[1] = np ? ch->mme_params[0] : 0; /* the first parameter is in r1 */
     m->next = 1;
     m->running = 1;
-    mme_resume(ch);
+    mme_go(ch, rec);
+}
+
+/* ============================================================ native macros */
+/* A macro whose code mme_hle.c knows runs as host code: the slot numbers are the SDK's choice, so the code's hash
+   names the macro, and an unknown hash keeps the interpreter. The hash covers the code from the macro's start to the
+   end of the upload batch that wrote it, as Eden's MacroEngine::Execute (src/video_core/macro.cpp at de7e6e01) hashes
+   it, so that hashes Eden's table names mean the same code here: NVN uploads each macro in a batch of its own, which
+   ends with the delay slot of its last exit */
+void mme_upload_ptr(GpuChannel* ch, u32 v) {
+    ch->mme_upload = v;
+    ch->mme_batch++;
+}
+void mme_upload(GpuChannel* ch, u32 v) {
+    u32 at = ch->mme_upload++ & 0x1FFF;
+    ch->mme_code[at] = v;
+    ch->mme_code_batch[at] = ch->mme_batch;
+    memset(ch->mme_choice, 0, sizeof ch->mme_choice);
+}
+void mme_bind(GpuChannel* ch, u32 v) {
+    ch->mme_start[ch->mme_start_ptr++ & 0x7F] = v;
+    memset(ch->mme_choice, 0, sizeof ch->mme_choice);
+}
+/* Eden's Common::HashRange over u32 words (src/common/container_hash.h at de7e6e01, from Boost's hash_combine:
+   2005-2014 Daniel James, with the 64-bit MurmurHash2 mix of 2016 Austin Appleby): each word is combined as itself */
+static u64 mme_hash_word(u64 h, u32 w) {
+    const u64 m = 0xC6A4A7935BD1E995ull;
+    u64 k = w;
+    k *= m;
+    k ^= k >> 47;
+    k *= m;
+    h ^= k;
+    h *= m;
+    return h + 0xE6546B64ull;
+}
+void mme_out(GpuChannel* ch, MmeRec* rec, u32 m, u32 v) {
+    m &= 0xFFF;
+    if (rec) {
+        if (rec->n < MME_REC_N) {
+            rec->m[rec->n] = m;
+            rec->v[rec->n] = v;
+            rec->n++;
+        }
+        rec->total++;
+        rec->hash = mme_hash_word(mme_hash_word(rec->hash, m), v);
+    } else if (m >= 0xE00) /* a macro method only sets its register, as Ryujinx's interpreter does: starting a call
+                              over the parameters the running macro is still reading is nothing the hardware does
+                              (Eden would nest one) */
+        ch->r3d[m] = v;
+    else
+        maxwell3d_method(ch, m, v, 1);
+}
+u32 mme_reg(GpuChannel* ch, MmeRec* rec, u32 a) {
+    if (rec && rec->total) rec->read_after_send = 1;
+    return ch->r3d[a & 0xFFF];
+}
+/* the native implementation for macro idx, or -1: looked up once after its code or start changed */
+static int mme_choose(GpuChannel* ch, u32 idx) {
+    u32 c = ch->mme_choice[idx];
+    if (!c) {
+        u32 s = ch->mme_start[idx] & 0x1FFF, b = ch->mme_code_batch[s], n = 0;
+        u64 h = 0;
+        int k = -1;
+        if (b) {
+            while (n < 0x2000 && ch->mme_code_batch[(s + n) & 0x1FFF] == b) {
+                h = mme_hash_word(h, ch->mme_code[(s + n) & 0x1FFF]);
+                n++;
+            }
+            k = mme_native_find(h);
+        }
+        LOG_LIMIT(256, "mme: macro %u at word %x, %u words uploaded together, hash %016llx: %s\n", idx, s, n,
+                  (unsigned long long)h, k >= 0 ? mme_native_name(k) : "interpreted");
+        c = k >= 0 ? (u32)k + 2 : 1;
+        ch->mme_choice[idx] = (u8)c;
+        ch->mme_hash[idx] = h;
+    }
+    return (int)c - 2;
+}
+/* SNX_MME_HLE=0 runs every macro through the interpreter; SNX_MME_VERIFY=1 runs a known macro both ways, recorded,
+   compares what they send, and sends what the interpreter does */
+enum { MME_NATIVE = 1, MME_VERIFY = 2 };
+static int mme_mode = -1;
+/* calls, counted on the GPU thread (the only one running macros): native, interpreted, and in verify mode those
+   compared, those that differed, those the recording couldn't judge (a register read after a send) and those the
+   native one left to the interpreter */
+static u64 mme_n_native, mme_n_interp, mme_n_same, mme_n_differ, mme_n_unjudged, mme_n_declined;
+/* the interpreted calls by the hash of their macro, in a table with a place for each of the first MME_STATS hashes:
+   the log line names the busiest, the macros a native implementation would take next */
+#define MME_STATS 64
+static struct {
+    u64 hash, calls;
+} mme_stats[MME_STATS];
+static void mme_stat(u64 h) {
+    u32 i = (u32)(h ^ h >> 32) % MME_STATS, n;
+    for (n = 0; n < MME_STATS && mme_stats[i].calls && mme_stats[i].hash != h; n++) i = (i + 1) % MME_STATS;
+    if (n == MME_STATS) return;
+    mme_stats[i].hash = h;
+    mme_stats[i].calls++;
+}
+static void mme_stats_log(void) {
+    char line[256];
+    size_t at = 0;
+    u32 shown[4], ns = 0, i, j;
+    while (ns < 4) {
+        u32 best = MME_STATS;
+        for (i = 0; i < MME_STATS; i++) {
+            for (j = 0; j < ns && shown[j] != i; j++) {}
+            if (j == ns && mme_stats[i].calls && (best == MME_STATS || mme_stats[i].calls > mme_stats[best].calls))
+                best = i;
+        }
+        if (best == MME_STATS) break;
+        shown[ns++] = best;
+        at += (size_t)snprintf(line + at, sizeof line - at, "%s%016llx %llu", ns > 1 ? ", " : "",
+                               (unsigned long long)mme_stats[best].hash, (unsigned long long)mme_stats[best].calls);
+        if (at >= sizeof line) break;
+    }
+    if (ns) LOG("mme: the macros interpreted most, by hash: %s\n", line);
+}
+static void mme_verify(GpuChannel* ch, u32 idx, int k, u32 np) {
+    static MmeRec rec[2]; /* GPU thread only, and too large for a frame of its own */
+    MmeRec *nat = &rec[0], *in = &rec[1];
+    u32 i, n;
+    nat->n = nat->total = in->n = in->total = 0;
+    nat->hash = in->hash = 0;
+    nat->read_after_send = in->read_after_send = 0;
+    if (!mme_native_run(k, ch, nat, ch->mme_params, np)) {
+        mme_n_declined++;
+        return;
+    }
+    mme_interpret(ch, in, idx, np);
+    if (nat->read_after_send || in->read_after_send) {
+        mme_n_unjudged++;
+        return;
+    }
+    if (nat->total == in->total && nat->hash == in->hash) {
+        mme_n_same++;
+        return;
+    }
+    mme_n_differ++;
+    n = nat->n < in->n ? nat->n : in->n;
+    i = 0;
+    while (i < n && nat->m[i] == in->m[i] && nat->v[i] == in->v[i]) i++;
+    if (i < n)
+        WARN_LIMIT(32,
+                   "mme: macro %u (%s, hash %016llx) differs from the interpreter at its send %u: native %x = %x, "
+                   "interpreter %x = %x (%u and %u sends)\n",
+                   idx, mme_native_name(k), (unsigned long long)mme_native_hash(k), i, nat->m[i], nat->v[i], in->m[i],
+                   in->v[i], nat->total, in->total);
+    else
+        WARN_LIMIT(32, "mme: macro %u (%s) differs from the interpreter after send %u (%u and %u sends)\n", idx,
+                   mme_native_name(k), i, nat->total, in->total);
+}
+void mme_run(GpuChannel* ch, u32 idx, u32 np) {
+    int k = -1;
+    idx &= 0x7F;
+    if (mme_mode < 0) {
+        const char *hle = getenv("SNX_MME_HLE"), *verify = getenv("SNX_MME_VERIFY");
+        mme_mode = (hle && !strcmp(hle, "0") ? 0 : MME_NATIVE) | (verify && strcmp(verify, "0") ? MME_VERIFY : 0);
+    }
+    if (mme_mode & MME_NATIVE) k = mme_choose(ch, idx);
+    if (k >= 0 && !(mme_mode & MME_VERIFY) && mme_native_run(k, ch, NULL, ch->mme_params, np))
+        mme_n_native++;
+    else {
+        if (k >= 0 && (mme_mode & MME_VERIFY)) mme_verify(ch, idx, k, np);
+        mme_n_interp++;
+        if (mme_mode & MME_NATIVE) mme_stat(ch->mme_hash[idx]);
+        mme_interpret(ch, NULL, idx, np);
+    }
+    if ((mme_n_native + mme_n_interp) % 1000000 == 0) {
+        LOG("mme: %llu macro calls, %llu native and %llu interpreted\n",
+            (unsigned long long)(mme_n_native + mme_n_interp), (unsigned long long)mme_n_native,
+            (unsigned long long)mme_n_interp);
+        mme_stats_log();
+        if (mme_mode & MME_VERIFY)
+            LOG("mme: verified %llu calls the same, %llu different, %llu unjudged (a read after a send), %llu left to the "
+                "interpreter\n",
+                (unsigned long long)mme_n_same, (unsigned long long)mme_n_differ, (unsigned long long)mme_n_unjudged,
+                (unsigned long long)mme_n_declined);
+    }
 }

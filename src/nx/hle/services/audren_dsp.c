@@ -7,6 +7,7 @@
    final mix through its effects and its volume; then the device sinks, then the circular buffer sinks. The mix
    buffers hold samples on the 16-bit scale, as floats */
 #include "nx/hle/services/audren_dsp.h"
+#include "nx/hle/hle.h"
 #include "nx/runtime/platform/log.h"
 #include <math.h>
 #include <stddef.h>
@@ -179,8 +180,12 @@ ARState* audren_state_new(const u8* params) {
     return s;
 }
 
+/* the compressor's state is a slot of g_hle.audren_dsp's pool, the others' a block of their own */
 static void fx_free(AREffect* e) {
-    free(e->fx);
+    if (e->fx && e->type == SNX_AUDREN_EFFECT_COMPRESSOR)
+        POOL_PUT((ARCompressor*)e->fx);
+    else
+        free(e->fx);
     e->fx = NULL;
 }
 
@@ -1664,10 +1669,7 @@ static void effect_i3dl2(ARState* s, ARMix* m, AREffect* e) {
     }
 }
 
-/* the compressor (Eden's CompressorInfo and CompressorCommand), from revision 9 */
-typedef struct {
-    float detector, held, gain, knee, knee_lo, knee_hi, rate, out;
-} ARCompressor;
+/* the compressor (Eden's CompressorInfo and CompressorCommand), from revision 9: an ARCompressor (audren_dsp.h) */
 
 static float db_gain(float db) {
     float e = db / 20.0f * 3.3219f;
@@ -1696,11 +1698,10 @@ static void effect_compressor(ARState* s, ARMix* m, AREffect* e) {
         if (!(in[i] = mixbuf(s, m, (i8)p[i])) || !(out[i] = mixbuf(s, m, (i8)p[6 + i]))) return;
     if (e->enabled && (!e->fx || p[0x34] == SNX_AUDREN_PARAM_INITIALIZED)) {
         fx_free(e);
-        c = calloc(1, sizeof *c);
-        if (c) {
-            c->held = c->gain = 1.0f;
-            compressor_params(c, p);
-        }
+        c = POOL_TAKE(g_hle.audren_dsp.compressors, g_hle.audren_dsp.compressor_next, "audio compressors");
+        c->used = 1;
+        c->held = c->gain = 1.0f;
+        compressor_params(c, p);
         e->fx = c;
     } else if (e->enabled && p[0x34] == SNX_AUDREN_PARAM_UPDATING)
         compressor_params(e->fx, p);

@@ -34,6 +34,7 @@ void logf_(int lvl, const char* fmt, ...) {
     (void)fmt;
 }
 u64 nvmap_addr_by_id(u32 id) { return id == 7 ? 0x1000 : 0; }
+void cheats_frame(void) {}
 static u64 presented;
 static void test_present(u64 a, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt, const i32 crop[4], u32 t) {
     (void)w, (void)h, (void)pitch, (void)layout, (void)bhl, (void)fmt, (void)crop, (void)t;

@@ -92,6 +92,9 @@ install(FILES "${plutovg_SOURCE_DIR}/LICENSE" "${plutovg_SOURCE_DIR}/source/FTL.
 if(BUILD_TESTING)
     add_executable(snx-test-splash "${PROJECT_SOURCE_DIR}/tests/splash.c")
     target_link_libraries(snx-test-splash PRIVATE snx_splash SDL3::SDL3)
+    # plutovg, built into snx_splash, makes the JPEGs the pictures are drawn from
+    target_include_directories(snx-test-splash SYSTEM PRIVATE "${plutovg_SOURCE_DIR}/include")
+    target_compile_definitions(snx-test-splash PRIVATE PLUTOVG_BUILD_STATIC)
     target_compile_definitions(snx-test-splash PRIVATE
                                SNX_SPLASH_ICON="${PROJECT_SOURCE_DIR}/dist/icons/hicolor/256x256/apps/wimsy.png")
     target_compile_options(snx-test-splash PRIVATE -Wall -Wextra -Werror -UNDEBUG)

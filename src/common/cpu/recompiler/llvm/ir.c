@@ -25,19 +25,23 @@ static int has_feature(const char* features, const char* name) {
 
 int snx_ir_init(char* error, size_t error_size) {
     char* triple;
-    int x86, arm;
+    int x86, arm, ppc;
     /* the asm parser for the runtime library's inline assembly (rtlib.c's divq, cpu.h's compiler barrier) */
     if (LLVMInitializeNativeTarget() || LLVMInitializeNativeAsmPrinter() || LLVMInitializeNativeAsmParser()) {
         snprintf(error, error_size, "LLVM has no code generator for this host");
         return -1;
     }
-    /* x86-64 and AArch64 hosts: the guest's barriers, acquires, releases and exclusives are fences and seq_cst atomics
-       (cpu.h), so its plain accesses need no ordering of their own from the host */
+    /* x86-64, AArch64 and PowerPC64 hosts: the guest's barriers, acquires, releases and exclusives are fences and
+       seq_cst atomics (cpu.h), so its plain accesses need no ordering of their own from the host. POWER is not
+       multi-copy atomic as ARMv8 is, which only a program ordering plain accesses on three threads without barriers
+       could see; its seq_cst fence (hwsync) is cumulative, as DMB is */
     triple = LLVMGetDefaultTargetTriple();
     x86 = !strncmp(triple, "x86_64", 6);
     arm = !strncmp(triple, "aarch64", 7) || !strncmp(triple, "arm64", 5); /* Apple names AArch64 arm64 */
-    if (!x86 && !arm)
-        snprintf(error, error_size, "the LLVM backend targets x86-64 and AArch64 hosts, this one is %s", triple);
+    ppc = !strncmp(triple, "powerpc64", 9) || !strncmp(triple, "ppc64", 5);
+    if (!x86 && !arm && !ppc)
+        snprintf(error, error_size, "the LLVM backend targets x86-64, AArch64 and PowerPC64 hosts, this one is %s",
+                 triple);
     LLVMDisposeMessage(triple);
     if (x86 && !snx_ir_host.x86) {
         char* f = LLVMGetHostCPUFeatures();
@@ -54,7 +58,7 @@ int snx_ir_init(char* error, size_t error_size) {
         LLVMDisposeMessage(f);
         snx_ir_host.x86 = 1; /* last: snx_ir_init may run again, the features stay as read */
     }
-    return x86 || arm ? 0 : -1;
+    return x86 || arm || ppc ? 0 : -1;
 }
 
 static LLVMCodeGenOptLevel codegen_level(char opt) {
@@ -66,19 +70,56 @@ static LLVMCodeGenOptLevel codegen_level(char opt) {
     }
 }
 
+/* The host's triple, for objects the JIT loader loads when jit is nonzero. The loader reads ELF (and Windows' COFF),
+   and Darwin's objects are Mach-O: there the triple names ELF as its object format (arm64-apple-darwin<version>-elf),
+   and the code stays Darwin's. LLVM's AArch64 backend picks the calling convention, the reserved registers and the
+   library calls by the operating system, not by the object format: DarwinPCS (variadic arguments on the stack, small
+   arguments extended by the caller), x18 and x29 never allocated, bzero and memset_pattern16 for memset (libc.inc).
+   Only the sections, relocations and symbol names (no leading underscore) are ELF's */
+static char* host_triple(int jit) {
+    char* triple = LLVMGetDefaultTargetTriple();
+#ifdef __APPLE__
+    if (jit && !strstr(triple, "-elf")) {
+        size_t n = strlen(triple);
+        char* elf = (char*)malloc(n + sizeof("-elf"));
+        if (elf) {
+            memcpy(elf, triple, n);
+            memcpy(elf + n, "-elf", sizeof("-elf"));
+            LLVMDisposeMessage(triple);
+            triple = LLVMCreateMessage(elf);
+            free(elf);
+        }
+    }
+#else
+    (void)jit;
+#endif
+    return triple;
+}
+
+static SnxIr* new_ir(const char* name, char opt, const char* target_triple, int jit, char* error, size_t error_size);
+
 SnxIr* snx_ir_new(const char* name, char opt, char* error, size_t error_size) {
-    return snx_ir_new_target(name, opt, NULL, error, error_size);
+    return new_ir(name, opt, NULL, 0, error, error_size);
+}
+
+SnxIr* snx_ir_new_jit(const char* name, char opt, char* error, size_t error_size) {
+    return new_ir(name, opt, NULL, 1, error, error_size);
 }
 
 SnxIr* snx_ir_new_target(const char* name, char opt, const char* target_triple, char* error, size_t error_size) {
+    return new_ir(name, opt, target_triple, 0, error, error_size);
+}
+
+static SnxIr* new_ir(const char* name, char opt, const char* target_triple, int jit, char* error, size_t error_size) {
     SnxIr* ir;
     char *triple, *cpu, *features, *message = NULL, *layout;
+    int ppc;
     LLVMTargetRef target;
     LLVMTargetDataRef data;
     LLVMTypeRef params[2];
     ir = (SnxIr*)calloc(1, sizeof(*ir));
     if (!ir) return NULL;
-    triple = target_triple ? LLVMCreateMessage(target_triple) : LLVMGetDefaultTargetTriple();
+    triple = target_triple ? LLVMCreateMessage(target_triple) : host_triple(jit);
     if (LLVMGetTargetFromTriple(triple, &target, &message)) {
         snprintf(error, error_size, "LLVM target %s: %s", triple, message ? message : "unavailable");
         LLVMDisposeMessage(message);
@@ -86,9 +127,27 @@ SnxIr* snx_ir_new_target(const char* name, char opt, const char* target_triple, 
         free(ir);
         return NULL;
     }
-    /* -march=native -mtune=native, -fPIC (toolchain.c) */
-    cpu = target_triple ? LLVMCreateMessage("x86-64") : LLVMGetHostCPUName();
-    features = target_triple ? LLVMCreateMessage("+cx16") : LLVMGetHostCPUFeatures();
+    /* -march=native -mtune=native, -fPIC (toolchain.c). Another triple gets its architecture's baseline: x86-64 with
+       CMPXCHG16B as rtlib is built, POWER8 on PowerPC64, anything else (AArch64) the generic CPU, since an x86 CPU
+       name crashes another target's instruction selection */
+    ppc = !strncmp(triple, "powerpc64", 9) || !strncmp(triple, "ppc64", 5);
+    if (!target_triple) {
+        cpu = LLVMGetHostCPUName();
+        features = LLVMGetHostCPUFeatures();
+    } else if (!strncmp(triple, "x86_64", 6)) {
+        cpu = LLVMCreateMessage("x86-64");
+        features = LLVMCreateMessage("+cx16");
+    } else {
+        cpu = LLVMCreateMessage(ppc ? "pwr8" : "generic");
+        features = LLVMCreateMessage("");
+    }
+    /* POWER8 at least, as cmake/cross.cmake builds the runtime library: before it there is no lqarx/stqcx., and the
+       128-bit cmpxchg becomes a libatomic call no module links. The host's name is "generic" where /proc/cpuinfo has
+       no POWER line, as under qemu-user */
+    if (ppc && (!strcmp(cpu, "generic") || !strcmp(cpu, "ppc64") || !strcmp(cpu, "ppc64le") || !*cpu)) {
+        LLVMDisposeMessage(cpu);
+        cpu = LLVMCreateMessage("pwr8");
+    }
     ir->tm =
         LLVMCreateTargetMachine(target, triple, cpu, features, codegen_level(opt), LLVMRelocPIC, LLVMCodeModelDefault);
 #ifdef __ANDROID__
@@ -149,14 +208,114 @@ void snx_ir_free(SnxIr* ir) {
     free(ir);
 }
 
+/* ---- PowerPC64's guest tail calls ----
+   Without PC-relative code (POWER10), LLVM only makes a call a jump when it can see that the callee shares the caller's
+   TOC: a function defined in the same module, never a declaration (another unit's guest function) or a pointer
+   (snx_lookup's). For those a musttail call is a fatal error. A module has one TOC (link_elf.c), so the jump is always
+   safe: each such call is made to a naked stub of this module, a definition LLVM jumps to, and the stub jumps on
+   without touching r2 or the arguments. A declared callee's stub is a branch to it, which the linker points at its
+   local entry (ELFv2) or code (ELFv1's descriptor); a pointer's stub repeats snx_lookup (cpu.h) and jumps through the
+   count register, with r12 at the global entry as ELFv2 expects, or through the descriptor (ELFv1) */
+static void attribute(SnxIr* ir, LLVMValueRef function, LLVMAttributeIndex index, const char* name);
+static int ppc_target(const SnxIr* ir) {
+    const char* target = LLVMGetTarget(ir->mod);
+    return !strncmp(target, "powerpc64", 9) || !strncmp(target, "ppc64", 5);
+}
+static LLVMValueRef ppc_stub(SnxIr* ir, LLVMTypeRef type, const char* name, const char* text) {
+    LLVMValueRef stub = LLVMGetNamedFunction(ir->mod, name), body;
+    LLVMBuilderRef b;
+    if (stub) return stub;
+    stub = LLVMAddFunction(ir->mod, name, type);
+    LLVMSetLinkage(stub, LLVMInternalLinkage);
+    attribute(ir, stub, LLVMAttributeFunctionIndex, "naked");
+    attribute(ir, stub, LLVMAttributeFunctionIndex, "noinline");
+    attribute(ir, stub, LLVMAttributeFunctionIndex, "nounwind");
+    b = LLVMCreateBuilderInContext(ir->ctx);
+    LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ir->ctx, stub, "entry"));
+    body = LLVMGetInlineAsm(LLVMFunctionType(ir->t_void, NULL, 0, 0), text, strlen(text), "", 0, 1, 0,
+                            LLVMInlineAsmDialectATT, 0);
+    LLVMBuildCall2(b, LLVMFunctionType(ir->t_void, NULL, 0, 0), body, NULL, 0, "");
+    LLVMBuildUnreachable(b);
+    LLVMDisposeBuilder(b);
+    return stub;
+}
+static LLVMValueRef ppc_dynamic_stub(SnxIr* ir, LLVMTypeRef type) {
+    char text[640];
+    /* ELFv2 is little-endian's and musl's (as Clang picks it), ELFv1 big-endian glibc's, where a function pointer
+       is its descriptor, whose first doubleword is the code */
+    const char* target = LLVMGetTarget(ir->mod);
+    const char* jump = !strncmp(target, "powerpc64le", 11) || !strncmp(target, "ppc64le", 7) || strstr(target, "musl")
+                           ? "mtctr 12\n bctr"
+                           : "ld 0, 0(12)\n mtctr 0\n bctr";
+    /* r3 the CPU, r4 the pc: f = disp[(pc - code_lo) >> 2] when inside and aligned, else snx_interp_entry */
+    sprintf(text,
+            "ld 11, %u(3)\n ld 12, %u(3)\n subf 12, 11, 12\n subf 11, 11, 4\n cmpld 11, 12\n bge 1f\n"
+            " andi. 0, 4, 3\n bne 1f\n ld 12, %u(3)\n sldi 11, 11, 1\n ldx 12, 12, 11\n cmpdi 12, 0\n beq 1f\n"
+            " %s\n1:\n addis 12, 2, snx_interp_entry@toc@ha\n ld 12, snx_interp_entry@toc@l(12)\n %s",
+            (unsigned)offsetof(CPU, code_lo), (unsigned)offsetof(CPU, code_hi), (unsigned)offsetof(CPU, disp), jump,
+            jump);
+    if (!LLVMGetNamedGlobal(ir->mod, "snx_interp_entry")) {
+        LLVMValueRef entry = LLVMAddGlobal(ir->mod, ir->t_ptr, "snx_interp_entry"); /* rtlib.c */
+        LLVMSetVisibility(entry, LLVMHiddenVisibility);
+    }
+    return ppc_stub(ir, type, "snx_ppc_tail_dynamic", text);
+}
+static void ppc_tail_calls(SnxIr* ir) {
+    LLVMValueRef function, inst, next;
+    LLVMBasicBlockRef block;
+    for (function = LLVMGetFirstFunction(ir->mod); function; function = LLVMGetNextFunction(function))
+        for (block = LLVMGetFirstBasicBlock(function); block; block = LLVMGetNextBasicBlock(block))
+            for (inst = LLVMGetFirstInstruction(block); inst; inst = next) {
+                LLVMValueRef callee, stub, args[2], site;
+                LLVMTypeRef type;
+                char name[160], text[160];
+                next = LLVMGetNextInstruction(inst);
+                if (!LLVMIsACallInst(inst) || LLVMGetTailCallKind(inst) != LLVMTailCallKindMustTail) continue;
+                callee = LLVMGetCalledValue(inst);
+                type = LLVMGetCalledFunctionType(inst);
+                if (LLVMIsAFunction(callee) && !LLVMIsDeclaration(callee)) continue; /* LLVM jumps there itself */
+                if (LLVMCountParamTypes(type) != 2) continue; /* only guest calls (c, pc) are musttail */
+                if (LLVMIsAFunction(callee)) {
+                    size_t length;
+                    const char* target = LLVMGetValueName2(callee, &length);
+                    if (length > 120) continue;
+                    sprintf(name, "snx_ppc_tail.%.*s", (int)length, target);
+                    sprintf(text, "b %.*s", (int)length, target);
+                    stub = ppc_stub(ir, type, name, text);
+                } else
+                    stub = ppc_dynamic_stub(ir, type);
+                args[0] = LLVMGetOperand(inst, 0);
+                args[1] = LLVMGetOperand(inst, 1);
+                LLVMPositionBuilderBefore(ir->b, inst);
+                site = LLVMBuildCall2(ir->b, type, stub, args, 2, "");
+                LLVMSetTailCallKind(site, LLVMTailCallKindMustTail);
+                LLVMInstructionEraseFromParent(inst);
+            }
+}
+
 int snx_ir_object(SnxIr* ir, char opt, unsigned char** data, size_t* size, char* error, size_t error_size) {
+    *data = NULL;
+    *size = 0;
+    if (ir->fallbacks) {
+        size_t index;
+        const SnxA64Pattern* pattern = snx_a64_case_pattern(snx_a64_decode(ir->fallback_word), &index);
+        snprintf(error, error_size, "no IR emitter for %s (%08lx at %llx), %lu instruction%s in all",
+                 pattern ? pattern->name : "?", (unsigned long)ir->fallback_word, (unsigned long long)ir->fallback_pc,
+                 ir->fallbacks, ir->fallbacks == 1 ? "" : "s");
+        return -1;
+    }
+    return snx_ir_module_object(ir, ir->mod, opt, data, size, error, error_size);
+}
+
+int snx_ir_module_object(SnxIr* ir, LLVMModuleRef module, char opt, unsigned char** data, size_t* size, char* error,
+                         size_t error_size) {
     char pipeline[16], *message = NULL;
     LLVMPassBuilderOptionsRef options;
     LLVMErrorRef failure;
     LLVMMemoryBufferRef buffer;
     *data = NULL;
     *size = 0;
-    if (LLVMVerifyModule(ir->mod, LLVMReturnStatusAction, &message)) {
+    if (LLVMVerifyModule(module, LLVMReturnStatusAction, &message)) {
         snprintf(error, error_size, "invalid IR: %.900s", message ? message : "");
         LLVMDisposeMessage(message);
         return -1;
@@ -164,7 +323,7 @@ int snx_ir_object(SnxIr* ir, char opt, unsigned char** data, size_t* size, char*
     LLVMDisposeMessage(message);
     sprintf(pipeline, "default<O%c>", opt == 's' ? 's' : opt == 'z' ? 'z' : opt);
     options = LLVMCreatePassBuilderOptions();
-    failure = LLVMRunPasses(ir->mod, pipeline, ir->tm, options);
+    failure = LLVMRunPasses(module, pipeline, ir->tm, options);
     LLVMDisposePassBuilderOptions(options);
     if (failure) {
         message = LLVMGetErrorMessage(failure);
@@ -172,8 +331,21 @@ int snx_ir_object(SnxIr* ir, char opt, unsigned char** data, size_t* size, char*
         LLVMDisposeErrorMessage(message);
         return -1;
     }
+    if (ppc_target(ir)) {
+        ppc_tail_calls(ir);
+        /* the pointer's load the stub repeats is dead now */
+        options = LLVMCreatePassBuilderOptions();
+        failure = LLVMRunPasses(ir->mod, "function(adce)", ir->tm, options);
+        LLVMDisposePassBuilderOptions(options);
+        if (failure) {
+            message = LLVMGetErrorMessage(failure);
+            snprintf(error, error_size, "LLVM passes: %s", message);
+            LLVMDisposeErrorMessage(message);
+            return -1;
+        }
+    }
     message = NULL;
-    if (LLVMTargetMachineEmitToMemoryBuffer(ir->tm, ir->mod, LLVMObjectFile, &message, &buffer)) {
+    if (LLVMTargetMachineEmitToMemoryBuffer(ir->tm, module, LLVMObjectFile, &message, &buffer)) {
         snprintf(error, error_size, "LLVM code generation: %s", message ? message : "");
         LLVMDisposeMessage(message);
         return -1;
@@ -413,6 +585,7 @@ size_t ir_rt_brk(void) { return offsetof(RtAPI, brk); }
 size_t ir_rt_sev(void) { return offsetof(RtAPI, sev); }
 size_t ir_rt_wfe(void) { return offsetof(RtAPI, wfe); }
 size_t ir_rt_poll(void) { return offsetof(RtAPI, poll); }
+size_t ir_rt_miss(void) { return offsetof(RtAPI, miss); }
 size_t ir_off_poll(void) { return offsetof(CPU, poll); }
 
 LLVMValueRef ir_rt_call(SnxIr* ir, size_t offset, LLVMTypeRef ret, LLVMTypeRef* params, LLVMValueRef* args,
@@ -453,12 +626,19 @@ static void compiler_barrier(SnxIr* ir) {
     LLVMBuildCall2(ir->b, type, barrier, NULL, 0, "");
 }
 void ir_yield(SnxIr* ir) {
-    /* cpu.h: __builtin_ia32_pause() under __x86_64__, the compiler barrier alone elsewhere */
-    if (!strncmp(LLVMGetTarget(ir->mod), "x86_64", 6)) { /* PAUSE is baseline x86-64: no CPUID gate */
+    /* cpu.h: __builtin_ia32_pause() under __x86_64__, the low-priority hint under __powerpc64__, the compiler
+       barrier alone elsewhere */
+    const char* target = LLVMGetTarget(ir->mod);
+    if (!strncmp(target, "x86_64", 6)) { /* PAUSE is baseline x86-64: no CPUID gate */
         static const char pause[] = "llvm.x86.sse2.pause";
         unsigned id = LLVMLookupIntrinsicID(pause, strlen(pause));
         LLVMValueRef function = LLVMGetIntrinsicDeclaration(ir->mod, id, NULL, 0);
         LLVMBuildCall2(ir->b, LLVMIntrinsicGetType(ir->ctx, id, NULL, 0), function, NULL, 0, "");
+    } else if (!strncmp(target, "powerpc64", 9) || !strncmp(target, "ppc64", 5)) {
+        static const char yield[] = "or 27,27,27"; /* yield: lower this hardware thread's priority for a moment */
+        LLVMTypeRef type = LLVMFunctionType(ir->t_void, NULL, 0, 0);
+        LLVMValueRef hint = LLVMGetInlineAsm(type, yield, strlen(yield), "", 0, 1, 0, LLVMInlineAsmDialectATT, 0);
+        LLVMBuildCall2(ir->b, type, hint, NULL, 0, "");
     }
     compiler_barrier(ir);
 }
@@ -1026,7 +1206,7 @@ static void build_stxp(SnxIr* ir, LLVMValueRef function) {
 }
 /* snx_lookup(c,pc) */
 static void build_lookup(SnxIr* ir, LLVMValueRef function) {
-    LLVMValueRef pc = P(1), lo, hi, o, inside, f, index, entry;
+    LLVMValueRef pc = P(1), lo, hi, o, inside, f, index, slot;
     LLVMBasicBlockRef table = ir_block(ir, "table"), found = ir_block(ir, "found"), none = ir_block(ir, "none");
     ir->c = P(0);
     lo = ir_cpu_load(ir, ir->t_i64, offsetof(CPU, code_lo));
@@ -1037,18 +1217,20 @@ static void build_lookup(SnxIr* ir, LLVMValueRef function) {
     LLVMBuildCondBr(B, inside, table, none);
     LLVMPositionBuilderAtEnd(B, table);
     index = LLVMBuildLShr(B, o, ir_i64(ir, 2), "");
-    f = ir_load(ir, ir->t_ptr,
-                LLVMBuildGEP2(B, ir->t_ptr, ir_cpu_load(ir, ir->t_ptr, offsetof(CPU, disp)), &index, 1, ""));
+    /* __atomic_load_n(&c->disp[o>>2],__ATOMIC_RELAXED): the runtime JIT fills slots while this runs (cpu.h) */
+    slot = LLVMBuildGEP2(B, ir->t_ptr, ir_cpu_load(ir, ir->t_ptr, offsetof(CPU, disp)), &index, 1, "");
+    f = LLVMBuildLoad2(B, ir->t_ptr, slot, "");
+    LLVMSetOrdering(f, LLVMAtomicOrderingMonotonic);
+    LLVMSetAlignment(f, sizeof(void*));
     LLVMBuildCondBr(B, LLVMBuildIsNotNull(B, f, ""), found, none);
     LLVMPositionBuilderAtEnd(B, found);
     LLVMBuildRet(B, f);
     LLVMPositionBuilderAtEnd(B, none);
-    entry = LLVMGetNamedGlobal(ir->mod, "snx_interp_entry");
-    if (!entry) {
-        entry = LLVMAddGlobal(ir->mod, ir->t_ptr, "snx_interp_entry");
-        LLVMSetVisibility(entry, LLVMHiddenVisibility);
-    }
-    LLVMBuildRet(B, ir_load(ir, ir->t_ptr, entry));
+    /* c->rt->miss */
+    index = ir_i64(ir, ir_rt_miss());
+    LLVMBuildRet(
+        B, ir_load(ir, ir->t_ptr,
+                   LLVMBuildInBoundsGEP2(B, ir->t_i8, ir_cpu_load(ir, ir->t_ptr, offsetof(CPU, rt)), &index, 1, "")));
 }
 /* dc_zva(M,a): memset(MP(a & ~63), 0, 64) */
 static void build_dc_zva(SnxIr* ir, LLVMValueRef function) {

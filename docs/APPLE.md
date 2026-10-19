@@ -18,7 +18,7 @@ same shape as Android's `MainActivity` and `src/gui/android.c`:
 
 ### macOS
 
-`ScarletNX.app` is the desktop program in a bundle: `scarletnx` and `hactool` in `Contents/MacOS`, the themes and the
+`ScarletNX.app` is the desktop program in a bundle: `scarletnx` in `Contents/MacOS`, the themes and the
 licenses in `Contents/share`, where an installed copy looks for them. It works as on Linux. The menu extracts and
 recompiles through the driver as a child process, with SDL's own file and folder dialogs. Its data folder is
 `~/Library/Application Support/scarletnx`. *Share log* saves the log and selects it in a Finder window. The app is
@@ -38,7 +38,7 @@ menu's driver:
 - **The data folder** is the app's Documents, which the Files app (*On My iPhone > ScarletNX*) and the Finder show.
   Games go in its `games/`, each as `games/<game>/<game>_code.so` with its `_data/`, prepared on a computer.
 - **The menu** lists those games. *Load* and the folder settings open the system's document picker. Preparing a
-  dump says it needs a computer: extraction and recompilation run the driver and hactool as programs of their own.
+  dump says it needs a computer: extraction and recompilation run the driver as a program of its own.
 - **A game** runs in the app's process once the menu closes (`src/nx/runtime/entry.c`): the runtime starts once per
   process, so the app ends with the game.
 - **Share log** opens the share sheet with `scarletnx.log`.
@@ -47,15 +47,22 @@ The IPA is unsigned: AltStore, SideStore or a developer account signs it for the
 `dist/apple/ScarletNX.entitlements` (the larger address space and memory limit a game needs). It holds MoltenVK's
 framework.
 
+Code compiled while a game runs on macOS, 32-bit games' blocks and the runtime JIT's functions, goes through the
+runtime's own loader (`src/common/cpu/recompiler/llvm/code_loader.c`). LLVM writes it as ELF objects with Darwin's
+calling convention, and the loader places them in `MAP_JIT` memory, which each thread sees either writable or
+executable. The app is signed without the hardened runtime, so `MAP_JIT` needs no entitlement.
+
 ## What is missing
 
-- **16 KiB pages.** Apple silicon's pages are 16 KiB, and the runtime maps and protects guest memory in the Switch's
-  4 KiB pages (`plat_vm_reserve` stops with a message). This is what keeps every game from running on both systems.
+Apple silicon's 16 KiB pages no longer stop the runtime: it commits guest memory in whole host pages, as on
+PowerPC64 ([PowerPC64](./PPC64.md)), and views of memory are copies there, as Windows has them. What still keeps
+games from running:
+
 - **Game modules.** The recompiler links ELF and PE only (`src/common/cpu/recompiler/llvm/link.c`). macOS needs a
   Mach-O dylib, signed. iOS loads no code it did not ship with, so its games would have to be linked into the app
   (`snx_module_static`, `src/nx/runtime/main.c`) or loaded into JIT memory on a device that allows it.
-- **32-bit games on iOS.** Their blocks are compiled at run time with LLVM's MCJIT (`src/nx/runtime/arm.c`), which
-  needs memory that becomes executable. iOS gives that only to an app that may JIT.
+- **32-bit games on iOS.** Their blocks are compiled at run time (`src/nx/runtime/arm.c`,
+  `src/common/cpu/arm/exec.c`), which needs memory that becomes executable. iOS gives that only to an app that may JIT.
 - **Preparing on iOS**, for the reasons above, until the driver runs in the app's process.
 - **The 3DS and Linux drivers** are not built for iOS (`SNX_BUILD_3DS`, `SNX_BUILD_GNUABI`), nor the Linux one for
   macOS.

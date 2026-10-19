@@ -403,9 +403,11 @@ int shader_merge_dual(const u8* a, const u8* b, u8* out, u32 max_bytes) {
     if ((unsigned long long)start * 8 + (len_b - 80) > max_bytes) return 0;
     memset(out, 0, max_bytes);
     memcpy(out, b, 80);
-    memcpy(out + 80, a + 80, len_a - 80);
+    /* A's last bundle whole: its length ends at the instruction that ends it, and the bundle's later words, zeros
+       here, would read as an unknown instruction (each of a bundle's three is decoded) */
+    memcpy(out + 80, a + 80, (size_t)start * 8 - 80);
     memcpy(out + (size_t)start * 8, b + 80, len_b - 80);
-    for (i = 11; i < words_a; i++) {
+    for (i = 11; i < start; i++) {
         u64 w = code[i];
         const Op* op;
         if (!IDX_OK(i)) continue;

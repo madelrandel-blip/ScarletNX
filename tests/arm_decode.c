@@ -148,7 +148,6 @@ int main(void) {
         snx_arm_undefined(&cpu, 0xe7f000f0, SNX_ARM_UNDEFINED);
         if (cpu.exit != SNX_ARM_UNDEFINED || cpu.syndrome != 0xe7f000f0) return 1;
     }
-    if (snx_arm_gccjit_stub() != SNX_ARM_BACKEND_UNSUPPORTED) return 1;
     {
         static const uint32_t invalid[] = {0xee000910,  /* reserved coprocessor */
                                            0xec000b10,  /* reserved VFP transfer */

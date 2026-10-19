@@ -46,14 +46,14 @@ spec.loader.exec_module(notes)
 SERVER = notes.SERVER
 BRANCH = 'discord-cards'
 LABEL = 'publish builds'  # what lets a fork's pull request be published (scripts/publish-builds.py)
-# The job of .github/workflows/build.yml that makes each release file
+# The job of .github/workflows/build.yml that makes each release file (macOS's and iOS's share one runner)
 JOBS = {
     'ScarletNX-linux-x86_64.AppImage': 'Linux AppImage (x86_64)',
     'ScarletNX-linux-aarch64.AppImage': 'Linux AppImage (aarch64)',
     'ScarletNX-windows-x86_64.zip': 'Windows (Clang + LLVM)',
     'ScarletNX-android-universal.apk': 'Android APK',
-    'ScarletNX-macos-arm64.zip': 'macOS (arm64)',
-    'ScarletNX-ios-arm64.ipa': 'iOS (arm64)',
+    'ScarletNX-macos-arm64.zip': 'macOS and iOS (arm64)',
+    'ScarletNX-ios-arm64.ipa': 'macOS and iOS (arm64)',
 }
 # a nightly's colours: building, published, a package failed, not published
 BUILDING, SCARLET, AMBER, CLOSED = 0x1F6FEB, 0xB0102A, 0xD29922, 0x6E7681

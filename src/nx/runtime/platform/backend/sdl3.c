@@ -5,6 +5,7 @@
    options (seconds, frames, shot, shot_every, press_len, script: platform/unattended.c). */
 #include "nx/runtime/main.h"
 #include "nx/runtime/options.h"
+#include "nx/hle/hle.h" /* g_hle.hid: the players and the touch screen hid samples */
 #include "nx/hle/services/hid.h"
 #include "nx/hle/kernel/kernel.h"
 #include "nx/runtime/platform/backend.h"
@@ -141,14 +142,14 @@ void plat_audio_volume(PAudio* a, float volume) {
 
 /* the game's touch screen: 0 nothing, 1 the fingers, 2 the fingers and the mouse's left button (ini key touch) */
 static int g_touch_mode = 2;
-static u64 g_touch_ids[SNX_HID_TOUCHES]; /* the finger in each slot of g_touch */
+static u64 g_touch_ids[SNX_HID_TOUCHES]; /* the finger in each slot of g_hle.hid.touch */
 
 /* g_touch_mode changed: the fingers or the mouse it no longer takes are lifted */
 static void touch_mode_set(const IniOpt* o, const char* v) {
     (void)o;
     (void)v;
-    if (!g_touch_mode) g_touch.down = 0;
-    if (g_touch_mode != 2) touch_up(&g_touch, g_touch_ids, SNX_TOUCH_MOUSE);
+    if (!g_touch_mode) g_hle.hid.touch.down = 0;
+    if (g_touch_mode != 2) touch_up(&g_hle.hid.touch, g_touch_ids, SNX_TOUCH_MOUSE);
 }
 const IniOpt g_backend_ini[] = {
     {"touch", "2", "The game's touch screen: 1 = fingers, 2 = fingers and the mouse's left button, 0 = off", INI_INT, 0,
@@ -857,11 +858,11 @@ static void touch_finger(const SDL_Event* e) {
     if (taken || !g_touch_mode) return;
     touch_window(picture);
     if (e->type == SDL_EVENT_FINGER_DOWN)
-        touch_down(&g_touch, g_touch_ids, finger_id(&e->tfinger), picture, px, py);
+        touch_down(&g_hle.hid.touch, g_touch_ids, finger_id(&e->tfinger), picture, px, py);
     else if (e->type == SDL_EVENT_FINGER_MOTION)
-        touch_move(&g_touch, g_touch_ids, finger_id(&e->tfinger), picture, px, py);
+        touch_move(&g_hle.hid.touch, g_touch_ids, finger_id(&e->tfinger), picture, px, py);
     else
-        touch_up(&g_touch, g_touch_ids, finger_id(&e->tfinger));
+        touch_up(&g_hle.hid.touch, g_touch_ids, finger_id(&e->tfinger));
 }
 /* the mouse's left button as one more finger: on the on-screen controls when they are on, and on the touch screen
    when the touch option asks for it; positions come in window points */
@@ -876,7 +877,7 @@ static void touch_mouse(const SDL_Event* e) {
         ui_unlock();
         touch_window(picture);
         if (g_touch_mode == 2 && (e->motion.state & SDL_BUTTON_LMASK))
-            touch_move(&g_touch, g_touch_ids, SNX_TOUCH_MOUSE, picture, e->motion.x * d, e->motion.y * d);
+            touch_move(&g_hle.hid.touch, g_touch_ids, SNX_TOUCH_MOUSE, picture, e->motion.x * d, e->motion.y * d);
     } else if (e->button.which != SDL_TOUCH_MOUSEID && e->button.button == SDL_BUTTON_LEFT) {
         ui_lock();
         if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN)
@@ -887,9 +888,9 @@ static void touch_mouse(const SDL_Event* e) {
         if (taken || g_touch_mode != 2) return;
         touch_window(picture);
         if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN)
-            touch_down(&g_touch, g_touch_ids, SNX_TOUCH_MOUSE, picture, e->button.x * d, e->button.y * d);
+            touch_down(&g_hle.hid.touch, g_touch_ids, SNX_TOUCH_MOUSE, picture, e->button.x * d, e->button.y * d);
         else
-            touch_up(&g_touch, g_touch_ids, SNX_TOUCH_MOUSE);
+            touch_up(&g_hle.hid.touch, g_touch_ids, SNX_TOUCH_MOUSE);
     }
 }
 void video_poll(void) {
@@ -959,7 +960,7 @@ void video_poll(void) {
                 ui_unlock();
                 /* SDL leaves a held mouse button to the system's implicit grab, whose release may go to the window
                    that took the focus: the game's touch from the mouse lifts now (a later release finds it up) */
-                touch_up(&g_touch, g_touch_ids, SNX_TOUCH_MOUSE);
+                touch_up(&g_hle.hid.touch, g_touch_ids, SNX_TOUCH_MOUSE);
                 break;
             case SDL_EVENT_JOYSTICK_ADDED: gamepad_detect(e.jdevice.which); break;
             case SDL_EVENT_GAMEPAD_ADDED: gamepad_open(e.gdevice.which); break;
@@ -974,12 +975,12 @@ void video_poll(void) {
     u64 pb;
     input_key_sticks(k, st);
     i32 lx = st[0], ly = st[1], rx = st[2], ry = st[3];
-    pm_lock(&g_pad_input_lock);
+    pm_lock(&g_hle.hid.input_lock);
     /* Each SDL slot is one guest Npad. Keyboard, scripted and on-screen input also drive No1. */
     static u32 previous_ids[SNX_GAMEPADS];
     pad0[0] = pad0[1] = pad0[2] = pad0[3] = 0;
     for (int i = 0; i < SNX_GAMEPADS; i++) {
-        PadState* player = i ? &g_pad_extra[i - 1] : &g_pad;
+        PadState* player = i ? &g_hle.hid.pad_extra[i - 1] : &g_hle.hid.pad1;
         u64 one_buttons;
         i32 one_sticks[4];
         u32 id = gamepad_slot_id(i);
@@ -1047,32 +1048,33 @@ void video_poll(void) {
     input_stick_clamp(&rx, &ry);
     if (menu_had || overlay_shown() || vpad_editing()) { /* the game's menu, or the controls' edit mode, has them */
         g_menu_held = nonpad;
-        g_menu_held_pad0 = g_pad.buttons;
+        g_menu_held_pad0 = g_hle.hid.pad1.buttons;
         b = 0;
         lx = ly = rx = ry = 0;
-        g_touch.down = 0;
+        g_hle.hid.touch.down = 0;
         for (int i = 0; i < SNX_GAMEPADS - 1; i++) {
-            g_menu_held_extra[i] = g_pad_extra[i].buttons;
-            g_pad_extra[i].buttons = 0;
-            g_pad_extra[i].lx = g_pad_extra[i].ly = g_pad_extra[i].rx = g_pad_extra[i].ry = 0;
-            memset(g_pad_extra[i].motion, 0, sizeof g_pad_extra[i].motion);
+            g_menu_held_extra[i] = g_hle.hid.pad_extra[i].buttons;
+            g_hle.hid.pad_extra[i].buttons = 0;
+            g_hle.hid.pad_extra[i].lx = g_hle.hid.pad_extra[i].ly = 0;
+            g_hle.hid.pad_extra[i].rx = g_hle.hid.pad_extra[i].ry = 0;
+            memset(g_hle.hid.pad_extra[i].motion, 0, sizeof g_hle.hid.pad_extra[i].motion);
         }
-        memset(g_pad.motion, 0, sizeof g_pad.motion);
+        memset(g_hle.hid.pad1.motion, 0, sizeof g_hle.hid.pad1.motion);
     } else {
         g_menu_held &= nonpad;
-        g_menu_held_pad0 &= g_pad.buttons;
-        b = (nonpad & ~g_menu_held) | (g_pad.buttons & ~g_menu_held_pad0);
+        g_menu_held_pad0 &= g_hle.hid.pad1.buttons;
+        b = (nonpad & ~g_menu_held) | (g_hle.hid.pad1.buttons & ~g_menu_held_pad0);
         for (int i = 0; i < SNX_GAMEPADS - 1; i++) {
-            g_menu_held_extra[i] &= g_pad_extra[i].buttons;
-            g_pad_extra[i].buttons &= ~g_menu_held_extra[i];
+            g_menu_held_extra[i] &= g_hle.hid.pad_extra[i].buttons;
+            g_hle.hid.pad_extra[i].buttons &= ~g_menu_held_extra[i];
         }
     }
-    g_pad.buttons = b;
-    g_pad.lx = lx;
-    g_pad.ly = ly;
-    g_pad.rx = rx;
-    g_pad.ry = ry;
-    pm_unlock(&g_pad_input_lock);
+    g_hle.hid.pad1.buttons = b;
+    g_hle.hid.pad1.lx = lx;
+    g_hle.hid.pad1.ly = ly;
+    g_hle.hid.pad1.rx = rx;
+    g_hle.hid.pad1.ry = ry;
+    pm_unlock(&g_hle.hid.input_lock);
 }
 
 void frontend_frame(void) {

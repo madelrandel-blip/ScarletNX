@@ -95,11 +95,13 @@ interface nn::audio::detail::IAudioRenderer {
 
 interface nn::audio::detail::IAudioDevice {
     [0] ListAudioDeviceName(array<nn::audio::AudioDeviceName, 6> names) -> i32 count;
+    [1] SetAudioDeviceOutputVolume(buffer<nn::audio::AudioDeviceName, 5> name, f32 volume);
     [2] GetAudioDeviceOutputVolume(buffer<nn::audio::AudioDeviceName, 5> name) -> f32 volume;
     [3] GetActiveAudioDeviceName(buffer<nn::audio::AudioDeviceName, 6> name);
     [4] QueryAudioDeviceSystemEvent() -> handle<copy, event> event;
     [5] GetActiveChannelCount() -> u32 count;
     [6] ListAudioDeviceNameAuto(array<nn::audio::AudioDeviceName, 0x22> names) -> i32 count;
+    [7] SetAudioDeviceOutputVolumeAuto(buffer<nn::audio::AudioDeviceName, 0x21> name, f32 volume);
     [8] GetAudioDeviceOutputVolumeAuto(buffer<nn::audio::AudioDeviceName, 0x21> name) -> f32 volume;
     [10] GetActiveAudioDeviceNameAuto(buffer<nn::audio::AudioDeviceName, 0x22> name);
     [11] QueryAudioDeviceInputEvent() -> handle<copy, event> event;

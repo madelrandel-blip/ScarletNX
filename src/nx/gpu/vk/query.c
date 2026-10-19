@@ -86,7 +86,7 @@ static int pool_make(void) {
     g_qres = info.pMappedData;
     /* a query is reset before its first use, outside a rendering pass */
     vk_render_end();
-    vkCmdResetQueryPool(vk_cmd(), g_qpool, 0, QN);
+    rec_CmdResetQueryPool(vk_cmd(), g_qpool, 0, QN);
     if (!g_vk.feat.occlusionQueryPrecise)
         WARN("vulkan: the device's occlusion queries aren't precise: samples-passed counts may be any nonzero value\n");
     return 1;
@@ -145,13 +145,13 @@ void vk_query_draw(VkCommandBuffer cb, u32 chan, u32 msaa_mode) {
     u32 at = (u32)(g_q.next % QN);
     g_qown[at] = (u8)own;
     g_qmul[at] = (u8)mul;
-    vkCmdBeginQuery(cb, g_qpool, at, g_vk.feat.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    rec_CmdBeginQuery(cb, g_qpool, at, g_vk.feat.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     g_q.next++;
     g_q.open = 1;
 }
 void vk_query_pass_end(VkCommandBuffer cb) {
     if (!g_q.open) return;
-    vkCmdEndQuery(cb, g_qpool, (u32)((g_q.next - 1) % QN));
+    rec_CmdEndQuery(cb, g_qpool, (u32)((g_q.next - 1) % QN));
     g_q.open = 0;
 }
 void vk_query_flush(VkCommandBuffer cb) {
@@ -159,9 +159,9 @@ void vk_query_flush(VkCommandBuffer cb) {
     while (g_q.copied < g_q.next) { /* in runs that don't wrap around the ring */
         u32 at = (u32)(g_q.copied % QN), n = QN - at;
         if (n > g_q.next - g_q.copied) n = (u32)(g_q.next - g_q.copied);
-        vkCmdCopyQueryPoolResults(cb, g_qpool, at, n, g_qbuf, (VkDeviceSize)at * sizeof(u64), sizeof(u64),
+        rec_CmdCopyQueryPoolResults(cb, g_qpool, at, n, g_qbuf, (VkDeviceSize)at * sizeof(u64), sizeof(u64),
                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        vkCmdResetQueryPool(cb, g_qpool, at, n);
+        rec_CmdResetQueryPool(cb, g_qpool, at, n);
         g_q.copied += n;
     }
     /* for the host's reads, and for a later copy into a slot of a segment no report read */
@@ -171,7 +171,7 @@ void vk_query_flush(VkCommandBuffer cb) {
                            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
                            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-    vkCmdPipelineBarrier2(cb, &di);
+    rec_CmdPipelineBarrier2(cb, &di);
 }
 
 /* a segment open now of this counter ends: what comes after is another epoch's, or isn't counted */

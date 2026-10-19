@@ -305,7 +305,7 @@ tools/run_game.py <id> --runs 3 --dump work/<Game>
 - The runtime builds with Clang's default warnings, and only `missing-prototypes` and `missing-variable-declarations` fail the build (the tests build with `-Wall -Wextra -Werror`), so a clean-looking runtime build says little. Build a changed file once with more warnings on (its line from `build/compile_commands.json`, with `-Wall -Wextra -fsyntax-only`) and check none come from the change.
 - A fix for a crash or a race is run until the evidence is statistical: the crash rate before and after, with the run counts, goes in the commit message.
 - Memory-safety fixes also get an AddressSanitizer build and a run. The runtime links as C++ (VMA), so the flag goes on the C, C++ and link lines, and the build stays out of `games/`: `cmake --preset default -B build/asan -DSNX_DEPLOY=OFF -DCMAKE_C_FLAGS=-fsanitize=address -DCMAKE_CXX_FLAGS=-fsanitize=address -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address && cmake --build build/asan`, then from `games/<id>/`: `../../build/asan/scarletnx --game=<id> --seconds=60`.
-- The game module only needs recompiling (`build/scarletnx -r work/<Game>`) when `src/common/cpu/recompiler/` (codegen and both backends), `src/common/cpu/aarch64/` (templates and the ABI), `src/nx/loader/`, or the module's flags in `src/nx/runtime/driver/toolchain.c` changed.
+- The game module only needs recompiling (`build/scarletnx -r work/<Game>`) when `src/common/cpu/recompiler/` (codegen and the LLVM backend), `src/common/cpu/aarch64/` (templates and the ABI), `src/nx/loader/`, or the module's flags in `src/nx/runtime/driver/toolchain.c` changed.
 
 ### 7. Diff Review Before Commit
 

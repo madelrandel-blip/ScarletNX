@@ -8,6 +8,7 @@
    or fonts/<Name>.ttf, and otherwise from the stand-ins compiled in (cmake/shared_fonts.cmake), the standard one
    placed once for the five slots that share it */
 #include "nx/hle/services/services_int.h"
+#include "nx/hle/hle.h"
 #include "nx/hle/filesystem/fs.h"
 
 #include "hle/services/pl.swipc.inc"
@@ -16,7 +17,6 @@ extern const unsigned char snx_font_standard[], snx_font_extended[];
 extern const size_t snx_font_standard_size, snx_font_extended_size;
 
 #define PL_SHM_SIZE   0x1100000u
-#define PL_FONTS      6
 #define PL_MAGIC      0x36f81a1eu /* the first word of a .bfttf, big-endian */
 #define PL_DECRYPTED  0x7f9a0218u /* what it decrypts to: its key is the two XORed */
 #define PL_LOADED     1           /* nn::pl::LoadState */
@@ -26,10 +26,6 @@ static const char* const pl_names[PL_FONTS] = {"FontStandard",        "FontChine
                                                "FontExtendedChineseSimplified", "FontChineseTraditional",
                                                "FontKorean",          "FontNintendoExtended"};
 
-static struct {
-    KShmem* shm;
-    u32 font_off[PL_FONTS], font_size[PL_FONTS]; /* where each font starts (past its header), and its size */
-} pl;
 
 static u32 bswap32_(u32 v) { return v >> 24 | (v >> 8 & 0xff00u) | (v << 8 & 0xff0000u) | v << 24; }
 /* big-endian words, on the little-endian hosts the runtime runs on */
@@ -84,12 +80,12 @@ static int pl_place(u8* shm, u32 shm_size, u32* at, const u8* font, u64 size, in
     u32 padded, key = PL_MAGIC ^ PL_DECRYPTED;
     if (size > shm_size || (size + 3) / 4 * 4 + 8 > shm_size - *at) return 0;
     padded = (u32)((size + 3) & ~3ull);
-    wr_be32(shm + *at, PL_MAGIC);
+    wr_be32(shm + *at, PL_MAGIC ^ key);
     wr_be32(shm + *at + 4, padded ^ key);
     memcpy(shm + *at + 8, font, (size_t)size);
     memset(shm + *at + 8 + size, 0, padded - (u32)size);
-    pl.font_off[slot] = *at + 8;
-    pl.font_size[slot] = (u32)size;
+    g_hle.pl.font_off[slot] = *at + 8;
+    g_hle.pl.font_size[slot] = (u32)size;
     *at += 8 + padded;
     return 1;
 }
@@ -98,8 +94,8 @@ static int pl_place(u8* shm, u32 shm_size, u32* at, const u8* font, u64 size, in
 static void fonts_fill(u8* shm, u32 shm_size) {
     u32 at = 0;
     int i, standard = -1; /* the slot the standard stand-in went into first */
-    memset(pl.font_off, 0, sizeof pl.font_off);
-    memset(pl.font_size, 0, sizeof pl.font_size);
+    memset(g_hle.pl.font_off, 0, sizeof g_hle.pl.font_off);
+    memset(g_hle.pl.font_size, 0, sizeof g_hle.pl.font_size);
     for (i = 0; i < PL_FONTS; i++) {
         u64 size = 0;
         u8* own = pl_game_font(i, &size);
@@ -109,23 +105,23 @@ static void fonts_fill(u8* shm, u32 shm_size) {
             else
                 WARN("pl: fonts/%s doesn't fit in the shared memory, the stand-in takes its place\n", pl_names[i]);
             free(own);
-            if (pl.font_size[i]) continue;
+            if (g_hle.pl.font_size[i]) continue;
         }
         if (i == PL_FONTS - 1)
             pl_place(shm, shm_size, &at, snx_font_extended, snx_font_extended_size, i);
         else if (standard >= 0) {
-            pl.font_off[i] = pl.font_off[standard];
-            pl.font_size[i] = pl.font_size[standard];
+            g_hle.pl.font_off[i] = g_hle.pl.font_off[standard];
+            g_hle.pl.font_size[i] = g_hle.pl.font_size[standard];
         } else if (pl_place(shm, shm_size, &at, snx_font_standard, snx_font_standard_size, i))
             standard = i;
     }
 }
 
-static SvcObj* pl_new(void) { return nn_pl_detail_IPlatformServiceManager_new(0); }
+static SvcObj* pl_new(void) { return nn_pl_detail_IPlatformServiceManager_new(); }
 void svc_pl_init(void) {
-    pl.shm = kshmem_new(PL_SHM_SIZE, "shared fonts");
-    kobj_ref(&pl.shm->o); /* the service's, for as long as the process runs */
-    fonts_fill(kshmem_ptr(pl.shm), PL_SHM_SIZE);
+    g_hle.pl.shm = kshmem_new(PL_SHM_SIZE, "shared fonts");
+    kobj_ref(&g_hle.pl.shm->o); /* the service's, for as long as the process runs */
+    fonts_fill(kshmem_ptr(g_hle.pl.shm), PL_SHM_SIZE);
     nn_pl_detail_IPlatformServiceManager_register(pl_new);
 }
 
@@ -142,18 +138,18 @@ static int nn_pl_detail_IPlatformServiceManager_GetLoadState(SvcObj* self, u32 f
 }
 static int nn_pl_detail_IPlatformServiceManager_GetSize(SvcObj* self, u32 font_type, u32* size) {
     (void)self;
-    *size = font_type < PL_FONTS ? pl.font_size[font_type] : 0;
+    *size = font_type < PL_FONTS ? g_hle.pl.font_size[font_type] : 0;
     R_SUCCEED();
 }
 static int nn_pl_detail_IPlatformServiceManager_GetSharedMemoryAddressOffset(SvcObj* self, u32 font_type,
                                                                               u32* offset) {
     (void)self;
-    *offset = font_type < PL_FONTS ? pl.font_off[font_type] : 0;
+    *offset = font_type < PL_FONTS ? g_hle.pl.font_off[font_type] : 0;
     R_SUCCEED();
 }
 static int nn_pl_detail_IPlatformServiceManager_GetSharedMemoryNativeHandle(SvcObj* self, u32* shared_memory) {
     (void)self;
-    *shared_memory = h_new(&pl.shm->o);
+    *shared_memory = h_new(&g_hle.pl.shm->o);
     R_SUCCEED();
 }
 /* every font, in the order of their types whatever the language, as Eden does: up to 6, or as many as the buffers
@@ -166,8 +162,8 @@ static int pl_in_order(IpcBuf codes, IpcBuf offsets, IpcBuf sizes, u8* loaded, u
     for (i = 0; i < n; i++) {
         u32 code = (u32)i;
         memcpy(GP(codes.addr + 4 * i), &code, 4);
-        memcpy(GP(offsets.addr + 4 * i), &pl.font_off[i], 4);
-        memcpy(GP(sizes.addr + 4 * i), &pl.font_size[i], 4);
+        memcpy(GP(offsets.addr + 4 * i), &g_hle.pl.font_off[i], 4);
+        memcpy(GP(sizes.addr + 4 * i), &g_hle.pl.font_size[i], 4);
     }
     *loaded = 1;
     *count = (u32)n;

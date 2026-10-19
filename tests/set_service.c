@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "nx/hle/services/set.c"
+#include "nx/hle/hle.c"
 
 u8* g_mem;
 int g_verbose;
@@ -34,8 +35,8 @@ void fatal(const char* format, ...) {
     va_end(args);
     exit(1);
 }
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t size) {
-    (void)name, (void)dispatch, (void)size;
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
+    (void)name, (void)dispatch;
     return NULL;
 }
 void ipc_out_overflow(IpcCtx* c) {
@@ -55,7 +56,14 @@ int stub_ok(SvcObj* o, IpcCtx* c) {
     return 0;
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+void pm_init(PMutex* m) { (void)m; }
+
 int main(void) {
+    hle_init();
     static u8 memory[0x1000];
     IpcBuf buf;
     nn_settings_LanguageCode code;
@@ -111,6 +119,41 @@ int main(void) {
     memset(memory, 0xAA, sizeof memory);
     buf.size = 0;
     CHECK(nn_settings_ISettingsServer_GetDeviceNickName(NULL, buf) == 0 && memory[0x600] == 0xAA);
+
+    /* set:sys's settings read back as set, from a factory console's: white, full vibration, the battery's
+       percentage shown, the language's keyboard layout (English (US) for en-US); set's quest flag is set:sys's */
+    {
+        i32 color = -1;
+        float volume = -1.0f;
+        u8 flag = 0xEE;
+        u32 layout = 0xEE;
+        CHECK(nn_settings_ISystemSettingsServer_GetColorSetId(NULL, &color) == 0 && color == 0);
+        CHECK(nn_settings_ISystemSettingsServer_SetColorSetId(NULL, 1) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetColorSetId(NULL, &color) == 0 && color == 1);
+        CHECK(nn_settings_ISystemSettingsServer_GetVibrationMasterVolume(NULL, &volume) == 0 && volume == 1.0f);
+        CHECK(nn_settings_ISystemSettingsServer_SetVibrationMasterVolume(NULL, 0.25f) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetVibrationMasterVolume(NULL, &volume) == 0 && volume == 0.25f);
+        CHECK(nn_settings_ISystemSettingsServer_GetKeyboardLayout(NULL, &layout) == 0 && layout == 1);
+        g_opt_lang = 2; /* French: its layout until one is set */
+        CHECK(nn_settings_ISystemSettingsServer_GetKeyboardLayout(NULL, &layout) == 0 && layout == 4);
+        CHECK(nn_settings_ISystemSettingsServer_SetKeyboardLayout(NULL, 3) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetKeyboardLayout(NULL, &layout) == 0 && layout == 3);
+        g_opt_lang = 1;
+        CHECK(nn_settings_ISystemSettingsServer_GetKeyboardLayout(NULL, &layout) == 0 && layout == 3);
+        CHECK(nn_settings_ISystemSettingsServer_GetBatteryPercentageFlag(NULL, &flag) == 0 && flag == 1);
+        CHECK(nn_settings_ISystemSettingsServer_SetBatteryPercentageFlag(NULL, 0) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetBatteryPercentageFlag(NULL, &flag) == 0 && flag == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetLockScreenFlag(NULL, &flag) == 0 && flag == 0);
+        CHECK(nn_settings_ISystemSettingsServer_SetLockScreenFlag(NULL, 1) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetLockScreenFlag(NULL, &flag) == 0 && flag == 1);
+        CHECK(nn_settings_ISystemSettingsServer_GetSpeakerAutoMuteFlag(NULL, &flag) == 0 && flag == 0);
+        CHECK(nn_settings_ISystemSettingsServer_SetSpeakerAutoMuteFlag(NULL, 2) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetSpeakerAutoMuteFlag(NULL, &flag) == 0 && flag == 1);
+        CHECK(nn_settings_ISystemSettingsServer_GetQuestFlag(NULL, &flag) == 0 && flag == 0);
+        CHECK(nn_settings_ISystemSettingsServer_SetQuestFlag(NULL, 1) == 0);
+        CHECK(nn_settings_ISystemSettingsServer_GetQuestFlag(NULL, &flag) == 0 && flag == 1);
+        CHECK(nn_settings_ISettingsServer_GetQuestFlag(NULL, &flag) == 0 && flag == 1);
+    }
 
     /* a setting there is none of: size 0, its value buffer zeroed */
     {

@@ -2,9 +2,11 @@
    Copyright 2026 the ScarletNX contributors */
 /* The core model of thread.c against the console's scheduler: a ready thread that would wait behind its core's holder
    runs on an idle core its mask allows, a core that falls idle takes a thread waiting for another one, a thread of
-   better priority stays and flags the holder, and only svcSleepThread(0) keeps a yielding thread on its core. The
-   threads here are bare KThreads; each one that has to wait for a core waits on a host thread of its own */
+   better priority stays and flags the holder, and only svcSleepThread(0) keeps a yielding thread on its core. A thread
+   runs on its core's share of the host CPUs, apart from the other cores' threads, as on the console. The threads here
+   are bare KThreads; each one that has to wait for a core waits on a host thread of its own */
 #include "nx/hle/kernel/thread.c"
+#include "nx/hle/hle.c"
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
@@ -13,12 +15,9 @@ u8* g_mem;
 MemLayout g_layout = {0x08000000ull,   0x2000000000ull, 0x100000000ull, 0x200000000ull,  0x300000000ull,
                       0x1000000000ull, 0x1300000000ull, 0x100000000ull, 0x1400000000ull, 0x1800000000ull};
 GuestFn* g_disp;
-u64 g_code_lo, g_code_hi, g_core_mask = 7, g_prio_mask, g_code_memory, g_main_stack_size, g_next_tid;
-u64 g_sysres_size;
+u64 g_code_lo, g_code_hi, g_code_memory, g_main_stack_size;
 int g_verbose;
-PMutex g_klock = PMUTEX_INIT;
 const RtAPI g_rtapi;
-GuestFn snx_interp_entry;
 const SnxArmModule* g_arm_mod; /* a 64-bit game */
 const SnxArmRt g_arm_rt;
 void arm_thread_run(KThread* t) { (void)t; }
@@ -100,6 +99,29 @@ static unsigned checks, failures;
     } while (0)
 
 enum { SNX_KCT_THREADS = 4 };
+/* the host: 12 CPUs, as the machine Link's Awakening stopped on. core_pin's last move, the last one of each test
+   thread (snx_kct_who, which the host threads below set; the test's own host thread's is slot SNX_KCT_THREADS), and
+   how many there were */
+static int snx_kct_host[256] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, snx_kct_nhost = 12;
+static char snx_kct_moved[256], snx_kct_moved_by[SNX_KCT_THREADS + 1][256];
+static int snx_kct_moves;
+static __thread int snx_kct_who = SNX_KCT_THREADS;
+static pthread_mutex_t snx_kct_lk = PTHREAD_MUTEX_INITIALIZER;
+int plat_cpus(int* ids, int max) {
+    int n = snx_kct_nhost < max ? snx_kct_nhost : max;
+    memcpy(ids, snx_kct_host, sizeof *ids * (size_t)n);
+    return n;
+}
+void plat_thread_cpus(const int* ids, int n) {
+    int len = 0;
+    pthread_mutex_lock(&snx_kct_lk);
+    snx_kct_moved[0] = 0;
+    for (int i = 0; i < n; i++)
+        len += snprintf(snx_kct_moved + len, sizeof snx_kct_moved - len, i ? " %d" : "%d", ids[i]);
+    strcpy(snx_kct_moved_by[snx_kct_who], snx_kct_moved);
+    snx_kct_moves++;
+    pthread_mutex_unlock(&snx_kct_lk);
+}
 static KThread snx_kct_thread[SNX_KCT_THREADS];
 /* thread i at this priority, on this core, with this core mask; nobody holds or waits for a core */
 static KThread* thread(int i, int prio, int core, u64 mask) {
@@ -112,19 +134,20 @@ static KThread* thread(int i, int prio, int core, u64 mask) {
     t->core = core;
     t->affinity = mask;
     t->on_core = -1;
+    t->pinned = -1;
     return t;
 }
 static void reset(void) {
     for (int k = 0; k < NCORES; k++) {
-        g_core_owner[k] = NULL;
-        g_core_wait[k] = NULL;
-        g_core_best[k] = 64;
+        g_hle.thread.core_owner[k] = NULL;
+        g_hle.thread.core_wait[k] = NULL;
+        g_hle.thread.core_best[k] = 64;
     }
 }
 static int on_core(KThread* t) {
-    pm_lock(&g_core_lk);
+    pm_lock(&g_hle.thread.core_lk);
     int k = t->on_core;
-    pm_unlock(&g_core_lk);
+    pm_unlock(&g_hle.thread.core_lk);
     return k;
 }
 /* until t holds a core, or waits for one (-2), for up to 2 s; the core it ends on */
@@ -133,7 +156,29 @@ static int settle(KThread* t, int want) {
     for (int i = 0; i < 2000 && on_core(t) != want; i++) nanosleep(&pause, NULL);
     return on_core(t);
 }
+/* the last move (by >= 0: the last one of test thread by) went to the CPUs in want, such as "1 4 7 10", and there
+   were moves moves so far */
+static int moved(int by, const char* want, int moves) {
+    const char* got = by < 0 ? snx_kct_moved : snx_kct_moved_by[by];
+    int ok;
+    pthread_mutex_lock(&snx_kct_lk);
+    ok = !strcmp(got, want) && snx_kct_moves == moves;
+    if (!ok) fprintf(stderr, "  moved to \"%s\" (%d moves), not \"%s\" (%d)\n", got, snx_kct_moves, want, moves);
+    pthread_mutex_unlock(&snx_kct_lk);
+    return ok;
+}
+static int moved_to(const char* want, int moves) { return moved(-1, want, moves); }
+/* a host with these CPUs, nothing moved yet */
+static void host(const int* ids, int n) {
+    memcpy(snx_kct_host, ids, sizeof *ids * (size_t)n);
+    snx_kct_nhost = n;
+    g_hle.thread.host_ncpu = plat_cpus(g_hle.thread.host_cpu, 256);
+    memset(snx_kct_moved_by, 0, sizeof snx_kct_moved_by);
+    snx_kct_moved[0] = 0;
+    snx_kct_moves = 0;
+}
 static void* enter_body(void* p) {
+    snx_kct_who = (int)((KThread*)p - snx_kct_thread);
     core_enter((KThread*)p);
     return NULL;
 }
@@ -143,11 +188,26 @@ typedef struct {
 } SnxKctYield;
 static void* yield_body(void* p) {
     SnxKctYield* y = (SnxKctYield*)p;
+    snx_kct_who = (int)(y->t - snx_kct_thread);
     core_yield(y->t, y->migrate);
     return NULL;
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+void kobj_ref(KObj* o) {
+    if (o) o->refs++;
+}
+void kobj_unref(KObj* o) {
+    if (o && --o->refs == 0 && o->destroy) o->destroy(o);
+}
+
 int main(void) {
+    hle_init();
+    g_hle.svcmem.core_mask = 7; /* cores 0 to 2, as an application's npdm gives */
+    static const int twelve[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
     pthread_t h, h2;
     kernel_init();
 
@@ -195,10 +255,10 @@ int main(void) {
     CHECK(settle(b, -2) == -2 && b->core == 0, "cores 0 and 1 busy: on core %d", b->on_core);
     core_leave(c);
     CHECK(settle(b, 1) == 1 && b->core == 1, "core 1 fell idle: 46 on core %d", on_core(b));
-    pm_lock(&g_core_lk);
-    CHECK(!g_core_wait[0] && g_core_best[0] == 64 && !a->cpu.poll, "core 0 still has a waiter, best %d",
-          g_core_best[0]);
-    pm_unlock(&g_core_lk);
+    pm_lock(&g_hle.thread.core_lk);
+    CHECK(!g_hle.thread.core_wait[0] && g_hle.thread.core_best[0] == 64 && !a->cpu.poll, "core 0 still has a waiter, best %d",
+          g_hle.thread.core_best[0]);
+    pm_unlock(&g_hle.thread.core_lk);
     core_leave(a);
     pthread_join(h, NULL);
     core_leave(b);
@@ -211,7 +271,7 @@ int main(void) {
     pthread_create(&h, NULL, enter_body, b);
     CHECK(settle(b, -2) == -2, "45 behind 46: on core %d", b->on_core);
     core_leave(c);
-    CHECK(on_core(b) == -2 && !g_core_owner[1], "45 left its core for core %d", on_core(b));
+    CHECK(on_core(b) == -2 && !g_hle.thread.core_owner[1], "45 left its core for core %d", on_core(b));
     core_leave(a);
     pthread_join(h, NULL);
     CHECK(b->on_core == 0, "45 got core %d", b->on_core);
@@ -233,7 +293,8 @@ int main(void) {
     CHECK(a->on_core == 0, "yield 0: back on core %d", a->on_core);
     core_leave(a);
 
-    /* svcSleepThread(-1) hands it over and runs on an idle core */
+    /* svcSleepThread(-1) hands it over and runs on an idle core, on that core's host CPUs */
+    host(twelve, 12);
     reset();
     a = thread(0, 44, 0, 7), w = thread(3, 50, 0, 1);
     core_enter(a);
@@ -243,26 +304,105 @@ int main(void) {
     pthread_create(&h2, NULL, yield_body, &y);
     CHECK(settle(a, 1) == 1 && a->core == 1 && settle(w, 0) == 0, "yield -1: 50 on %d, 44 on %d", on_core(w),
           on_core(a));
-    pthread_join(h, NULL);
-    core_leave(w);
     pthread_join(h2, NULL);
+    pthread_join(h, NULL); /* 50's own move, into core 0's CPUs, is the third: done once its enter returns */
+    CHECK(moved(0, "1 4 7 10", 3), "yield -1: 44 on core 1's CPUs");
+    core_leave(w);
     core_leave(a);
 
-    /* the thread table: 256 slots, an exited thread's slot taken once they are all used, and with 256 live threads
-       a new one left out (not fatal); the live count leaves exited threads out */
+    /* each core the game may use runs its threads on every third host CPU, its own */
+    host(twelve, 12);
+    reset();
+    a = thread(0, 44, 0, 1), b = thread(1, 44, 1, 2), c = thread(2, 44, 2, 4);
+    core_enter(a);
+    CHECK(moved_to("0 3 6 9", 1), "core 0's thread");
+    core_enter(b);
+    CHECK(moved_to("1 4 7 10", 2), "core 1's thread");
+    core_enter(c);
+    CHECK(moved_to("2 5 8 11", 3), "core 2's thread");
+    /* taking the same core again moves nothing */
+    core_leave(a);
+    core_enter(a);
+    CHECK(moved_to("2 5 8 11", 3), "core 0's thread again");
+    core_leave(a);
+    core_leave(b);
+    core_leave(c);
+
+    /* a thread that ran on core 0 and that an idle core takes later moves to that core's CPUs */
+    host(twelve, 12);
+    reset();
+    a = thread(0, 44, 0, 1), b = thread(1, 45, 0, 7);
+    core_enter(b);
+    core_leave(b);
+    core_enter(a);
+    pthread_create(&h, NULL, enter_body, b);
+    CHECK(settle(b, 1) == 1, "behind 44 on core 0: on core %d", on_core(b));
+    pthread_join(h, NULL);
+    CHECK(moved_to("1 4 7 10", 3), "the thread core 1 took");
+    core_leave(a);
+    core_leave(b);
+
+    /* and so does a holder that lets a better thread have its core and goes on on an idle one */
+    host(twelve, 12);
+    reset();
+    a = thread(0, 45, 0, 3), w = thread(3, 43, 0, 1);
+    core_enter(a);
+    pthread_create(&h, NULL, enter_body, w);
+    CHECK(settle(w, -2) == -2, "43 waits for core 0: on core %d", w->on_core);
+    core_preempt(a);
+    pthread_join(h, NULL);
+    CHECK(a->on_core == 1 && moved(SNX_KCT_THREADS, "1 4 7 10", 3), "the preempted 45 on core %d", a->on_core);
+    core_leave(a);
+    core_leave(w);
+
+    /* the shares follow the game's cores (1 and 2 here) and the CPUs the process was given (taskset 2-9) */
+    static const int eight[] = {2, 3, 4, 5, 6, 7, 8, 9};
+    host(eight, 8);
+    g_hle.svcmem.core_mask = 6;
+    reset();
+    a = thread(0, 44, 1, 2), b = thread(1, 44, 2, 4);
+    core_enter(a);
+    CHECK(moved_to("2 4 6 8", 1), "core 1 of cores 1 and 2");
+    core_enter(b);
+    CHECK(moved_to("3 5 7 9", 2), "core 2 of cores 1 and 2");
+    core_leave(a);
+    core_leave(b);
+    g_hle.svcmem.core_mask = 7;
+    host(eight, 8);
+    reset();
+    a = thread(0, 44, 2, 4);
+    core_enter(a);
+    CHECK(moved_to("4 7", 1), "core 2 of cores 0 to 2");
+    core_leave(a);
+
+    /* fewer host CPUs than cores: nothing to share out, nothing moves */
+    host(twelve, 2);
+    reset();
+    a = thread(0, 44, 0, 1), b = thread(1, 44, 2, 4);
+    core_enter(a);
+    core_enter(b);
+    CHECK(moved_to("", 0), "2 host CPUs for 3 cores");
+    core_leave(a);
+    core_leave(b);
+
+    /* the thread pool: KTHREAD_MAX (256) slots, filled by as many threads; an exited thread keeps its slot (the live
+       count leaves it out) until its last reference goes, and then a new thread takes that slot. A full pool is a bound
+       below what a game uses, asserted, so no thread is left out */
     {
-        KThread* first[256];
+        KThread* first[KTHREAD_MAX];
         KThread* t;
-        for (int i = 0; i < 256; i++) first[i] = kthread_create(0x1000, 0, 0x2000, 44, 0);
-        CHECK(g_nthreads == 256 && kthread_live_count() == 256, "%d threads, %d live", g_nthreads, kthread_live_count());
+        int taken = 0;
+        for (int i = 0; i < KTHREAD_MAX; i++) first[i] = kthread_create(0x1000, 0, 0x2000, 44, 0);
+        for (int i = 0; i < KTHREAD_MAX; i++) taken += g_hle.thread.threads[i].o.type == KO_THREAD;
+        CHECK(taken == KTHREAD_MAX && kthread_live_count() == KTHREAD_MAX, "%d threads, %d live", taken,
+              kthread_live_count());
         first[7]->state = 2;
-        CHECK(kthread_live_count() == 255, "one exited: %d live", kthread_live_count());
+        CHECK(kthread_live_count() == KTHREAD_MAX - 1, "one exited: %d live", kthread_live_count());
+        thread_destroy(&first[7]->o); /* its last reference */
+        CHECK(first[7]->o.type == 0 && kthread_live_count() == KTHREAD_MAX - 1, "the exited thread's slot is free");
         t = kthread_create(0x1000, 0, 0x2000, 44, 0);
-        CHECK(g_nthreads == 256 && g_threads[7] == t && kthread_live_count() == 256, "slot 7 holds the new thread");
-        t = kthread_create(0x1000, 0, 0x2000, 44, 0);
-        CHECK(g_nthreads == 256 && t && t->id == first[255]->id + 2, "left out of a full table, thread %llu",
-              (unsigned long long)t->id);
-        for (int i = 0; i < 256; i++) CHECK(g_threads[i] != t, "the thread left out is in slot %d", i);
+        CHECK(t == first[7] && t->id == first[KTHREAD_MAX - 1]->id + 1 && kthread_live_count() == KTHREAD_MAX,
+              "the freed slot holds the new thread, %llu", (unsigned long long)t->id);
     }
 
     printf("%u checks, %u failed\n", checks, failures);

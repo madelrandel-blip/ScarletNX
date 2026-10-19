@@ -11,6 +11,7 @@
 *.nro
 *.nso
 *.npdm
+*.zip
 *.keys
 *.tik
 *.cert
@@ -36,6 +37,8 @@ vkshader_*.glsl
 
 # Build output, and the AppImage scripts/make-appimage.sh makes
 /build*/
+# what ctest writes when it runs in the checkout
+/Testing/
 __pycache__/
 *.o
 *.so

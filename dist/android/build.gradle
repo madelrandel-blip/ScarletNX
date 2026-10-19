@@ -8,6 +8,10 @@ plugins {
 
 def stage = file(providers.gradleProperty('scarletnx.stage').get())
 layout.buildDirectory = new File(stage, 'gradle')
+// One key signs every APK given it, so each installs over the one before: scarletnx.keystore names its keystore,
+// SNX_ANDROID_KEYSTORE_PASSWORD is the keystore's password and the key's, SNX_ANDROID_KEY_ALIAS the key (scarletnx).
+// Without it the machine's own debug key signs, a new one on every machine that had none (docs/ANDROID.md)
+def keystore = providers.gradleProperty('scarletnx.keystore').orNull
 
 android {
     namespace = 'org.scarletnx'
@@ -18,6 +22,14 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = '0.1'
+    }
+    if (keystore) {
+        signingConfigs.debug {
+            storeFile = file(keystore)
+            storePassword = providers.environmentVariable('SNX_ANDROID_KEYSTORE_PASSWORD').get()
+            keyAlias = providers.environmentVariable('SNX_ANDROID_KEY_ALIAS').orElse('scarletnx').get()
+            keyPassword = storePassword
+        }
     }
     sourceSets.main {
         java.srcDir new File(stage, 'java')

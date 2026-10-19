@@ -8,7 +8,7 @@ The NX runtime runs 32-bit programs with it. The recompiler compiles a 32-bit pr
 
 - `arm.h`: separate, versioned `SnxArmCPU` state and exit reasons, the backend's `SnxArmRt`, plus the Thumb decode model.
 - `rt_helpers.c`: the runtime library's calls into the backend (`snx_arm_undefined`, `snx_arm_coproc`), with the defaults for no backend.
-- `a32.c`: validated A32 decoder and explicit libgccjit unsupported stub. No LLVM dependency.
+- `a32.c`: validated A32 decoder. No LLVM dependency.
 - `thumb_decode.c`: validated Thumb16/Thumb32 decoder to an explicit operand model.
 - `llvm.h`, `llvm.c`, `llvm_vector.inc`, `llvm_thumb.inc`: `snx_arm_llvm_block(module, name, words, count, pc, &consumed)` and `snx_thumb_llvm_block(module, name, halfwords, count, pc, &consumed)` emit `void name(SnxArmCPU*)` into a **host-target** LLVM module.
 - `tests/arm_emit.c`, `tests/thumb_emit.c`: object generators demonstrating module creation, verification, optimization and native object emission.
@@ -37,7 +37,7 @@ Generated code doesn't decide two things itself. It calls the runtime library, w
 - An instruction the block compiler doesn't implement, or can't with the block's memory model, calls `snx_arm_undefined(cpu, word, reason)`. The backend runs it and returns with `exit` clear, and the block goes on after it, or it sets `exit` and the block stops at it. Without a backend, `exit` is `reason` (`SNX_ARM_UNDEFINED`, `SNX_ARM_BACKEND_UNSUPPORTED`) and `syndrome` the word, as before.
 - MRC, MCR, MRRC and MCRR to coprocessors 14 and 15 call `snx_arm_coproc(cpu, word)`: which system registers user mode reaches, and what they hold, is the system's. The NX runtime gives the generic timer's CNTPCT, CNTVCT and CNTFRQ (the SDK's system tick) and the CP15 barriers. Without a backend, `snx_arm_coproc_user` gives TPIDRURW and TPIDRURO from the CPU's fields, and anything else is `SNX_ARM_UNDEFINED`.
 
-Programs linking blocks link `snx_arm_rt`; LLVM's JIT finds its functions through `snx_arm_exec_symbols` (`exec.h`).
+Programs linking blocks link `snx_arm_rt`. The executor (`exec.h`, built into `snx_llvm`) compiles each block to an object and loads it with the runtime JIT's loader (`recompiler/llvm/code_loader.c`), which it gives those functions by name.
 
 ## Thumb32 instructions with A32 twins
 
@@ -185,8 +185,7 @@ Thumb16 and Thumb32 are supported (see `thumb_decode.c`, `llvm_thumb.inc`): inte
 ## Limits and memory model
 
 - ARMv8.1+ extensions that Cortex-A57 lacks (FP16
-  arithmetic, dot-product, RDM) and privileged VFP state are not implemented. libgccjit is an explicit stub for
-  both A32 and Thumb. Unsupported and rejected
+  arithmetic, dot-product, RDM) and privileged VFP state are not implemented. Unsupported and rejected
   unpredictable encodings trap rather than using an A64 fallback.
 - Little-endian Normal guest memory only. CPSR.E is rejected. Host-endian conversion is separate from the guest byte order.
 - Effective addresses wrap at 32 bits before host pointer construction. Transfers outside the supplied flat mapping, or crossing its end, abort. Unaligned ordinary scalar accesses are supported. Multiple transfers, doubleword transfers, PC loads and atomics enforce their alignment constraints.

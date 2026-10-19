@@ -28,8 +28,8 @@ JOBS = [
     'Linux AppImage (aarch64)',
     'Windows (Clang + LLVM)',
     'Android APK',
-    'macOS (arm64)',
-    'iOS (arm64)',
+    'macOS and iOS (arm64)',
+    'macOS and iOS (arm64)',
 ]
 FILES = [
     'ScarletNX-linux-x86_64.AppImage',
@@ -39,7 +39,7 @@ FILES = [
     'ScarletNX-macos-arm64.zip',
     'ScarletNX-ios-arm64.ipa',
 ]
-N = len(JOBS)  # the packages, one job each
+N = len(JOBS)  # the packages, each with its job (macOS's and iOS's are one)
 failures = []
 
 

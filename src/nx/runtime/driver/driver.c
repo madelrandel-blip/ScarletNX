@@ -27,9 +27,11 @@ static void usage(void) {
          "  --touch=0|1|2          The game's touch screen: off, fingers, or fingers and the mouse\n"
          "  --controls=0|1         The on-screen controls: hidden or shown (the game's menu sets them)\n"
          "  --KEY=VALUE            Any setting of the game's .ini, for this run (--settings lists them)");
-    puts("  --backend=llvm|gcc     Select the recompiler backend for preparation\n"
-         "  -x -h / -r -h          Extraction / recompilation options\n"
+    puts("  -x -h / -r -h          Extraction / recompilation options\n"
          "  --game=games/Game      Run a compiled game");
+    puts("  --tmpfs                Played or prepared, extract to tmpfs: <temp>/scarletnx/work/<title ID>, which\n"
+         "                         the game reads its RomFS from; extracted again from <game>.source, the link\n"
+         "                         to the dump in the game's folder, when the system has emptied it");
     puts("  --outdir DIR           Played or prepared, where the game's folder goes (default: games/)\n"
          "  --out DIR              Played or prepared, the dump's extraction (default: work/<its name>)\n"
          "  --repo DIR             The data folder: games/, work/ and the keys (default: a\n"
@@ -129,20 +131,166 @@ static int left_beside(const char* input) {
     free(data);
     return found;
 }
-/* games/ and the extraction in work/ of the data folder, else the folder outdir names and the extraction out names. A
-   game made already stays where it is */
-static int play_dump(const char* input, const SnxPaths* paths, unsigned flags, const char* backend, const char* outdir,
-                     const char* out, int settings, char** setting, int game_argc, char** game_argv) {
+/* the link in a game's folder to the dump it was made from, which Extract to tmpfs extracts it from again */
+static char* source_link(const char* folder, const char* name) { return snx_format("%s/%s.source", folder, name); }
+/* the game's link to dump, made again unless it names it already; a note when the system makes none (Windows without
+   the right to) */
+static void link_source(const char* folder, const char* name, const char* dump) {
+    char* link = source_link(folder, name);
+    if (!snx_is_link(link) || !snx_same_file(link, dump)) {
+        if (snx_path_exists(link)) snx_remove_tree(link);
+        if (snx_symlink(dump, link))
+            printf("Could not link %s to its dump %s, which Extract to tmpfs extracts it from again\n", link, dump);
+    }
+    free(link);
+}
+/* dump extracted straight into target, the game's data folder or its folder in tmpfs: what an extraction left there
+   taken away first, its saves and the rest kept. marker, <name>.extracting in the game's folder, says it is incomplete
+   until it is done */
+static int extract_game(const char** command, const char* dump, const char* target, const char* marker) {
+    static const char* const parts[] = {"exefs", "romfs", "control.nacp", "control.romfs"};
+    char *folder = snx_dirname(marker), *part;
+    size_t i;
+    int failed = snx_mkdirs(folder) || snx_write_file(marker, "", 0);
+    free(folder);
+    for (i = 0; !failed && i < sizeof parts / sizeof *parts; ++i) {
+        part = snx_path_join(target, parts[i]);
+        failed = snx_path_exists(part) && snx_remove_tree(part);
+        free(part);
+    }
+    if (failed) return snx_error("cannot prepare %s for an extraction", target);
+    command[5] = "-x";
+    command[6] = "--out";
+    command[7] = target;
+    command[8] = "--";
+    command[9] = dump;
+    command[10] = NULL;
+    failed = snx_run_stage(command, NULL, "Extraction"); /* its status, the run's */
+    if (failed) return failed;
+    part = snx_path_join(target, "exefs");
+    failed = !snx_is_dir(part);
+    free(part);
+    if (failed) return snx_error("Extraction finished without creating %s/exefs", target);
+    return snx_remove_tree(marker) ? snx_error("cannot remove %s", marker) : 0;
+}
+/* The game's RomFS where Extract to tmpfs wants it before it runs. On: its extraction in snx_tmpfs_work, the copy in
+   its data folder taken away, and <name>.tmpfs in its folder saying so. Off: a game with that file gets its RomFS back
+   in its data folder, and the extraction in tmpfs is taken away. Extracted again, straight where it goes, from the dump
+   its folder links to when it is in neither (a reboot empties tmpfs) or its extraction stopped, or said why not. An
+   NRO's romfs.bin and a program without a title ID stay as they are. 0, or nonzero when an extraction or a copy
+   failed */
+static int ensure_romfs(const char** command, const char* folder, const char* name, int tmpfs) {
+    char *base = snx_path_join(folder, name), *data = snx_format("%s_data", base), *link = source_link(folder, name);
+    char *disk = snx_path_join(data, "romfs"), *bin = snx_path_join(data, "romfs.bin"), *marker = NULL;
+    char *npdm = snx_path_join(data, "exefs/main.npdm"), *work = NULL, *ram = NULL, *staged = NULL;
+    char* extracting = snx_format("%s.extracting", base);
+    unsigned char* text;
+    size_t size;
+    int rc = 0;
+    text = snx_read_file(npdm, &size);
+    work = text ? snx_tmpfs_work(snx_npdm_title(text, size)) : NULL;
+    free(text);
+    if (!work || snx_is_file(bin)) goto done;
+    ram = snx_path_join(work, "romfs");
+    marker = snx_format("%s.tmpfs", base);
+    if (tmpfs && snx_is_dir(work) && !snx_is_file(extracting)) { /* there already */
+        rc = (snx_is_dir(disk) && snx_remove_tree(disk)) || snx_write_file(marker, "", 0);
+        goto done;
+    }
+    if (!tmpfs && (snx_is_dir(disk) || !snx_is_file(marker))) { /* on disk, or never in tmpfs */
+        rc = (snx_is_dir(disk) && snx_is_dir(work) && snx_remove_tree(work)) ||
+             (snx_is_file(marker) && snx_remove_tree(marker));
+        goto done;
+    }
+    if (!tmpfs && snx_is_dir(ram)) { /* tmpfs's copied into its data folder */
+        staged = snx_format("%s.copying", disk);
+        rc = (snx_path_exists(staged) && snx_remove_tree(staged)) || snx_copy_tree(ram, staged) ||
+             snx_replace(staged, disk) || snx_remove_tree(work) || snx_remove_tree(marker);
+        if (rc) snx_error("cannot copy the RomFS in %s into %s", ram, data);
+        goto done;
+    }
+    if (!snx_is_file(link)) {
+        if (tmpfs && !snx_is_link(link))
+            printf("Can't be extracted to tmpfs due to missing symlink (%s)\n", link);
+        else
+            printf("Can't be extracted %s: %s %s\n", tmpfs ? "to tmpfs" : "again from tmpfs's emptied copy", link,
+                   snx_is_link(link) ? "links to a dump that is not there" : "is missing");
+        goto done;
+    }
+    rc = extract_game(command, link, tmpfs ? work : data, extracting);
+    if (!rc && tmpfs)
+        rc = (snx_is_dir(disk) && snx_remove_tree(disk)) || snx_write_file(marker, "", 0);
+    else if (!rc)
+        rc = snx_remove_tree(marker);
+done:
+    free(base);
+    free(data);
+    free(link);
+    free(disk);
+    free(bin);
+    free(marker);
+    free(npdm);
+    free(work);
+    free(ram);
+    free(staged);
+    free(extracting);
+    return rc;
+}
+/* games/ of the data folder, else the folder outdir names. A dump is extracted straight into its game's data folder,
+   games/<title ID>/<title ID>_data (its title ID read from its NCAs' headers first), or with --tmpfs into tmpfs, and
+   its game made from it there: no copy is kept. --out names a folder the extraction is kept in instead, the game made
+   from a copy. A game made already stays where it is */
+static int play_dump(const char* input, const SnxPaths* paths, unsigned flags, const char* outdir, const char* out,
+                     int settings, char** setting, int game_argc, char** game_argv) {
     char *dumped = NULL, *dump = snx_absolute(input), *name = NULL, *games = NULL, *extracted = NULL, *work = NULL;
     char *pending = NULL, *game = NULL, *folder = NULL, *base = NULL, *code = NULL, *source = NULL, error[256];
     const char** command = (const char**)snx_alloc((size_t)(game_argc + settings + 16) * sizeof(*command));
     int rc = 1, nro = is_nro_path(input), prepared = prepared_game(input, &folder, &name), named = 0, n, j;
+    int tmpfs = (flags & SNX_TMPFS) != 0;
     SnxNpdm npdm;
     command[0] = paths->executable;
     command[1] = "--repo";
     command[2] = paths->repo;
     command[3] = "--build-dir";
     command[4] = paths->build;
+    if (tmpfs && out) {
+        snx_error("--out names where the extraction goes, and --tmpfs puts it in tmpfs");
+        goto done;
+    }
+    if (!prepared && !nro && !out) {
+        SnxU64 title;
+        char text[17], *data, *extracting, *exefs;
+        int extract;
+        if (!dump || !snx_is_file(dump)) {
+            snx_error("Input dump is missing or is not a file: %s", input);
+            goto done;
+        }
+        games = outdir ? snx_absolute(outdir) : snx_path_join(paths->repo, "games");
+        if (!games || snx_extract_title(dump, paths, &title)) goto done;
+        /* named as the recompile names it, by its title ID; a dump without one of its own by its file's stem */
+        name = snx_title_text(title, text) ? snx_strdup(text) : snx_dump_name(input);
+        work = tmpfs ? snx_tmpfs_work(title) : NULL;
+        if (tmpfs && !work) {
+            snx_error("%s has no title ID of its own to extract it to tmpfs by", input);
+            goto done;
+        }
+        folder = snx_path_join(games, name);
+        base = snx_path_join(folder, name);
+        data = snx_format("%s_data", base);
+        extracting = snx_format("%s.extracting", base);
+        exefs = snx_path_join(data, "exefs");
+        /* extracted unless its game has its ExeFS, from a finished extraction */
+        extract = snx_is_file(extracting) || !snx_is_dir(exefs);
+        rc = extract ? extract_game(command, dump, tmpfs ? work : data, extracting) : 0;
+        source = snx_strdup(extract && tmpfs ? work : data);
+        free(data);
+        free(extracting);
+        free(exefs);
+        if (rc) goto done;
+        link_source(folder, name, dump);
+        named = 1;
+        goto made;
+    }
     if (prepared) {
         /* recompiled in its folder, from what its _data keeps (the ExeFS or the NRO, the RomFS, control.nacp), when
            another build made it: no dump, keys or extraction */
@@ -171,10 +319,9 @@ static int play_dump(const char* input, const SnxPaths* paths, unsigned flags, c
     dumped = snx_dump_name(input);
     games = outdir ? snx_absolute(outdir) : snx_path_join(paths->repo, "games");
     extracted = out ? snx_absolute(out) : NULL;
-    work = !out ? snx_work_dir(paths->repo) : extracted ? snx_dirname(extracted) : NULL;
-    if (!out && work) extracted = snx_path_join(work, dumped);
+    work = extracted ? snx_dirname(extracted) : NULL;
     pending = extracted ? snx_format("%s.extracting", extracted) : NULL;
-    if (!pending || !games) {
+    if ((!nro && !pending) || !games) {
         snx_error("cannot resolve the folders of %s", input);
         goto done;
     }
@@ -230,16 +377,12 @@ made:
     game = snx_strdup(base);
 #endif
     /* Always restage an NRO: a same-named cached game may belong to another input or an older build. */
-    /* An explicit backend must not silently reuse a game built by another compiler. */
-    if (backend || nro || (flags & SNX_RECOMP) || !snx_is_file(game) || !snx_is_file(code) || !stamped(base)) {
+    if (nro || (flags & SNX_RECOMP) || !snx_is_file(game) || !snx_is_file(code) || !stamped(base)) {
         command[5] = "-r";
         command[6] = "--outdir";
         command[7] = games;
         n = 8;
-        if (backend) {
-            command[n++] = "--backend";
-            command[n++] = backend;
-        }
+        if (tmpfs) command[n++] = "--tmpfs";
         command[n++] = "--";
         command[n++] = source;
         if (named) command[n++] = name;
@@ -255,6 +398,8 @@ made:
         rc = 0;
         goto done;
     }
+    rc = ensure_romfs(command, folder, name, tmpfs);
+    if (rc) goto done;
 #ifdef __ANDROID__
     /* an app's child process has no window to play in: the app runs the game this names (docs/ANDROID.md) */
     printf("Ready %s\n", name);
@@ -297,7 +442,7 @@ done:
 static int takes_value(const char* arg) {
     static const char* const names[] = {"--update", "--name",    "--out",    "--keys",    "--title-keys",
                                         "-o",       "--outname", "--outdir", "--runtime", "--target",
-                                        "-O",       "--jobs",    "--chunk",  "--backend"};
+                                        "-O",       "--jobs",    "--chunk"};
     size_t i;
     for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
         if (!strcmp(arg, names[i])) return 1;
@@ -331,10 +476,10 @@ static int dump_modules(int argc, char** argv) {
 }
 int snx_driver(int argc, char** argv) {
     SnxPaths paths;
-    const char *repo = NULL, *build = SNX_BUILD_DIR, *input = NULL, *backend = NULL, *outdir = NULL, *out = NULL;
+    const char *repo = NULL, *build = SNX_BUILD_DIR, *input = NULL, *outdir = NULL, *out = NULL;
     char *r = NULL, *b = NULL, *exe = NULL, **rest, **setting, *self, *data = NULL, *source = NULL;
     unsigned flags = 0;
-    int i, n = 0, separator = argc, result = -1, tool_paths = 0, help = 0, parsed, automatic, backend_args = 0;
+    int i, n = 0, separator = argc, result = -1, tool_paths = 0, help = 0, parsed, automatic, tmpfs_args = 0;
     int repo_given = 0, settings = 0;
     if (argc <= 1) return -1;
     if (!strcmp(argv[1], "--dump-modules")) return dump_modules(argc, argv);
@@ -359,6 +504,12 @@ int snx_driver(int argc, char** argv) {
                 build = argv[i];
             continue;
         }
+        if (!strcmp(argv[i], "--tmpfs")) { /* -r's too, which takes it from rest */
+            flags |= SNX_TMPFS;
+            rest[n++] = argv[i];
+            ++tmpfs_args;
+            continue;
+        }
         parsed = snx_cli_flag(argv[i], &flags);
         if (parsed < 0) {
             result = snx_error("unknown option: %s", argv[i]);
@@ -372,22 +523,10 @@ int snx_driver(int argc, char** argv) {
 #endif
         if (parsed) continue;
         if (!strcmp(argv[i], "--backend") || !strncmp(argv[i], "--backend=", 10)) {
-            const char* option = argv[i];
-            rest[n++] = argv[i];
-            ++backend_args;
-            if (!strcmp(option, "--backend")) {
-                if (++i == argc) {
-                    result = snx_error("--backend requires llvm or gcc");
-                    goto done;
-                }
-                backend = argv[i];
-                rest[n++] = argv[i];
-                ++backend_args;
-            } else {
-                backend = option + 10;
-            }
-            if (strcmp(backend, "llvm") && strcmp(backend, "gcc")) {
-                result = snx_error("unknown backend: %s", backend);
+            /* LLVM is the only code generator: older scripts name it */
+            const char* backend = argv[i][9] ? argv[i] + 10 : i + 1 < argc ? argv[++i] : "";
+            if (strcmp(backend, "llvm")) {
+                result = snx_error("--backend %s: LLVM is the only backend", backend);
                 goto done;
             }
             continue;
@@ -417,7 +556,7 @@ int snx_driver(int argc, char** argv) {
     /* played, a --key=value that is not the driver's own is a setting of the game's .ini, passed on to it when the
        runtime knows the key; any other is refused */
     for (i = 0; automatic && i < n; ++i)
-        if (!strncmp(rest[i], "--", 2) && strchr(rest[i], '=') && strncmp(rest[i], "--backend=", 10)) {
+        if (!strncmp(rest[i], "--", 2) && strchr(rest[i], '=')) {
             if (!setting_known(rest[i] + 2)) {
                 result = snx_error("unknown option: %s", rest[i]);
                 goto done;
@@ -438,7 +577,7 @@ int snx_driver(int argc, char** argv) {
             n -= 2;
             --i;
         }
-    if (automatic && (n != 1 + backend_args || help)) {
+    if (automatic && (n != 1 + tmpfs_args || help)) {
         result = snx_error("automatic preparation accepts one dump file. Pass game arguments after --");
         goto done;
     }
@@ -495,7 +634,7 @@ int snx_driver(int argc, char** argv) {
     paths.source = source;
     if (automatic)
         result =
-            play_dump(input, &paths, flags, backend, outdir, out, settings, setting,
+            play_dump(input, &paths, flags, outdir, out, settings, setting,
                       separator < argc ? argc - separator - 1 : 0, argv + (separator < argc ? separator + 1 : argc));
     else
         result = (flags & SNX_RECOMP) ? snx_recompile(n, rest, &paths) : snx_extract(n, rest, &paths);

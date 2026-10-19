@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* The boxes of a screen (place.c): where each goes on a computer's window and on a phone held upright, the title
-   beside the tabs or under them, the tips under the head or in the foot, and how a list of items fits its box. */
+   beside the tabs or under them, the user at the head's right, the tips under the head or in the foot, and how a list
+   of items fits its box. */
 #include "gui/place.h"
 #include <assert.h>
 #include <stdio.h>
@@ -19,13 +20,13 @@ static int holds(GuiRect outer, GuiRect r) {
 }
 /* every box in the area, none over another, the head round the tabs and the title */
 static void sound(const GuiPlace* p, int width, int height) {
-    const GuiRect all[] = {p->tabs, p->title, p->tips, p->list, p->side, p->status, p->keys};
+    const GuiRect all[] = {p->tabs, p->title, p->badge, p->tips, p->list, p->side, p->status, p->keys};
     size_t i, j, n = sizeof all / sizeof *all;
     for (i = 0; i < n; ++i) {
         assert(inside(all[i], width, height));
         for (j = i + 1; j < n; ++j) assert(apart(all[i], all[j]));
     }
-    assert(holds(p->head, p->tabs) && holds(p->head, p->title) && apart(p->head, p->list));
+    assert(holds(p->head, p->tabs) && holds(p->head, p->title) && holds(p->head, p->badge) && apart(p->head, p->list));
 }
 
 int main(void) {
@@ -75,7 +76,53 @@ int main(void) {
     assert(empty(p.tabs) && p.title.x == 16 && p.title.y == 16 && p.list.y == 16 + 64 + 16);
     in.tabs = 40;
     in.tabs_w = 400;
+    /* the user, 64 high and 200 wide: against the right of the tabs' row past the title beside them, two columns
+       between */
+    in.badge = 64;
+    in.badge_w = 200;
+    gui_place(&in, &p);
+    sound(&p, 1280, 800);
+    assert(p.badge.x + p.badge.w == 1280 - 16 && p.badge.y == 16 && p.badge.w == 200 && p.badge.h == 64);
+    assert(p.title.x + p.title.w == p.badge.x - 32 && p.title.y == 16 && p.tabs.y == 16 + 64 - 40);
+    assert(p.head.y + p.head.h == 16 + 64 && p.list.y == 16 + 64 + 16);
+    /* taller than the title: the row is its height, the title and the tabs at its foot */
+    in.badge = 80;
+    gui_place(&in, &p);
+    sound(&p, 1280, 800);
+    assert(p.badge.y == 16 && p.title.y == 16 + 80 - 64 && p.tabs.y == 16 + 80 - 40 && p.list.y == 16 + 80 + 16);
+    in.badge = 64;
+    /* the three do not fit on the row: the title goes under the tabs, the user at that row's right */
+    in.title_w = 1248 - 400 - 2 * 16 - 200 - 32 + 1;
+    gui_place(&in, &p);
+    sound(&p, 1280, 800);
+    assert(p.title.y == p.tabs.y + 40 + 16 && p.title.x == 16 && p.title.w == 1248 - 200 - 32);
+    assert(p.badge.y == p.title.y && p.badge.x + p.badge.w == 1280 - 16);
+    in.title_w = 300;
+    /* the title on its own row (below): the user at its right; with no title, at the right of the tabs */
     in.title_beside = 0;
+    gui_place(&in, &p);
+    sound(&p, 1280, 800);
+    assert(p.title.y == p.tabs.y + 40 + 16 && p.badge.y == p.title.y && p.title.w == 1248 - 200 - 32);
+    in.title = in.title_w = 0;
+    gui_place(&in, &p);
+    sound(&p, 1280, 800);
+    assert(empty(p.title) && p.badge.y == 16 && p.tabs.y == 16 + 64 - 40 && p.badge.x + p.badge.w == 1280 - 16);
+    /* a phone held upright, 360 wide: nothing fits beside the tabs, so the user has a row of its own under them */
+    in.width = 360;
+    in.tabs_w = 300;
+    gui_place(&in, &p);
+    sound(&p, 360, 800);
+    assert(p.badge.y == p.tabs.y + 40 + 16 && p.badge.x + p.badge.w == 360 - 16 && p.list.y == p.badge.y + 64 + 16);
+    /* wider than the screen: no user at all, the rest as without one */
+    in.badge_w = 360;
+    gui_place(&in, &p);
+    sound(&p, 360, 800);
+    assert(empty(p.badge) && p.list.y == p.tabs.y + 40 + 16);
+    in.width = 1280;
+    in.tabs_w = 400;
+    in.title = 64;
+    in.title_w = 300;
+    in.badge = in.badge_w = 0;
     /* the tips on a row of their own under the head, the whole width: the keys alone in the foot, the whole width */
     in.tips = 40;
     gui_place(&in, &p);

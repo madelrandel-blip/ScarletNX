@@ -14,7 +14,7 @@ clause, what Clang does with each undefined behavior at -O2, and how that differ
   `n > ((size_t)-1) / size`. A file's own build flags decide what it may use: read them in its `CMakeLists.txt`
   before relying on `-fno-strict-aliasing` or a newer standard.
 - **Never rely on `-fwrapv`.** It is still passed where game code and helpers are compiled (the rtlib flags in
-  `src/common/cpu/recompiler/llvm/CMakeLists.txt`, `gccjit/jit.c`, `src/common/cpu/execution/execution.c`, the
+  `src/common/cpu/recompiler/llvm/CMakeLists.txt`, `src/common/cpu/execution/execution.c`, the
   codegen and differential tests), and the goal is to remove it. C you write or touch must be correct without it:
   arithmetic that can wrap is done in unsigned types and converted back (Clang defines the out-of-range
   conversion as modular), products that can overflow get a wider intermediate, and a signed overflow you find

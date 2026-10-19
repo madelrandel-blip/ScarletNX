@@ -24,12 +24,11 @@ static int unrefs, stubs, quiets, unknowns, bad_requests, bad_objects;
 static const char* registered[4];
 static int nregistered;
 static SvcObj in_thing;
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t size) {
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
     SvcObj* o = calloc(1, sizeof *o);
     o->name = name;
     o->dispatch = dispatch;
     o->refs = 1;
-    if (size) o->data = calloc(1, size);
     return o;
 }
 void svcobj_ref(SvcObj* o) { o->refs++; }
@@ -131,12 +130,12 @@ static int test_IThing_Objects(SvcObj* self, SvcObj* thing, u32* m, SvcObj** out
     got.thing = thing;
     CHECK(thing == &in_thing && thing->refs == 2); /* the dispatcher's reference, dropped after */
     *m = 0x51, *h = 0x52;
-    *out = svcobj_new("out", NULL, 0);
+    *out = svcobj_new("out", NULL);
     return 0;
 }
 static int test_IThing_Fail(SvcObj* self, SvcObj** o, u32* h, u32* v) {
     (void)self;
-    *o = svcobj_new("lost", NULL, 0);
+    *o = svcobj_new("lost", NULL);
     *h = 0x61;
     *v = 5;
     return 0x1234;
@@ -229,7 +228,7 @@ static IpcBuf buf(u64 addr, u64 size) {
 static int same(IpcBuf a, u64 addr, u64 size) { return a.addr == addr && a.size == size; }
 
 int main(void) {
-    SvcObj* thing = test_IThing_new(0);
+    SvcObj* thing = test_IThing_new();
     u32 v32;
     u64 v64;
     u16 v16;
@@ -438,7 +437,7 @@ int main(void) {
 
     /* an interface of another file, with this file's types */
     {
-        SvcObj* o = test_IOther_new(0);
+        SvcObj* o = test_IOther_new();
         request(0);
         memset(raw, 0, sizeof raw);
         v64 = 0xC0FFEE, put(8, &v64, 8);
@@ -451,14 +450,14 @@ int main(void) {
     stubs = quiets = 0;
     CHECK(thing->dispatch(thing, &ctx) == 0 && stubs == 1);
     {
-        SvcObj* q = test_IQuiet_new(0);
+        SvcObj* q = test_IQuiet_new();
         request(0);
         CHECK(q->dispatch(q, &ctx) == 0 && quiets == 1 && stubs == 1);
         svcobj_unref(q);
-        q = test_IStrict_new(0);
+        q = test_IStrict_new();
         CHECK(q->dispatch(q, &ctx) == 0x1BA0A && unknowns == 1);
         svcobj_unref(q);
-        q = test_ICustom_new(0);
+        q = test_ICustom_new();
         CHECK(q->dispatch(q, &ctx) == 0x2A && got.fallbacks == 1);
         svcobj_unref(q);
     }

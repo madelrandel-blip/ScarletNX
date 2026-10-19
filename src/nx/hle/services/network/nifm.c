@@ -8,15 +8,13 @@
    queries about the connection fail like GetCurrentIpAddress does on a console without one. Online it reports the
    host's interface, the one with the default route. */
 #include "nx/hle/services/network/network.h"
+#include "nx/hle/hle.h"
 #include "hle/services/network/nifm.swipc.inc"
 
 enum { REQ_INVALID = 1, REQ_ON_HOLD = 2, REQ_ACCEPTED = 3 }; /* nn::nifm::RequestState (1 is also NotSubmitted) */
 #define NIFM_NOT_CONNECTED RC(110, 300)
 
-/* IRequest: u[0] the state (an atomic: game threads submit and poll at once), data the two events */
-typedef struct {
-    KEvent* ev[2];
-} NifmRequest;
+/* IRequest: u[0] the state (an atomic: game threads submit and poll at once), data the two events (NifmRequest) */
 static void nifm_req_destroy(SvcObj* o) {
     NifmRequest* r = o->data;
     for (int i = 0; i < 2; i++) kobj_unref(&r->ev[i]->o);
@@ -46,7 +44,7 @@ static int nn_nifm_detail_IRequest_Submit(SvcObj* self) {
     R_SUCCEED();
 }
 static SvcObj* nifm_req_new(void) {
-    SvcObj* o = nn_nifm_detail_IRequest_new(sizeof(NifmRequest));
+    SvcObj* o = nn_nifm_detail_IRequest_new_data(g_hle.nifm.reqs, g_hle.nifm.req_next, "nifm requests");
     NifmRequest* r = o->data;
     r->ev[0] = owned_event("nifm0");
     r->ev[1] = owned_event("nifm1");
@@ -108,7 +106,7 @@ static int nn_nifm_detail_IGeneralService_GetClientId(SvcObj* self, IpcBuf clien
     R_SUCCEED();
 }
 static int nn_nifm_detail_IGeneralService_CreateScanRequest(SvcObj* self, SvcObj** request) {
-    *request = nn_nifm_detail_IScanRequest_new(0);
+    *request = nn_nifm_detail_IScanRequest_new();
     R_SUCCEED();
 }
 static int nn_nifm_detail_IGeneralService_CreateRequest(SvcObj* self, i32 requirement_preset, SvcObj** request) {
@@ -166,7 +164,7 @@ static int nn_nifm_detail_IGeneralService_IsAnyForegroundRequestAccepted(SvcObj*
     R_SUCCEED();
 }
 static int general_service(SvcObj** service) {
-    *service = nn_nifm_detail_IGeneralService_new(0);
+    *service = nn_nifm_detail_IGeneralService_new();
     R_SUCCEED();
 }
 static int nn_nifm_detail_IStaticService_CreateGeneralServiceOld(SvcObj* self, SvcObj** service) {
@@ -175,4 +173,4 @@ static int nn_nifm_detail_IStaticService_CreateGeneralServiceOld(SvcObj* self, S
 static int nn_nifm_detail_IStaticService_CreateGeneralService(SvcObj* self, u64 pid, SvcObj** service) {
     return general_service(service);
 }
-SvcObj* new_nifm(void) { return nn_nifm_detail_IStaticService_new(0); }
+SvcObj* new_nifm(void) { return nn_nifm_detail_IStaticService_new(); }

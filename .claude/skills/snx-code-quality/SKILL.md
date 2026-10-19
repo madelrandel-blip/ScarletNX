@@ -25,6 +25,10 @@ padding array, `n > ((size_t)-1) / size`. A file's build flags plus `-std=c90 -p
    `static`s included) is the members of one struct in one global, `g_<file>`, not loose globals. What
    other files read is declared once, in the header beside it, through the struct or a function. Not
    for `const` tables (they are data, not state), or for `_Thread_local`.
+   **In `src/nx/hle/`** the HLE's state is one global for the whole subsystem: each file's state struct is a
+   member of `g_hle` (`hle/hle.h`), its type and initializer declared in the header beside the file, and the
+   objects it makes and frees come from bounded pools in it (an all-zero slot is free, `pool_take` searches on
+   from the last slot taken and asserts when full). No file there defines a variable of static duration.
 
 Review: `python3 .claude/skills/snx-code-quality/check.py FILES` lists candidates for 1, 3, 4 and 6 (a
 candidate is not a finding until the code is read); read the diff for 2 and 5. Report `file:line`, the

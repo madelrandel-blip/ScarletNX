@@ -35,36 +35,30 @@
 #endif
 
 enum {
-    CLONE_VM = 0x100,
-    CLONE_SIGHAND = 0x800,
-    CLONE_VFORK = 0x4000,
-    CLONE_THREAD = 0x10000,
-    CLONE_SETTLS = 0x80000,
-    CLONE_PARENT_SETTID = 0x100000,
-    CLONE_CHILD_CLEARTID = 0x200000,
-    CLONE_CHILD_SETTID = 0x1000000
+CLONE_VM = 0x100,
+CLONE_SIGHAND = 0x800,
+CLONE_VFORK = 0x4000,
+CLONE_THREAD = 0x10000,
+CLONE_SETTLS = 0x80000,
+CLONE_PARENT_SETTID = 0x100000,
+CLONE_CHILD_CLEARTID = 0x200000,
+CLONE_CHILD_SETTID = 0x1000000
 };
 #define ARGUMENTS_MAX 0x200000 /* bytes of arguments and environment, Linux's 2 MiB with the default stack */
 
 /* ---- signals between guest and host numbering ---- */
 #ifndef _WIN32
-static const int signal_pairs[][2] = {{1, SIGHUP},   {2, SIGINT},   {3, SIGQUIT},  {4, SIGILL},   {5, SIGTRAP},
-                                      {6, SIGABRT},  {7, SIGBUS},   {8, SIGFPE},   {9, SIGKILL},  {10, SIGUSR1},
-                                      {11, SIGSEGV}, {12, SIGUSR2}, {13, SIGPIPE}, {14, SIGALRM}, {15, SIGTERM},
-                                      {17, SIGCHLD}, {18, SIGCONT}, {19, SIGSTOP}, {20, SIGTSTP}, {21, SIGTTIN},
-                                      {22, SIGTTOU}, {23, SIGURG},  {24, SIGXCPU}, {25, SIGXFSZ}, {26, SIGVTALRM},
-                                      {27, SIGPROF}, {28, SIGWINCH}};
-static int host_signal(int guest) {
-    size_t i;
-    for (i = 0; i < sizeof signal_pairs / sizeof signal_pairs[0]; ++i)
-        if (signal_pairs[i][0] == guest) return signal_pairs[i][1];
+static int host_signal(int s) {
+    if (0) { /* ... */ }
+#define LINUX_SIGNAL(guest, name) else if (guest == s) return name;
+#include "gnuabi/abi/linux_signal.inc"
     return 0;
 }
-static int guest_signal(int host) {
-    size_t i;
-    for (i = 0; i < sizeof signal_pairs / sizeof signal_pairs[0]; ++i)
-        if (signal_pairs[i][1] == host) return signal_pairs[i][0];
-    return host;
+static int guest_signal(int s) {
+    if (0) { /* ... */ }
+#define LINUX_SIGNAL(guest, name) else if (name == s) return guest;
+#include "gnuabi/abi/linux_signal.inc"
+    return 0;
 }
 /* a host wait status in Linux's encoding */
 static uint32_t guest_status(int status) {

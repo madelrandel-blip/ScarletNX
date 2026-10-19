@@ -195,7 +195,7 @@ static void atlas_upload(VkCommandBuffer cb) {
     }
     vk_barrier(cb, g_atlas, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(cb, buf, g_atlas, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    rec_CmdCopyBufferToImage(cb, buf, g_atlas, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     vk_barrier(cb, g_atlas, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -306,20 +306,21 @@ void vk_ui_draw(VkCommandBuffer cb, VkImage sc, const int safe[4]) {
         VkViewport vp = {0, 0, (float)sw, (float)sh, 0, 1};
         VkRect2D sci = {{0, 0}, g_vk.sc_extent};
         VkDeviceSize vo = off;
-        vkCmdBeginRendering(cb, &ri);
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe);
-        vkCmdSetViewport(cb, 0, 1, &vp);
-        vkCmdSetScissor(cb, 0, 1, &sci);
-        vkCmdPushConstants(cb, g_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
-        vkCmdBindVertexBuffers(cb, 0, 1, &buf, &vo);
+        rec_CmdBeginRendering(cb, &ri);
+        vk_render_forget_state(); /* another pipeline and layout: a draw after it sets everything again */
+        rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe);
+        rec_CmdSetViewport(cb, 0, 1, &vp);
+        rec_CmdSetScissor(cb, 0, 1, &sci);
+        rec_CmdPushConstants(cb, g_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+        rec_CmdBindVertexBuffers(cb, 0, 1, &buf, &vo);
         /* runs of quads that sample the same way, in their order */
         for (i = 0; i < n; i = run) {
             for (run = i + 1; run < n && g_quads[run].sharp == g_quads[i].sharp; ++run) continue;
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout, 0, 1,
+            rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout, 0, 1,
                                     &g_sets[g_quads[i].sharp ? 1 : 0], 0, NULL);
-            vkCmdDraw(cb, (u32)(run - i) * 6, 1, (u32)i * 6, 0);
+            rec_CmdDraw(cb, (u32)(run - i) * 6, 1, (u32)i * 6, 0);
         }
-        vkCmdEndRendering(cb);
+        rec_CmdEndRendering(cb);
     }
     vk_barrier(cb, sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,

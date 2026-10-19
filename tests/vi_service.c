@@ -6,6 +6,7 @@
 #include <stdarg.h>
 
 #include "nx/hle/services/vi.c"
+#include "nx/hle/hle.c"
 
 u8* g_mem;
 int g_verbose;
@@ -37,19 +38,19 @@ void logf_(int level, const char* format, ...) {
     (void)level;
     (void)format;
 }
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t size) {
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
     SvcObj* obj = calloc(1, sizeof *obj);
     CHECK(obj != NULL);
     obj->name = name;
     obj->dispatch = dispatch;
     obj->refs = 1;
-    if (size) obj->data = calloc(1, size);
     test_objects++;
     return obj;
 }
+#include "svcobj_data.h"
 void svcobj_unref(SvcObj* obj) {
     if (!obj || --obj->refs) return;
-    free(obj->data);
+    test_svcobj_data_free(obj);
     free(obj);
     test_objects--;
 }
@@ -161,7 +162,13 @@ static u32 transact(u32 code, const void* payload, u32 n) {
     return rd32(0x4000); /* the data's size; it starts at 0x4010 and ends with the status */
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+
 int main(void) {
+    hle_init();
     u8 gbuf[VI_GBUF], req[4 + 4 + 8 + VI_GBUF], q[4 + 8 + VI_QBI];
     u32 v, n;
     i64 size = 0;
@@ -223,7 +230,7 @@ int main(void) {
     CHECK(rd32(0x4010) == 1280 && rd32(0x4014) == 720 && rd32(0x401c) == 1 && rd32(0x4020) == 0);
     CHECK(fence_n == 1 && fence_id == 5 && shown_n == 1 && shown_nvmap == 7 && shown_w == 1280 && shown_h == 720);
     CHECK(shown_pitch == 5120 && shown_layout == 3 && shown_bhl == 4 && shown_fmt == 1);
-    CHECK(vi.layer[0].slot[0].state == SLOT_FREE);
+    CHECK(g_hle.vi.layer[0].slot[0].state == SLOT_FREE);
     paced = 0;
     CHECK(transact(BQ_DEQUEUE_BUFFER, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 20) == 56);
     CHECK(rd32(0x4010) == 0 && paced == 1);
@@ -241,7 +248,7 @@ int main(void) {
     paced = 0;
     v = shown_n;
     CHECK(transact(BQ_QUEUE_BUFFER, q, sizeof q) == 20);
-    CHECK(shown_n == v && vi.layer[1].slot[0].state == SLOT_FREE);
+    CHECK(shown_n == v && g_hle.vi.layer[1].slot[0].state == SLOT_FREE);
     CHECK(transact(BQ_DEQUEUE_BUFFER, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 20) == 56 && paced == 0);
 
     /* DestroyStrayLayer: its binder is gone */
@@ -261,7 +268,7 @@ int main(void) {
     CHECK(rd32(0x1018) == 1);
     v = shown_n;
     held_fn(held_arg);
-    CHECK(shown_n == v && vi.layer[0].slot[0].state == SLOT_FREE && !vi.layer[0].slot[0].has_buffer);
+    CHECK(shown_n == v && g_hle.vi.layer[0].slot[0].state == SLOT_FREE && !g_hle.vi.layer[0].slot[0].has_buffer);
     CHECK(transact(BQ_REQUEST_BUFFER, "\0\0\0\0", 4) == 8 && rd32(0x4010) == 0);
     CHECK(transact(BQ_SET_PREALLOCATED_BUFFER, req, sizeof req) == 4 && rd32(0x4010) == 0);
     CHECK(transact(BQ_DEQUEUE_BUFFER, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 20) == 56);
@@ -270,16 +277,16 @@ int main(void) {
     /* the swap interval queued is the next dequeue's pace: 0 to 4, a negative one 1, past 4 capped */
     memcpy(q + 12 + 44, &(u32){9}, 4);
     CHECK(transact(BQ_DEQUEUE_BUFFER, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 20) == 56);
-    CHECK(transact(BQ_QUEUE_BUFFER, q, sizeof q) == 20 && vi.layer[0].interval == 4);
+    CHECK(transact(BQ_QUEUE_BUFFER, q, sizeof q) == 20 && g_hle.vi.layer[0].interval == 4);
     memcpy(q + 12 + 44, &(u32){~0u}, 4);
     CHECK(transact(BQ_DEQUEUE_BUFFER, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 20) == 56);
-    CHECK(transact(BQ_QUEUE_BUFFER, q, sizeof q) == 20 && vi.layer[0].interval == 1);
+    CHECK(transact(BQ_QUEUE_BUFFER, q, sizeof q) == 20 && g_hle.vi.layer[0].interval == 1);
     memcpy(q + 12 + 44, &(u32){0}, 4);
     CHECK(transact(BQ_DEQUEUE_BUFFER, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 20) == 56);
-    CHECK(transact(BQ_QUEUE_BUFFER, q, sizeof q) == 20 && vi.layer[0].interval == 0);
+    CHECK(transact(BQ_QUEUE_BUFFER, q, sizeof q) == 20 && g_hle.vi.layer[0].interval == 0);
     /* a QueueBufferInput cut short: the whole buffer at interval 1 */
     CHECK(transact(BQ_DEQUEUE_BUFFER, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 20) == 56);
-    CHECK(transact(BQ_QUEUE_BUFFER, q, 12 + 40) == 20 && vi.layer[0].interval == 1);
+    CHECK(transact(BQ_QUEUE_BUFFER, q, 12 + 40) == 20 && g_hle.vi.layer[0].interval == 1);
 
     /* a transaction without a parcel header fails; a graphic buffer short of its first plane clears the slot */
     {
@@ -291,7 +298,7 @@ int main(void) {
         memcpy(short_req + 8, &(u32){0x40}, 4);
         memcpy(short_req + 16, gbuf, 0x40);
         CHECK(transact(BQ_SET_PREALLOCATED_BUFFER, short_req, sizeof short_req) == 4 && rd32(0x4010) == 0);
-        CHECK(!vi.layer[0].slot[0].has_buffer);
+        CHECK(!g_hle.vi.layer[0].slot[0].has_buffer);
     }
 
     /* a native window buffer too small for the parcel: its size still, nothing written */

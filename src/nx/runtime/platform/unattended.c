@@ -3,7 +3,6 @@
 /* Unattended runs, for the windowed and the headless backend alike: the run's limit, screenshots and scripted
    presses */
 #include "nx/runtime/platform/unattended.h"
-#include "nx/gpu/renderer.h"
 #include "nx/runtime/ini.h"
 #include "nx/runtime/main.h"
 #include "nx/runtime/options.h"
@@ -136,6 +135,7 @@ int unattended_ini(const char* k, const char* v) {
 }
 
 void unattended_start(void) { g_t0 = plat_ns(); }
+u64 unattended_ms(void) { return (plat_ns() - g_t0) / 1000000ull; }
 int unattended_active(void) { return g_seconds > 0 || g_frame_limit >= 0; }
 
 static int frames_now(void) { return __atomic_load_n(&g_frames, __ATOMIC_RELAXED); }

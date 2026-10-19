@@ -29,7 +29,8 @@ if(CMAKE_CROSSCOMPILING)
     # GLOBAL: tests/ includes this file before src/nx does, and a plain imported target is only seen below the
     # folder that made it
     add_executable(snx-swipc IMPORTED GLOBAL)
-    set_target_properties(snx-swipc PROPERTIES IMPORTED_LOCATION "${snx_swipc_exe}")
+    # it runs here, so a test running it (tests/, swipc_refuses_*) doesn't go through the target's emulator
+    set_target_properties(snx-swipc PROPERTIES IMPORTED_LOCATION "${snx_swipc_exe}" CROSSCOMPILING_EMULATOR "")
     add_dependencies(snx-swipc snx_swipc_host)
 else()
     add_executable(snx-swipc "${PROJECT_SOURCE_DIR}/tools/swipc/swipc.c")

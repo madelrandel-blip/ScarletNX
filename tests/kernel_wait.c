@@ -7,6 +7,7 @@
    scripts for "another thread" and then moves a fake clock past its deadline */
 #include "nx/hle/kernel/kernel.c"
 #include "nx/hle/kernel/sync.c"
+#include "nx/hle/hle.c"
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -83,7 +84,10 @@ static int thread_done(KObj* o) { return ((KThread*)o)->state == 2; }
 /* the writable end of an svcCreateEvent pair: no signaled test, so it can't be waited on */
 static KObj g_wevent = {KO_WEVENT, 1, NULL, NULL, NULL, 0, 0, "writable event"};
 
+void pm_init(PMutex* m) { (void)m; }
+
 int main(void) {
+    hle_init();
     u32 idx, h[3], hw, ht;
     int refs;
     g_mem = calloc(1, 0x1000);

@@ -10,7 +10,7 @@
 #   vk        the renderer                                            platform  the OS layer and a window backend
 
 add_library(snx_nx_flags INTERFACE)
-target_link_libraries(snx_nx_flags INTERFACE scarletnx-common scarletnx-net scarletnx-filesystem)
+target_link_libraries(snx_nx_flags INTERFACE scarletnx-common scarletnx-net scarletnx-ldn scarletnx-filesystem)
 # Every function and global used across files is declared once, in the header of the file that defines it, and
 # everything else is static: a declaration that disagrees with the definition is then a compile error instead of a
 # miscompile. Third-party sources keep their own warnings off.
@@ -19,7 +19,7 @@ target_compile_options(snx_nx_flags INTERFACE -fno-strict-aliasing
 target_compile_definitions(snx_nx_flags INTERFACE VK_NO_PROTOTYPES)
 target_link_libraries(snx_nx_flags INTERFACE Vulkan::Headers)
 target_include_directories(snx_nx_flags BEFORE INTERFACE "${volk_SOURCE_DIR}"
-                                                "${VulkanMemoryAllocator_SOURCE_DIR}/include")
+                                                "${VulkanMemoryAllocator_SOURCE_DIR}/include" "${renderdoc_app_SOURCE_DIR}")
 
 function(snx_component name)
     add_library(snx_${name} OBJECT ${ARGN})
@@ -27,21 +27,22 @@ function(snx_component name)
 endfunction()
 
 snx_component(core runtime/main.c runtime/arm.c runtime/loader.c runtime/rtapi.c runtime/clock.c runtime/crash.c runtime/options.c
-              runtime/ini.c runtime/startup.c runtime/gdbstub.c runtime/present.c)
+              runtime/ini.c runtime/startup.c runtime/gdbstub.c runtime/present.c runtime/guest_jit.c
+              runtime/cheats.c)
 target_link_libraries(snx_core PRIVATE snx_driver snx_lz4)
 if(APPLE)
     # main.c's weak snx_module_static, which no build defines yet: ld64 refuses an undefined symbol, weak or not,
     # unless told it is resolved at run time
     target_link_options(snx_core INTERFACE "LINKER:-U,_snx_module_static")
 endif()
-snx_component(kernel hle/kernel/kernel.c hle/kernel/thread.c hle/kernel/sync.c hle/svc/svc.c hle/svc/svc_mem.c hle/kernel/debug.c
+snx_component(kernel hle/hle.c hle/kernel/kernel.c hle/kernel/thread.c hle/kernel/sync.c hle/svc/svc.c hle/svc/svc_mem.c hle/kernel/debug.c
               memory/mem.c hle/kernel/ipc.c)
 # the SVC dispatch, generated from hle/svc/hos.svc
 include("${PROJECT_SOURCE_DIR}/cmake/svcgen.cmake")
 snx_svcgen(snx_kernel)
-snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/pl.c hle/services/sm.c hle/services/am.c hle/services/set.c hle/services/time.c hle/services/acc.c hle/services/audio.c
+snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/pl.c hle/services/sm.c hle/services/am.c hle/services/set.c hle/services/time.c hle/services/acc.c hle/services/users.c hle/services/audio.c
               hle/services/misc.c hle/services/ldr.c hle/services/network/bsd.c hle/services/network/dns.c
-              hle/services/network/nifm.c hle/services/network/ssl.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c)
+              hle/services/network/nifm.c hle/services/network/ssl.c hle/services/network/ldn.c hle/services/network/room.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c)
 # the shared fonts' stand-ins (cmake/shared_fonts.cmake), which hle/services/pl.c hands out
 target_sources(snx_hle PRIVATE "${CMAKE_BINARY_DIR}/generated/shared_fonts.c")
 # the IPC interfaces of the services (docs/IPC.md): their dispatchers are generated, the handlers are in the services'
@@ -53,12 +54,15 @@ snx_swipc(snx_hle ROOT "${CMAKE_CURRENT_SOURCE_DIR}" FILES
           hle/services/misc.swipc hle/services/am.swipc hle/services/hid.swipc
           hle/services/vi.swipc hle/services/nvdrv.swipc hle/services/network/bsd.swipc
           hle/services/network/dns.swipc hle/services/network/nifm.swipc hle/services/network/ssl.swipc
+          hle/services/network/ldn.swipc
           hle/filesystem/fs.swipc)
 snx_component(video gpu/video/host1x.c gpu/video/nvdec.c gpu/video/vp9_rebuild.cpp gpu/video/vic.c)
 target_link_libraries(snx_video PRIVATE FFmpeg::avcodec)
-# hwopus (hle/services/audio.c) decodes Opus with FFmpeg too
-target_link_libraries(snx_hle PRIVATE FFmpeg::avcodec OpenSSL::SSL)
-snx_component(gpu gpu/gpu.c gpu/maxwell/engines.c gpu/maxwell/mme.c gpu/maxwell/compute.c gpu/maxwell/fermi2d.c gpu/maxwell/dma.c gpu/maxwell/write_pages.c gpu/maxwell/maxwell3d.c gpu/renderer.c)
+# hwopus (hle/services/audio.c) decodes Opus with FFmpeg too; acc's user picture is a splash drawing (cmake/splash.cmake)
+include("${PROJECT_SOURCE_DIR}/cmake/splash.cmake")
+target_link_libraries(snx_hle PRIVATE FFmpeg::avcodec OpenSSL::SSL snx_splash)
+snx_component(gpu gpu/gpu.c gpu/maxwell/engines.c gpu/maxwell/mme.c gpu/maxwell/mme_hle.c gpu/maxwell/compute.c gpu/maxwell/fermi2d.c gpu/maxwell/dma.c gpu/maxwell/write_pages.c gpu/maxwell/maxwell3d.c gpu/renderer.c
+              gpu/nvn_trace.c)
 
 include("${PROJECT_SOURCE_DIR}/cmake/controls_atlas.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
@@ -78,13 +82,17 @@ snx_component(shader gpu/shader/shader.c gpu/shader/decode.c gpu/shader/corpus.c
 # the opcode enum and decoder, generated from gpu/shader/maxwell_opcodes.def
 include("${PROJECT_SOURCE_DIR}/cmake/shaderdec.cmake")
 snx_shaderdec(snx_shader)
-snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
-                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/compute.c
-                 gpu/vk/pending_pages.c gpu/vk/memory.c gpu/vk/astc.c gpu/vk/ui.c gpu/texture/etc2.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp
+snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
+                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/compute.c
+                 gpu/vk/pending_pages.c gpu/vk/memory.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/ui.c gpu/texture/etc2.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp
                  "${volk_SOURCE_DIR}/volk.c")
-# the ASTC decoder's SPIR-V, compiled from its GLSL at build time (cmake/glsl.cmake)
+# the ASTC decoder's and the VIC composition's SPIR-V, compiled from their GLSL at build time (cmake/glsl.cmake). The
+# VIC shader is built twice: for word aligned rows, and for the rest (gpu/video/vic_compose.glsl)
 include("${PROJECT_SOURCE_DIR}/cmake/glsl.cmake")
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc.comp NAME astc_spv HEADER nx/gpu/texture/astc_spv.h)
+snx_glsl_spirv(snx_vk SOURCE gpu/video/vic.comp NAME vic_spv HEADER nx/gpu/video/vic_spv.h)
+snx_glsl_spirv(snx_vk SOURCE gpu/video/vic.comp NAME vic_unaligned_spv HEADER nx/gpu/video/vic_spv.h
+               DEFINES VIC_UNALIGNED)
 set(components core kernel hle video gpu platform shader vk)
 # third-party code (vma.cpp is VMA's implementation)
 set_source_files_properties("${volk_SOURCE_DIR}/volk.c" gpu/vk/vma.cpp PROPERTIES COMPILE_OPTIONS -w)
@@ -145,7 +153,9 @@ endif()
 include("${PROJECT_SOURCE_DIR}/cmake/window_icon.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/build_info.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/pad_sdl.cmake")
-target_link_libraries(snx_platform PRIVATE SDL3::SDL3 snx_window_icon snx_build_info snx_pad_sdl)
+target_link_libraries(snx_platform PRIVATE SDL3::SDL3 snx_window_icon snx_build_info snx_pad_sdl snx_splash)
+# the build is part of the key of the shader and pipeline file (gpu/vk/pipeline.c)
+target_link_libraries(snx_vk PRIVATE snx_build_info)
 # the game's menu in YoRHa's colours, from src/gui/themes/yorha/theme.ini (cmake/gui_themes.cmake)
 target_include_directories(snx_platform PRIVATE "${CMAKE_BINARY_DIR}/generated")
 target_link_libraries(scarletnx PRIVATE SDL3::SDL3)
@@ -204,10 +214,16 @@ if(BUILD_TESTING AND SNX_TEST_VULKAN)
     # the ASTC upload against the CPU decoder, with the backend's own frames, staging and allocations and the SPIR-V
     # the build makes (the file snx_glsl_spirv generated for snx_vk above). Again under a 4 MiB allocation cap, so
     # images in pieces are tested too. `snx-test-astc-vulkan --large` decodes two 512 MiB textures (minutes on lavapipe)
+    # cmd.c records the frame's commands through record.c's thread, with the platform's threads and locks
+    if(WIN32)
+        set(snx_astc_plat runtime/platform/plat_win32.c)
+    else()
+        set(snx_astc_plat runtime/platform/plat_posix.c)
+    endif()
     add_executable(snx-test-astc-vulkan "${PROJECT_SOURCE_DIR}/tests/astc_vulkan.c" gpu/texture/astc.c gpu/vk/astc.c
-        gpu/vk/cmd.c gpu/vk/memory.c gpu/vk/vma.cpp "${volk_SOURCE_DIR}/volk.c"
+        gpu/vk/cmd.c gpu/vk/memory.c gpu/vk/record.c gpu/vk/vma.cpp ${snx_astc_plat} "${volk_SOURCE_DIR}/volk.c"
         "${CMAKE_BINARY_DIR}/generated/spirv/astc_spv.c")
-    target_link_libraries(snx-test-astc-vulkan PRIVATE snx_nx_flags Threads::Threads ${CMAKE_DL_LIBS})
+    target_link_libraries(snx-test-astc-vulkan PRIVATE snx_nx_flags scarletnx-filesystem Threads::Threads ${CMAKE_DL_LIBS})
     set_target_properties(snx-test-astc-vulkan PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME astc_vulkan COMMAND snx-test-astc-vulkan)
     add_test(NAME astc_vulkan_pieces COMMAND snx-test-astc-vulkan)
@@ -231,22 +247,16 @@ elseif(SNX_DEPLOY)
         VERBATIM)
 endif()
 
-# All model names share the same Horizon/Maxwell implementation.
-if(ANDROID OR IOS) # an app has one program, started by its icon
-    set(snx_models "")
-else()
-    set(snx_models erista mariko aula)
+# scarletnx-switch: the Switch driver by name, beside scarletnx-3ds and scarletnx-gnuabi. An app has one program,
+# started by its icon
+if(WIN32)
+    add_custom_command(TARGET scarletnx POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:scarletnx>"
+                "${CMAKE_BINARY_DIR}/scarletnx-switch.exe" VERBATIM)
+    install(PROGRAMS "${CMAKE_BINARY_DIR}/scarletnx-switch.exe" DESTINATION bin)
+elseif(NOT ANDROID AND NOT IOS)
+    add_custom_command(TARGET scarletnx POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E create_symlink "$<TARGET_FILE_NAME:scarletnx>"
+                "${CMAKE_BINARY_DIR}/scarletnx-switch" VERBATIM)
+    install(PROGRAMS "${CMAKE_BINARY_DIR}/scarletnx-switch" DESTINATION bin)
 endif()
-foreach(model ${snx_models})
-    if(WIN32)
-        add_custom_command(TARGET scarletnx POST_BUILD
-            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:scarletnx>"
-                    "${CMAKE_BINARY_DIR}/scarletnx-${model}.exe" VERBATIM)
-        install(PROGRAMS "${CMAKE_BINARY_DIR}/scarletnx-${model}.exe" DESTINATION bin)
-    else()
-        add_custom_command(TARGET scarletnx POST_BUILD
-            COMMAND "${CMAKE_COMMAND}" -E create_symlink "$<TARGET_FILE_NAME:scarletnx>"
-                    "${CMAKE_BINARY_DIR}/scarletnx-${model}" VERBATIM)
-        install(PROGRAMS "${CMAKE_BINARY_DIR}/scarletnx-${model}" DESTINATION bin)
-    endif()
-endforeach()

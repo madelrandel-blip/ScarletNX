@@ -41,6 +41,7 @@ static FsNode* node_new(const char* name, int is_dir) {
 static void node_free(FsNode* n) {
     if (n->fd >= 0) plat_file_unshare(n->fd, n->map, n->size);
     free(n->virtual_data);
+    free(n->host);
     free(n->name);
     free(n);
 }
@@ -167,23 +168,26 @@ FsTreeResult fs_tree_path(FsTree* tree, const FsNode* node, char* out, size_t ca
     if (!tree || !tree->base || !out || !capacity) return FS_TREE_INVALID;
     out[0] = 0;
     if (!belongs_to(tree, node)) return FS_TREE_NOTFOUND;
-    size_t base_len = strlen(tree->base), size = base_len;
-    int base_slash = base_len && separator(tree->base[base_len - 1]);
-    for (const FsNode* n = node; n != tree->root; n = n->parent) {
-        size_t add = strlen(n->name) + !(n->parent == tree->root && base_slash);
+    const FsNode* top = node; /* the path's start: the data directory, or the graft node is in */
+    while (top != tree->root && !top->host) top = top->parent;
+    const char* base = top->host ? top->host : tree->base;
+    size_t base_len = strlen(base), size = base_len;
+    int base_slash = base_len && separator(base[base_len - 1]);
+    for (const FsNode* n = node; n != top; n = n->parent) {
+        size_t add = strlen(n->name) + !(n->parent == top && base_slash);
         if (add >= FS_TREE_PATH_MAX || size >= FS_TREE_PATH_MAX - add) return FS_TREE_TOOLONG;
         size += add;
     }
     if (size >= capacity || size >= FS_TREE_PATH_MAX) return FS_TREE_TOOLONG;
     out[size] = 0;
     size_t pos = size;
-    for (const FsNode* n = node; n != tree->root; n = n->parent) {
+    for (const FsNode* n = node; n != top; n = n->parent) {
         size_t len = strlen(n->name);
         pos -= len;
         memcpy(out + pos, n->name, len);
-        if (n->parent != tree->root || !base_slash) out[--pos] = '/';
+        if (n->parent != top || !base_slash) out[--pos] = '/';
     }
-    memcpy(out, tree->base, base_len);
+    memcpy(out, base, base_len);
     return FS_TREE_OK;
 }
 
@@ -806,15 +810,12 @@ static FsTreeResult scan_directory(FsTree* tree, FsNode* parent, char* host, uns
     return rc;
 }
 
-FsTreeResult fs_tree_init(FsTree* tree, const char* directory) {
-    if (!tree || !directory || !*directory) return FS_TREE_INVALID;
-    memset(tree, 0, sizeof *tree);
-    pm_init(&tree->lock);
-    char absolute[FS_TREE_PATH_MAX];
+/* directory as an absolute path without symlinks (no junction on Windows), into absolute */
+static FsTreeResult host_directory(const char* directory, char* absolute) {
 #if defined(_WIN32)
-    DWORD len = GetFullPathNameA(directory, sizeof absolute, absolute, NULL);
+    DWORD len = GetFullPathNameA(directory, FS_TREE_PATH_MAX, absolute, NULL);
     if (!len) return FS_TREE_IO;
-    if (len >= sizeof absolute) return FS_TREE_TOOLONG;
+    if (len >= FS_TREE_PATH_MAX) return FS_TREE_TOOLONG;
     for (char* p = absolute; *p; p++)
         if (*p == '\\') *p = '/';
     while (len > 3 && absolute[len - 1] == '/') absolute[--len] = 0;
@@ -823,8 +824,8 @@ FsTreeResult fs_tree_init(FsTree* tree, const char* directory) {
     if (!(attributes & FILE_ATTRIBUTE_DIRECTORY) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return FS_TREE_INVALID;
 #else
     struct stat st;
-    size_t input_len = strnlen(directory, sizeof absolute);
-    if (input_len >= sizeof absolute) return FS_TREE_TOOLONG;
+    size_t input_len = strnlen(directory, FS_TREE_PATH_MAX);
+    if (input_len >= FS_TREE_PATH_MAX) return FS_TREE_TOOLONG;
     memcpy(absolute, directory, input_len + 1);
     while (input_len > 1 && absolute[input_len - 1] == '/') absolute[--input_len] = 0;
     if (lstat(absolute, &st)) return FS_TREE_IO;
@@ -832,13 +833,52 @@ FsTreeResult fs_tree_init(FsTree* tree, const char* directory) {
     char* resolved = realpath(directory, NULL);
     if (!resolved) return FS_TREE_IO;
     size_t len = strlen(resolved);
-    if (len >= sizeof absolute) {
+    if (len >= FS_TREE_PATH_MAX) {
         free(resolved);
         return FS_TREE_TOOLONG;
     }
     memcpy(absolute, resolved, len + 1);
     free(resolved);
 #endif
+    return FS_TREE_OK;
+}
+
+static void make_readonly(FsNode* n) {
+    n->readonly = 1;
+    for (FsNode* child = n->children; child; child = child->next) make_readonly(child);
+}
+
+FsTreeResult fs_tree_graft(FsTree* tree, const char* name, const char* directory) {
+    if (!tree || !tree->root || !name || !directory || !valid_name(name, strlen(name))) return FS_TREE_INVALID;
+    if (child_find(tree->root, name)) return FS_TREE_EXISTS;
+    char absolute[FS_TREE_PATH_MAX];
+    FsTreeResult rc = host_directory(directory, absolute);
+    if (rc) return rc;
+    FsNode* n = node_new(name, 1);
+    if (!n) return FS_TREE_NOMEM;
+    n->host = strdup(absolute);
+    if (!n->host) {
+        node_free(n);
+        return FS_TREE_NOMEM;
+    }
+    n->attached = 1;
+    rc = scan_directory(tree, n, absolute, 1);
+    if (rc) {
+        subtree_discard(n);
+        return rc;
+    }
+    make_readonly(n);
+    node_attach(tree->root, n);
+    return FS_TREE_OK;
+}
+
+FsTreeResult fs_tree_init(FsTree* tree, const char* directory) {
+    if (!tree || !directory || !*directory) return FS_TREE_INVALID;
+    memset(tree, 0, sizeof *tree);
+    pm_init(&tree->lock);
+    char absolute[FS_TREE_PATH_MAX];
+    FsTreeResult rc = host_directory(directory, absolute);
+    if (rc) return rc;
     tree->base = strdup(absolute);
     tree->root = node_new("", 1);
     if (!tree->base || !tree->root) {
@@ -846,7 +886,7 @@ FsTreeResult fs_tree_init(FsTree* tree, const char* directory) {
         return FS_TREE_NOMEM;
     }
     tree->root->attached = 1;
-    FsTreeResult rc = scan_directory(tree, tree->root, absolute, 0);
+    rc = scan_directory(tree, tree->root, absolute, 0);
     if (!rc) {
         FsNode* root = child_find(tree->root, "root");
         if (root && !root->is_dir) rc = FS_TREE_INVALID;

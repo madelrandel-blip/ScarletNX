@@ -13,6 +13,12 @@
 void pm_lock(PMutex* m) { (void)m; }
 void pm_unlock(PMutex* m) { (void)m; }
 
+/* ui.c's warning for a picture that does not draw */
+void logf_(int lvl, const char* fmt, ...) {
+    (void)lvl;
+    (void)fmt;
+}
+
 static const int safe[4] = {0, 0, 2000, 1000};
 static char stored_key[64], stored_value[64];
 static int stores;

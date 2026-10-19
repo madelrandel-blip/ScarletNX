@@ -4,6 +4,8 @@
 #include "nx/runtime/rtapi.h"
 #include "nx/hle/kernel/kernel.h"
 #include "nx/runtime/clock.h"
+#include "nx/runtime/guest_jit.h"
+#include "nx/runtime/loader.h"
 #include "nx/runtime/main.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
@@ -84,6 +86,17 @@ void load_hints(void) {
     fclose(f);
 }
 
+/* the JIT's warm start (guest_jit.c) */
+u64* hints_copy(size_t* count) {
+    u64* copy;
+    pm_lock(&g_hints_lock);
+    copy = g_hints.n ? malloc(8 * (size_t)g_hints.n) : NULL;
+    *count = copy ? (size_t)g_hints.n : 0;
+    if (copy) memcpy(copy, hints_order(), 8 * (size_t)g_hints.n);
+    pm_unlock(&g_hints_lock);
+    return copy;
+}
+
 /* Under the lock for the whole write: the main loop and a thread stopping the game may save at once, and neither may
    truncate the file under the other. Written beside it, then moved over it */
 void save_hints(void) {
@@ -114,11 +127,16 @@ void save_hints(void) {
 
 /* ---- RtAPI ---- */
 
-static void rt_note_hint(u64 pc) {
+/* 1 when pc is a new hint */
+static int hint_add(u64 pc) {
+    int added;
     pm_lock(&g_hints_lock);
-    if (hint_add_nl(pc)) g_hints.dirty = 1;
+    added = hint_add_nl(pc);
+    if (added) g_hints.dirty = 1;
     pm_unlock(&g_hints_lock);
+    return added;
 }
+static void rt_note_hint(u64 pc) { hint_add(pc); }
 
 /* the game cannot go on past either: what is needed to look into it, then the end */
 static void rt_undef(CPU* c, u64 pc, u32 w) {
@@ -151,5 +169,23 @@ static void rt_wfe(CPU* c) {
 }
 static void rt_poll(CPU* c) { core_poll((KThread*)c->thread); }
 
-const RtAPI g_rtapi = {snx_svc,        rt_undef, rt_note_hint, guest_ticks, rt_brk,
-                       snx_fpcr_apply, rt_sev,   rt_wfe,       rt_poll,     g_svc64};
+/* snx_lookup found no function for pc: the JIT's code, which a call into code the game mapped (an NRO) finds without a
+   wait once compiled. A pc without code yet waits for its compile off its guest core, so the core's other threads run
+   meanwhile. It is noted as a hint, so the next recompile has the function in the module: not code the game mapped,
+   which the module never holds and which lands elsewhere next time */
+static void rt_miss(CPU* c, u64 pc) {
+    GuestFn f = jit_resolve(pc);
+    if (!f) {
+        KThread* t = kthread_cur();
+        if (t) core_leave(t);
+        f = jit_wait(pc);
+        if (t) core_enter(t);
+        if (!f)
+            fatal("The game reached code at %llx that the recompiler missed, and %s", (unsigned long long)pc,
+                  jit_failure());
+    }
+    if (pc - g_code_lo < g_code_hi - g_code_lo) hint_add(pc);
+    f(c, pc);
+}
+const RtAPI g_rtapi = {snx_svc,        rt_undef, rt_note_hint, guest_ticks, rt_brk, snx_fpcr_apply,
+                       rt_sev,         rt_wfe,   rt_poll,      g_svc64,     rt_miss};

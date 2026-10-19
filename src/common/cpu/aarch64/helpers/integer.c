@@ -26,7 +26,7 @@ u64 snx_decode_bitmask(u32 N, u32 imms, u32 immr, u32 ds) {
 
 /* CRC32 (polynomial 0x04C11DB7) and CRC32C (0x1EDC6F41), bit-reflected as the instructions define them, a nibble
    at a time: entry i is i run through four steps of the bit-serial division. Same results as eight conditional
-   shifts per byte, which made the interpreter and the libgccjit backend slow (#69). */
+   shifts per byte, which made the interpreter slow (#69). */
 static const u32 crc32_nibbles[2][16] = {
     {0x00000000u, 0x1DB71064u, 0x3B6E20C8u, 0x26D930ACu, 0x76DC4190u, 0x6B6B51F4u, 0x4DB26158u, 0x5005713Cu,
      0xEDB88320u, 0xF00F9344u, 0xD6D6A3E8u, 0xCB61B38Cu, 0x9B64C2B0u, 0x86D3D2D4u, 0xA00AE278u, 0xBDBDF21Cu},
@@ -47,7 +47,8 @@ u32 snx_crc32(u32 acc, u64 val, int bytes, int castagnoli) {
 /* STXP of two doublewords: one atomic compare-and-swap of all 16 bytes. Swapping the halves one at a time let
    Tears of the Kingdom's lock-free lists pair one thread's pointer with another's counter. Clang emits
    lock cmpxchg16b with cx16 enabled (the builds also pass -mcx16: Clang 18 still called libatomic with the
-   attribute alone), and LDAXP/STLXP on AArch64; GCC makes it a libatomic call, which a module can't link. */
+   attribute alone), LDAXP/STLXP on AArch64, and lqarx/stqcx. on PowerPC64 from POWER8 (cmake/cross.cmake's
+   -mcpu=power8); GCC makes it a libatomic call, which a module can't link. */
 #ifndef __clang__
 #error "the CPU helpers need Clang: GCC turns the 16-byte compare-and-swap into a libatomic call"
 #endif

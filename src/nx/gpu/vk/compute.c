@@ -47,10 +47,9 @@ typedef struct {
 } CsOut;
 static CsOut g_out[256];
 static int g_nout;
-static u64 g_out_lo = ~0ull, g_out_hi;
 /* the guest pages every pending result covers, the current batch's and those put aside: a read or write of memory no
    result covers (most of them) is answered without checking each result, through the GMMU page by page */
-static PendPages g_pages;
+static PendPages g_pages = {.also = &g_pend_any};
 static void outs_pages(const CsOut* out, int n, int delta) {
     for (int i = 0; i < n; i++) pend_add(&g_pages, out[i].addr, out[i].size, delta);
 }
@@ -72,7 +71,7 @@ typedef struct {
     VmaAllocation ar_mem;
     u8* ar_ptr;
     u8* org;
-    u64 ar_cap, org_cap, cval, lo, hi;
+    u64 ar_cap, org_cap, cval;
     CsOut out[256];
     int nout, gfx;
 } CsBatch;
@@ -211,6 +210,7 @@ static void cs_submit(void) {
                         .pCommandBufferInfos = &c,
                         .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
+    vk_rec_queue(g_vk.compute); /* after the graphics submissions before it, when the queue is theirs too */
     VkResult r = vkQueueSubmit2(g_vk.compute, 1, &si, VK_NULL_HANDLE);
     if (r == VK_ERROR_DEVICE_LOST) fatal("vulkan: the GPU device was lost (driver reset or crash)");
     g_recording = 0;
@@ -313,8 +313,6 @@ static void cs_put_aside(void) {
     b->gfx = g_ar_gfx;
     memcpy(b->out, g_out, (size_t)g_nout * sizeof g_out[0]);
     b->nout = g_nout;
-    b->lo = g_out_lo;
-    b->hi = g_out_hi;
     g_phead++;
     g_ccb = cb;
     g_dpool = dp;
@@ -323,8 +321,6 @@ static void cs_put_aside(void) {
     g_ar = VK_NULL_HANDLE; /* arena_fit gives the next batch one */
     g_ar_cap = g_ar_used = 0;
     g_nout = 0;
-    g_out_lo = ~0ull;
-    g_out_hi = 0;
     g_ar_gfx = 0;
     g_inflight = 0;
     cs_any_update();
@@ -343,8 +339,6 @@ static void cs_land(void) {
     /* only now: until the results are in memory, readers on other threads wait for this landing in
        vk_compute_mem_need */
     g_nout = 0;
-    g_out_lo = ~0ull;
-    g_out_hi = 0;
     g_ar_used = 0;
     vkResetDescriptorPool(g_vk.dev, g_dpool, 0);
     if (g_ar_gfx) { /* draws read this arena: it waits until their frame is done, the next batch gets another */
@@ -468,6 +462,14 @@ void vk_compute_mem_need(u64 a, u64 n) {
     vk_lock();
     if (pend_hit(&g_pages, a, n)) cs_mem_need(a, n);
     vk_unlock();
+}
+u64 vk_compute_adds(void) { return g_pages.adds; }
+int vk_compute_pending(u64 a, u64 n) {
+    int hit;
+    vk_lock();
+    hit = pend_hit(&g_pages, a, n);
+    vk_unlock();
+    return hit;
 }
 /* the GMMU is about to change [a, a + n): every result there lands with the mappings it covered its pages through,
    including one that overlaps it only on GPU pages that weren't mapped, which covered no page */
@@ -690,24 +692,26 @@ void vk_dispatch(GpuChannel* ch, const u32* q, u64 code) {
         for (i = 0; i < p->si.ntex && i < SH_MAXTEX; i++) {
             ShTex* st = &p->si.tex[i];
             u32 h = 0, h2 = 0, tic[8];
-            VkFmt f;
+            int num;
             if (st->shadow || st->flags) continue; /* raw and multisample textures are declared on their own */
             if (!cs_cb_read(st->bindless ? (st->bl_cbuf & 7) : tcb_key, st->cbuf_off * 4, &h)) continue;
             if (st->bindless && st->bl2 && cs_cb_read(st->bl2_cbuf & 7, st->bl2_off * 4, &h2)) h |= h2;
             gmem_read(tic_key_base + (h & 0xFFFFF) * 32ull, tic, sizeof tic);
-            f = vk_tic_format(tic[0], 0);
-            if (f.is_int || vk_tic_reads_stencil(tic)) ck.tex_int |= 1ull << i;
-            if (f.is_int && f.sint) ck.tex_sint |= 1ull << i;
+            /* by the header alone: textures are resolved only when bound, a color texture's surface has its header's
+               number type, and depth isn't sampled here */
+            num = vk_tex_num(tic, NULL);
+            if (num) ck.tex_int |= 1ull << i;
+            if (num == 2) ck.tex_sint |= 1ull << i;
         }
     if (!p->failed)
         for (i = 0; i < p->si.nimg && i < 8; i++) {
             u32 h = 0, tic[8];
-            if (p->si.img[i].type != 3 || p->si.img[i].kind == 1) continue;
+            if (!vk_image_keyable(&p->si, i)) continue;
             if (!cs_cb_read(p->si.img[i].bindless ? (p->si.img[i].bl_cbuf & 7) : tcb_key, p->si.img[i].cbuf_off * 4,
                             &h))
                 continue;
             gmem_read(tic_key_base + (h & 0xFFFFF) * 32ull, tic, sizeof tic);
-            if (!!vk_tic_format(tic[0], 0).is_int != !!p->si.img[i].bindless) ck.image |= 1u << i;
+            if (vk_image_key(&p->si, i, tic)) ck.image |= 1u << i;
         }
     if (ck.tex_int || ck.image) {
         if (!p->keyed || (p->keyed->si.rt_int_mask >> 8) != ck.image || p->keyed->si.tex_int_mask != ck.tex_int ||
@@ -740,10 +744,7 @@ void vk_dispatch(GpuChannel* ch, const u32* q, u64 code) {
         cs_cb_read(0, p->si.gbuf_cbuf_off[i], &v[0]);
         cs_cb_read(0, p->si.gbuf_cbuf_off[i] + 4, &v[1]);
         cs_cb_read(0, p->si.gbuf_cbuf_off[i] + 8, &v[2]);
-        sa[i] = ((u64)v[1] << 32) | v[0];
-        ss[i] = v[2] ? v[2] : 16;
-        if (ss[i] > (16u << 20)) ss[i] = 16u << 20;
-        ss[i] = (ss[i] + 3) & ~3u;
+        ss[i] = vk_gbuf_desc(ST_CS, p->si.gbuf_cbuf_off[i], v, &sa[i]);
         need += ss[i] + vk_stage_align();
     }
     for (int i = 0; i < 8; i++)
@@ -819,7 +820,7 @@ rebind:
     setup_sub = vk_submit_number();
     if (deferred) {
         vk_buf_writable_abort();
-        set = vk_desc_alloc(g_vk_dslayout[shader_vk_set(ST_CS)]);
+        set = vk_desc_alloc(g_vk_dslayout[0][shader_vk_set(ST_CS)]);
         if (!set) {
             g_vk_cs_skipped++;
             return;
@@ -828,7 +829,7 @@ rebind:
         VkDescriptorSetAllocateInfo dai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                            .descriptorPool = g_dpool,
                                            .descriptorSetCount = 1,
-                                           .pSetLayouts = &g_vk_dslayout[shader_vk_set(ST_CS)]};
+                                           .pSetLayouts = &g_vk_dslayout[0][shader_vk_set(ST_CS)]};
         if (vkAllocateDescriptorSets(g_vk.dev, &dai, &set) != VK_SUCCESS) {
             cs_land();
             if (!VK_OK(vkAllocateDescriptorSets(g_vk.dev, &dai, &set))) return;
@@ -915,9 +916,8 @@ rebind:
     }
     VkCommandBuffer cb;
     if (gfx) {
-        /* textures from the compute engine's headers; texture handles from its texture constant buffer bank. Compute
-           shaders declare every texture as float (they aren't keyed on integer textures), and depth textures aren't
-           sampled here */
+        /* textures from the compute engine's headers; texture handles from its texture constant buffer bank. Their
+           number types are what the program was keyed on (vk_tex_num), and depth textures aren't sampled here */
         u64 tic_base = ((u64)rc[0x55D] << 32) | rc[0x55E], tsc_base = ((u64)rc[0x557] << 32) | rc[0x558];
         u32 tcb = rc[0x982] & 7;
         int fmt_used = 0;
@@ -993,15 +993,8 @@ rebind:
             }
             gmem_read(tic_base + (h & 0xFFFFF) * 32ull, tic, sizeof tic);
             Surf* t = vk_tex_from_tic(tic);
-            u64 image_bytes = vk_surf_guest_size(t);
-            VkComponentMapping identity = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-                                           VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-            VkImageView view = t && vk_surf_can_writeback(t) && t->storage_capable && t->f.raw && !t->f.depth &&
-                                       (p->si.img[i].kind ? t->f.vk == VK_FORMAT_R32_UINT : !t->f.is_int) &&
-                                       t->levels == 1 && t->depth3d == 1 && p->si.img[i].type == 3 && image_bytes &&
-                                       image_bytes <= UINT32_MAX
-                                   ? vk_tex_view(t, VK_IMAGE_VIEW_TYPE_2D, 0, &identity, 0)
-                                   : VK_NULL_HANDLE;
+            u64 image_bytes;
+            VkImageView view = vk_storage_image_view(t, &p->si, i, &image_bytes);
             if (!view) {
                 LOG_LIMIT(4, "vulkan: unsupported compute storage image (header word 0 %08x, kind %d, skipped)\n",
                           tic[0], p->si.img[i].kind);
@@ -1025,7 +1018,7 @@ rebind:
                 gmem_read(t->gva, originals[i], image_bytes);
             }
             vk_surf_use(vk_cmd(), t, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+                        VK_STORAGE_IMAGE_ACCESS);
             images[i] = t;
             ii[p->si.ntex + i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
             w[nw++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -1130,8 +1123,6 @@ rebind:
             memcpy(g_org + so[i], g_ar_ptr + so[i], ss[i]);
             g_out[g_nout++] = (CsOut){sa[i], so[i], ss[i]};
             pend_add(&g_pages, sa[i], ss[i], 1);
-            if (sa[i] < g_out_lo) g_out_lo = sa[i];
-            if (sa[i] + ss[i] > g_out_hi) g_out_hi = sa[i] + ss[i];
         }
     /* buffer images land like storage buffers: only the bytes the dispatch changed are written back */
     for (i = 0; i < p->si.nimg && i < 8 && !deferred; i++) {
@@ -1145,8 +1136,6 @@ rebind:
             g_out[g_nout].size = bimg[i].bytes;
             g_nout++;
             pend_add(&g_pages, bimg[i].gva, bimg[i].bytes, 1);
-            if (bimg[i].gva < g_out_lo) g_out_lo = bimg[i].gva;
-            if (bimg[i].gva + bimg[i].bytes > g_out_hi) g_out_hi = bimg[i].gva + bimg[i].bytes;
         }
     }
     if (gfx) {
@@ -1170,11 +1159,11 @@ rebind:
                                 .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT};
         VkDependencyInfo cdi = {
             .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &cmb};
-        vkCmdPipelineBarrier2(cb, &cdi);
+        rec_CmdPipelineBarrier2(cb, &cdi);
     }
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->p);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk_playout, 0, 1, &set, 0, NULL);
-    vkCmdDispatch(cb, gx, gy, gz);
+    rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p->p);
+    rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_vk_playout, 0, 1, &set, 0, NULL);
+    rec_CmdDispatch(cb, gx, gy, gz);
     if (deferred) {
         /* pending from here: the submit copies them where the host reads them (vk_buf_host_barrier) */
         vk_buf_writable_commit();
@@ -1190,7 +1179,7 @@ rebind:
                            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
                            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-    vkCmdPipelineBarrier2(cb, &di);
+    rec_CmdPipelineBarrier2(cb, &di);
     g_vk_dispatches++;
     if (gfx) {
         /* everything before it on the graphics queue runs first; then its results land at once */
@@ -1217,8 +1206,6 @@ rebind:
         }
         for (int i = 0; i < p->si.nimg; i++) free(originals[i]);
         g_nout = 0;
-        g_out_lo = ~0ull;
-        g_out_hi = 0;
         g_ar_used = 0;
         vkResetDescriptorPool(g_vk.dev, g_dpool, 0);
         g_landing = 0;

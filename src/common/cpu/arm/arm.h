@@ -216,7 +216,5 @@ typedef struct {
    (1 or 2), or 0 for a reserved/unpredictable encoding. */
 unsigned snx_thumb_decode(uint16_t hw1, uint16_t hw2, SnxThumb* out);
 unsigned snx_thumb_decode_profile(SnxArmProfile profile, uint16_t hw1, uint16_t hw2, SnxThumb* out);
-/* Explicitly unsupported backend, never falls back to the A64 decoder. */
-SnxArmExit snx_arm_gccjit_stub(void);
 
 #endif

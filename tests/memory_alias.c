@@ -5,6 +5,7 @@
    the same pages; the pool gives everything back; write tracking keeps working over remapped ranges. Skips (77)
    where the host has no pool */
 #include "nx/hle/kernel/kernel_int.h"
+#include "nx/hle/hle.h"
 #include "nx/gpu/gpu.h"
 #include "nx/runtime/clock.h"
 #include <dirent.h>
@@ -15,8 +16,6 @@
 
 #define MIB (1ull << 20)
 static unsigned checks;
-PMutex g_klock = PMUTEX_INIT;
-u64 g_title_id, g_sysres_size;
 int g_verbose;
 
 static void test_fail(const char* expr, int line) {
@@ -179,6 +178,14 @@ static void test_map_memory(u64 info) {
     CHECK(svc_map_memory(dst, src, 0x2000) == R_BADMEMSTATE);
     CHECK(mem_pool_used() == 0 && info_attr_perm(info, src, &perm) == 0 && perm == PERM_RW && gr32(src) == 0x7777);
     CHECK(mem_unmap(dst, 0x1000) == 0);
+    /* two sources side by side get neighbouring pool pages, and their blocks join: unmapping each gives its own back,
+       and a later view of heap across both works (Catherine's thread stacks failed to map in about 1 run in 3) */
+    CHECK(svc_map_memory(dst, src, 0x2000) == 0 && svc_map_memory(dst + 0x4000, src + 0x2000, 0x2000) == 0);
+    CHECK(mem_pool_used() == 0x4000);
+    CHECK(svc_unmap_memory(dst, src, 0x2000) == 0 && mem_pool_used() == 0x2000);
+    CHECK(svc_unmap_memory(dst + 0x4000, src + 0x2000, 0x2000) == 0 && mem_pool_used() == 0);
+    CHECK(svc_map_memory(dst, src + 0x1000, 0x2000) == 0 && svc_unmap_memory(dst, src + 0x1000, 0x2000) == 0);
+    CHECK(mem_pool_used() == 0 && gr32(src) == 0x7777);
 }
 
 /* code memory: the owner's writes are in the slave at once */
@@ -309,7 +316,13 @@ static void test_cycles(void) {
     check_tracking(HEAP_BASE, 0x3000); /* the heap's own pages beside it */
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+
 int main(void) {
+    hle_init();
     u64 info = STACK_BASE, off;
     u8* p;
     if (sysconf(_SC_PAGESIZE) != 4096) {

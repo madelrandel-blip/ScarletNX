@@ -29,7 +29,7 @@ The orchestrator applies your fixes without re-deriving them. A confident causal
 
 ## Expertise to apply
 - **Events**: X11/Wayland/SDL events are pumped on the main thread; input state shared with the HID update is read atomically or under a lock.
-- **Input**: the button bitmask the backends produce (A bit 0 ... Down bit 15) feeds `g_pad`; scripted input (`--script`) and real input combine.
+- **Input**: the button bitmask the backends produce (A bit 0 ... Down bit 15) feeds `g_hle.hid.pad1`; scripted input (`--script`) and real input combine.
 - **Unattended runs**: `--seconds`, `--frames` and `--shot` must exit cleanly with the screenshot written and hints saved.
 - **Portability**: Windows code (`_WIN32` parts, `plat_win32.c`, `profiler_win32.c`) still compiles there; a shared header change must not break them even though Linux only cross-builds them.
 

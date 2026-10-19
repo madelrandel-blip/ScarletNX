@@ -28,7 +28,7 @@ struct IniOpt {
     void (*set)(const IniOpt* o, const char* v);
     /* the menus' (the game's and the launcher's Settings), NULL where they show the key and the number: the label,
        and the words of lo, lo + step... between '|'. A word with '#' reads its value and the ones above it as the
-       number plus shift in the '#''s place ("Off|#%") */
+       number plus shift in the '#''s place ("Off|#%"). An INI_TEXT's words are its values, value=word between '|' */
     const char* name;
     const char* words;
     int step, shift;

@@ -19,8 +19,6 @@ typedef struct {
 unsigned snx_module_abi(void);
 /* 0 on success. LLVM is a required recompiler dependency. */
 int snx_build_module_llvm(SnxProgram* loaded, const SnxCodegenOptions* options, const SnxLlvmBuild* build);
-/* The libgccjit backend's entry point: reserved, it reports that it isn't implemented */
-int snx_build_module_gccjit(SnxProgram* loaded, const SnxCodegenOptions* options, const SnxLlvmBuild* build);
 /* A 32-bit program's module (module_arm.c): its AArch32 blocks and an SnxArmModule. LLVM only */
 int snx_build_module_arm(SnxProgram* loaded, const SnxCodegenOptions* options, const SnxLlvmBuild* build);
 

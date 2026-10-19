@@ -29,6 +29,7 @@
                  the shift in bits 60-63 of the first, the enable in bit 63 of the second
    A slot's planes are at registers 0x400 + slot * 0x60 (luma) and + 4 (chroma), the output's at 0x720 and 0x724 */
 #include "nx/gpu/video/host1x_int.h"
+#include "nx/gpu/video/vic.h"
 #include "nx/gpu/renderer.h"
 
 #define CFG_SIZE  0x610u
@@ -239,6 +240,87 @@ static void compose_cpu(const VicJob* j) {
                 for (k = 0; k < 2; k++) plane_wr(&j->oc, o + (k ^ vu), (u8)(px[1 + k] >> 2));
             }
         }
+}
+
+/* ------------------------------------------------ the shader's parameters (vic_params.glsl) */
+static VicGpuPlane gpu_plane(const VicPlane* p, u32 base) {
+    VicGpuPlane g;
+    memset(&g, 0, sizeof g);
+    g.base = base;
+    if (!p->p) return g; /* lim 0: nothing is read or written */
+    g.lim = (u32)p->lim;
+    g.blk = p->blk;
+    g.pitch = p->pitch;
+    g.bsh = 9 + p->bh;
+    g.ysh = 3 + p->bh;
+    g.gm = ((1u << p->bh) - 1) << 9;
+    g.bstride = ((p->pitch + 63) / 64) << g.bsh;
+    return g;
+}
+int vic_gpu_params(const VicJob* j, VicGpuParams* p, const u32 in_base[16], u32 oc_base) {
+    u32 yuv = j->fmt == FMT_NV12 || j->fmt == FMT_NV21, ovu = j->fmt == FMT_NV21, rb = j->fmt == FMT_ARGB ? 16 : 0;
+    u32 bg[4], s, n = 0;
+    VicGpuJob* g = &p->job;
+    memset(p, 0, sizeof *p);
+    for (s = 0; s < 4; s++) bg[s] = j->bg[s] >> 2;
+    g->nv12 = yuv;
+    g->rpos = rb;
+    g->gpos = yuv ? 8 * ovu : 8;
+    g->bpos = yuv ? 8 - 8 * ovu : 16 - rb;
+    g->tx0 = j->tx0;
+    g->tx1 = j->tx0 + j->tw;
+    g->ty0 = j->ty0;
+    g->th = j->th;
+    g->gx0 = j->tx0 & ~3u;
+    g->gy0 = j->ty0 & ~1u;
+    g->bgw = (bg[0] << g->rpos) | (bg[1] << 8) | (bg[2] << g->bpos) | (bg[3] << 24);
+    g->bgy = bg[0] * 0x01010101u;
+    g->bgc = ((bg[1] << g->gpos) | (bg[2] << g->bpos)) * 0x00010001u;
+    g->ol = gpu_plane(&j->oy, 0);
+    g->oc = gpu_plane(&j->oc, oc_base);
+    for (s = 0; s < 8; s++) {
+        const VicSlot* sl = &j->slots[s];
+        VicGpuSlot* o = &p->slots[n];
+        if (!sl->on) continue;
+        /* lo above hi clamps to lo below it and to hi above, which the shader's clamp of bytes can't. And the shader
+           writes the target rectangle alone, which holds every slot slot_resolve leaves on */
+        if (sl->mat_enable && sl->clamp_lo > sl->clamp_hi) return 0;
+        if (sl->dx0 < j->tx0 || sl->dx0 + sl->w > j->tx0 + j->tw || sl->dy0 < j->ty0 ||
+            sl->dy0 + sl->h > j->ty0 + j->th)
+            return 0;
+        n++;
+        o->dx0 = sl->dx0;
+        o->dx1 = sl->dx0 + sl->w;
+        o->dy0 = sl->dy0;
+        o->h = sl->h;
+        o->ox = sl->sx0 - sl->dx0;
+        o->oy = sl->sy0 - sl->dy0;
+        o->mat = sl->mat_enable != 0;
+        o->msh = (u32)sl->mat_shift;
+        o->ry = sl->mat[0][0] * 4, o->ru = sl->mat[0][1] * 4, o->rv = sl->mat[0][2] * 4, o->r3 = sl->mat[0][3];
+        o->gy = sl->mat[1][0] * 4, o->gu = sl->mat[1][1] * 4, o->gv = sl->mat[1][2] * 4, o->g3 = sl->mat[1][3];
+        o->by = sl->mat[2][0] * 4, o->bu = sl->mat[2][1] * 4, o->bv = sl->mat[2][2] * 4, o->b3 = sl->mat[2][3];
+        o->lo = (int)(sl->clamp_lo >> 2);
+        o->hi = (int)(sl->clamp_hi >> 2);
+        o->aw = (sl->alpha >> 2) << 24;
+        o->ush = 8 * sl->vu;
+        o->vsh = 8 - 8 * sl->vu;
+        o->cswap = sl->vu ^ ovu;
+        o->iy = gpu_plane(&sl->iy, in_base[2 * s]);
+        o->ic = gpu_plane(&sl->ic, in_base[2 * s + 1]);
+    }
+    g->nslots = n;
+    return 1;
+}
+
+/* the shader's build for word aligned rows needs every plane's rows to keep a word aligned column word aligned: block
+   linear rows do (bl_offset keeps the column's alignment), pitch linear ones when the pitch is a multiple of 4 */
+static int plane_aligned(const VicPlane* p) { return !p->p || p->blk || !(p->pitch & 3); }
+int vic_gpu_aligned(const VicJob* j) {
+    u32 s;
+    for (s = 0; s < 8; s++)
+        if (j->slots[s].on && !(plane_aligned(&j->slots[s].iy) && plane_aligned(&j->slots[s].ic))) return 0;
+    return plane_aligned(&j->oy) && plane_aligned(&j->oc);
 }
 
 /* SNX_NO_VIC_GPU set (and not 0): the CPU composes every job */

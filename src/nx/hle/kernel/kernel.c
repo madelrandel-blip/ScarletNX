@@ -6,13 +6,7 @@
    SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project */
 /* kernel objects and their references, the handle table, waiting on objects and waking, events */
 #include "nx/hle/kernel/kernel_int.h"
-
-PMutex g_klock;
-u64 g_title_id = 0x0100000000001000ull;
-u64 g_sysres_size;
-u64 g_next_tid = 0x50;
-SvcRec g_svc_ring[64];
-u32 g_svc_ring_n;
+#include "nx/hle/hle.h"
 
 /* ============================================================ references */
 void kobj_ref(KObj* o) {
@@ -25,58 +19,49 @@ void kobj_unref(KObj* o) {
 }
 
 /* ============================================================ the handle table */
-/* A handle is (linear id << 15) | index, as the console's: the linear id (1 to 0x7FFF, counting up and wrapping) tells
-   a stale handle from the one now in its slot, and bits 30 and 31 stay clear, so a handle fits the owner field of a
-   mutex word beside its waiters bit. 1024 entries is the most the console's table holds. Free entries are a list
-   through next, with -1 at its end; entries above h_top were never used (H_MAX, kernel_int.h) */
-typedef struct {
-    KObj* obj;
-    u16 linear;
-    i16 next;
-} HEntry;
-static HEntry g_htab[H_MAX];
-static int g_hfree = -1, g_htop;
-static u16 g_hlinear = 1;
+/* g_hle.kernel.htab, whose comment says how a handle is made: 1024 entries, the most the console's table holds */
 
-/* the one process, for the pseudo-handle: never destroyed, and never signaled, as the game never ends it */
-static int proc_signaled(KObj* o) {
+/* the one process, for the pseudo-handle (g_hle.kernel.process): never destroyed, and never signaled, as the game
+   never ends it */
+int kobj_never_signaled(KObj* o) {
     (void)o;
     return 0;
 }
-static KObj g_process = {KO_PROCESS, 1, NULL, proc_signaled, NULL, 0, 0, "process"};
 
 u32 h_new(KObj* o) {
     int i;
     u16 lin;
     if (!o) return 0;
-    pm_lock(&g_klock);
-    if (g_hfree >= 0) {
-        i = g_hfree;
-        g_hfree = g_htab[i].next;
-    } else if (g_htop < H_MAX)
-        i = g_htop++;
+    pm_lock(&g_hle.kernel.klock);
+    if (g_hle.kernel.hfree >= 0) {
+        i = g_hle.kernel.hfree;
+        g_hle.kernel.hfree = g_hle.kernel.htab[i].next;
+    } else if (g_hle.kernel.htop < H_MAX)
+        i = g_hle.kernel.htop++;
     else {
-        pm_unlock(&g_klock);
+        pm_unlock(&g_hle.kernel.klock);
         WARN_LIMIT(4, "kernel: the handle table is full (%d handles), %s gets none\n", H_MAX, o->name);
         return 0;
     }
-    lin = g_hlinear;
-    g_hlinear = lin == 0x7FFF ? 1 : (u16)(lin + 1);
-    g_htab[i].obj = o;
-    g_htab[i].linear = lin;
+    lin = g_hle.kernel.hlinear;
+    g_hle.kernel.hlinear = lin == 0x7FFF ? 1 : (u16)(lin + 1);
+    g_hle.kernel.htab[i].obj = o;
+    g_hle.kernel.htab[i].linear = lin;
     kobj_ref(o);
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
     return ((u32)lin << 15) | (u32)i;
 }
 /* the table's entry for h, or -1. Pseudo-handles have the reserved bits set, so they are never in it */
 static int h_index_nl(u32 h) {
     u32 i = h & 0x7FFF, lin = (h >> 15) & 0x7FFF;
-    if ((h >> 30) || !lin || i >= (u32)g_htop || !g_htab[i].obj || g_htab[i].linear != lin) return -1;
+    if ((h >> 30) || !lin || i >= (u32)g_hle.kernel.htop || !g_hle.kernel.htab[i].obj ||
+        g_hle.kernel.htab[i].linear != lin)
+        return -1;
     return (int)i;
 }
 KObj* h_get_nl(u32 h) {
     int i = h_index_nl(h);
-    return i < 0 ? NULL : g_htab[i].obj;
+    return i < 0 ? NULL : g_hle.kernel.htab[i].obj;
 }
 static KObj* h_resolve_nl(u32 h, int t) {
     KObj* o;
@@ -84,48 +69,41 @@ static KObj* h_resolve_nl(u32 h, int t) {
         KThread* cur = kthread_cur();
         o = cur ? &cur->o : NULL;
     } else if (h == H_CUR_PROC)
-        o = &g_process;
+        o = &g_hle.kernel.process;
     else
         o = h_get_nl(h);
     return o && (!t || o->type == t) ? o : NULL;
 }
-KObj* h_get(u32 h) {
-    KObj* o;
-    pm_lock(&g_klock);
-    o = h_resolve_nl(h, 0);
-    pm_unlock(&g_klock);
-    return o;
-}
 KObj* h_get_type(u32 h, int t) {
     KObj* o;
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     o = h_resolve_nl(h, t);
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
     return o;
 }
 KObj* h_get_ref(u32 h, int t) {
     KObj* o;
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     o = h_resolve_nl(h, t);
     kobj_ref(o);
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
     return o;
 }
 /* the table's reference goes after the lock is dropped: closing the last handle to a session destroys its service */
 int h_close(u32 h) {
     KObj* o;
     int i;
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     i = h_index_nl(h);
     if (i < 0) {
-        pm_unlock(&g_klock);
+        pm_unlock(&g_hle.kernel.klock);
         R_THROW(R_BADHANDLE);
     }
-    o = g_htab[i].obj;
-    g_htab[i].obj = NULL;
-    g_htab[i].next = (i16)g_hfree;
-    g_hfree = i;
-    pm_unlock(&g_klock);
+    o = g_hle.kernel.htab[i].obj;
+    g_hle.kernel.htab[i].obj = NULL;
+    g_hle.kernel.htab[i].next = (i16)g_hle.kernel.hfree;
+    g_hle.kernel.hfree = i;
+    pm_unlock(&g_hle.kernel.klock);
     kobj_unref(o);
     R_SUCCEED();
 }
@@ -187,7 +165,7 @@ int sleep_nl(KThread* t, i64 timeout) {
             if (!timeout || now >= end) return 0;
             left = (i64)(end - now);
         }
-        pc_wait(&t->cv, &g_klock, left);
+        pc_wait(&t->cv, &g_hle.kernel.klock, left);
     }
     return 1;
 }
@@ -196,13 +174,18 @@ int sleep_nl(KThread* t, i64 timeout) {
 static int ev_signaled(KObj* o) { return ((KEvent*)o)->signaled; }
 static void ev_destroy(KObj* o) {
     free(o->waiters);
-    free(o);
+    pm_lock(&g_hle.kernel.pool_lk);
+    POOL_PUT((KEvent*)o);
+    pm_unlock(&g_hle.kernel.pool_lk);
 }
-/* the readable end, with no reference: the first handle takes one, or the service that keeps it */
+/* the readable end, with no reference: the first handle takes one, or the service that keeps it. From
+   g_hle.kernel.events (KEVENT_MAX) */
 KEvent* kevent_new(const char* name) {
-    KEvent* e = calloc(1, sizeof *e);
-    if (!e) fatal("Out of memory for the event %s", name);
+    KEvent* e;
+    pm_lock(&g_hle.kernel.pool_lk);
+    e = (KEvent*)POOL_TAKE(g_hle.kernel.events, g_hle.kernel.event_next, "events");
     e->o.type = KO_EVENT;
+    pm_unlock(&g_hle.kernel.pool_lk);
     e->o.is_signaled = ev_signaled;
     e->o.destroy = ev_destroy;
     e->o.name = name;
@@ -212,13 +195,13 @@ KEvent* kevent_new(const char* name) {
    clear, when no thread can be waiting on it; the waiters are woken either way here, in case a service set the flag
    by itself */
 void kevent_signal(KEvent* e) {
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     e->signaled = 1;
     kobj_signal_nl(&e->o);
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
 }
 void kevent_clear(KEvent* e) {
-    pm_lock(&g_klock);
+    pm_lock(&g_hle.kernel.klock);
     e->signaled = 0;
-    pm_unlock(&g_klock);
+    pm_unlock(&g_hle.kernel.klock);
 }

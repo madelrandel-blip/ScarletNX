@@ -13,8 +13,8 @@
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/texture/astc.h"
 #include "nx/runtime/platform/log.h"
+#include "nx/runtime/main.h"
 #include "nx/runtime/platform/plat.h"
-#include <time.h>
 
 VkState g_vk;
 VkSemaphore g_vk_csem;
@@ -56,11 +56,15 @@ int gmem_read(u64 gva, void* dst, u64 size) {
     memset(dst, 0, size);
     return 0;
 }
-/* cmd.c times its waits */
-u64 plat_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (u64)ts.tv_sec * 1000000000u + (u64)ts.tv_nsec;
+/* one thread adds commands here, so record.c's drain has no other producer to keep out (device.c's vk_lock) */
+void vk_lock(void) {}
+void vk_unlock(void) {}
+/* plat_posix.c's crash handler, which the test never installs */
+void log_crash_mode(void) {}
+void crash_report(void* host_pc, void* fault, int sig) {
+    (void)host_pc;
+    (void)fault;
+    (void)sig;
 }
 void vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets) {
     sz[0] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets * 2};
@@ -198,7 +202,7 @@ static void compare(VkImage img, u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 dep
             VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
                                       .imageOffset = {0, (i32)(y * bh), (i32)z},
                                       .imageExtent = {w, rows, 1}};
-            vkCmdCopyImageToBuffer(vk_cmd(), img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+            rec_CmdCopyImageToBuffer(vk_cmd(), img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
             vk_finish();
             vk_readback_ready();
             astc_decode_image(blocks + ((size_t)z * ny + y) * nx * 16, w, rows, bw, bh, expected, srgb);

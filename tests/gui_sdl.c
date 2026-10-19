@@ -130,11 +130,13 @@ static void splash_drawn(App* app, const SDL_Rect* view, const SnxSplashSvg* svg
     free(drawing);
     SDL_DestroySurface(image);
 }
-/* text in color anywhere on the render, glyph by glyph in the font's own bytes: its ink pixels in color, the others
-   not (a box's frame may cross the font's last row, which is empty); 1 and where it starts, else 0 */
-static int find_text(App* app, const char* text, SDL_Color color, int size, int* at_x, int* at_y) {
+/* the 16 rows of the menu font's glyph c: CP437's, then the Latin letters past it (gui_menu_glyph) */
+static const uint8_t* font_rows(int c) { return c < 256 ? gui_vga_font + c * 16 : gui_latin_font + (c - 256) * 16; }
+/* n glyphs in color anywhere on the render: their ink pixels in color, the others not (a box's frame may cross the
+   font's last row, which is empty); 1 and where they start, else 0 */
+static int find_glyphs(App* app, const int* text, int n, SDL_Color color, int size, int* at_x, int* at_y) {
     SDL_Surface *read = SDL_RenderReadPixels(app->renderer, NULL), *image;
-    int s = app->scale * size, n = (int)strlen(text), first = -1, fx = 0, fy = 0, found = 0, x, y;
+    int s = app->scale * size, first = -1, fx = 0, fy = 0, found = 0, x, y;
     assert(read);
     image = SDL_ConvertSurface(read, SDL_PIXELFORMAT_RGBA32);
     SDL_DestroySurface(read);
@@ -144,7 +146,7 @@ static int find_text(App* app, const char* text, SDL_Color color, int size, int*
     for (int i = 0; i < n && first < 0; ++i) /* the first ink, to look for */
         for (int gy = 0; gy < 15 && first < 0; ++gy)
             for (int gx = 0; gx < 8 && first < 0; ++gx)
-                if (gui_vga_font[(unsigned char)text[i] * 16 + gy] & (0x80 >> gx)) {
+                if (font_rows(text[i])[gy] & (0x80 >> gx)) {
                     first = i;
                     fx = (i * 8 + gx) * s;
                     fy = gy * s;
@@ -157,7 +159,7 @@ static int find_text(App* app, const char* text, SDL_Color color, int size, int*
             for (int i = 0; found && i < n; ++i)
                 for (int gy = 0; found && gy < 15; ++gy)
                     for (int gx = 0; found && gx < 8; ++gx) {
-                        int ink = (gui_vga_font[(unsigned char)text[i] * 16 + gy] & (0x80 >> gx)) != 0;
+                        int ink = (font_rows(text[i])[gy] & (0x80 >> gx)) != 0;
                         found = ink == SNX_IS(SNX_AT(x + (i * 8 + gx) * s, y + gy * s));
                     }
             if (found) {
@@ -169,6 +171,25 @@ static int find_text(App* app, const char* text, SDL_Color color, int size, int*
 #undef SNX_AT
     SDL_DestroySurface(image);
     return found;
+}
+/* text in color, glyph by glyph in the font's own bytes (CP437) */
+static int find_text(App* app, const char* text, SDL_Color color, int size, int* at_x, int* at_y) {
+    int glyphs[256], n = 0;
+    while (text[n]) {
+        assert(n < 256);
+        glyphs[n] = (unsigned char)text[n];
+        ++n;
+    }
+    return find_glyphs(app, glyphs, n, color, size, at_x, at_y);
+}
+/* UTF-8 text in color, a glyph each letter as the menu draws it (gui_menu_glyph), size times the text's letters */
+static int find_letters(App* app, const char* text, SDL_Color color, int size, int* at_x, int* at_y) {
+    int glyphs[256], n = 0;
+    while (*text) {
+        assert(n < 256);
+        glyphs[n++] = gui_menu_glyph(SDL_StepUTF8(&text, NULL));
+    }
+    return find_glyphs(app, glyphs, n, color, size, at_x, at_y);
 }
 /* the text drawn, or not, in color, its letters size times the text's: a check that fails names its line */
 #define shows(app, text, color)           shows_at(__LINE__, app, text, color, 1, 1)
@@ -329,9 +350,8 @@ static void app_select(App* app, int row) {
     key(app, SDLK_RETURN);
     if (app->editing && app->form == GUI_FORM_APP) leave_editor(app);
 }
-/* the launcher's own two Settings on or off */
+/* the launcher's gdbstub on or off */
 static void launcher(App* app, bool on) {
-    assert(gui_settings_set(&app->settings, "libgccjit", on && SNX_GUI_HAS_GCCJIT ? "on" : "off"));
     assert(gui_settings_set(&app->settings, "gdbstub", on ? "on" : "off"));
 }
 /* the focus on the game of Games named name, its page shown */
@@ -794,13 +814,13 @@ static void step_line(void) {
     char runs[3][112];
     size_t lengths[3];
     memset(&s, 0, sizeof s);
-    snprintf(s.label, sizeof s.label, "UNPACK");
+    snprintf(s.label, sizeof s.label, "EXTRACT");
     snprintf(s.detail, sizeof s.detail, "Game.xci");
     s.value = 1024;
     s.total = 4096;
     s.megabytes = 1;
     step_runs(&s, GUI_PROGRESS_PERCENT, 0, runs, lengths);
-    assert(!strcmp(runs[0], "UNPACK:") && !strcmp(runs[1], " GAME.XCI") && !strcmp(runs[2], " 25%"));
+    assert(!strcmp(runs[0], "EXTRACT:") && !strcmp(runs[1], " GAME.XCI") && !strcmp(runs[2], " 25%"));
     step_runs(&s, GUI_PROGRESS_AMOUNT, 0, runs, lengths);
     assert(!strcmp(runs[2], " 1.0 / 4.0 GB") && lengths[2] == 13);
     s.state = GUI_STEP_DONE;
@@ -836,7 +856,8 @@ int main(int argc, char** argv) {
               "Graphics\tresolution\t1\tfloat\t0.25\t4\tInternal 3D resolution\t\t\n"
               "On-screen controls\tcontrols\t0\tint\t0\t1\tThe on-screen controls\tShow controls\t0=Off|1=On\n"
               "On-screen controls/Buttons\tcontrols_a_shown\t\tint\t0\t1\tA control drawn\tA\t0=Hidden|1=Shown\n"
-              "On-screen controls/Buttons\tcontrols_b_shown\t\tint\t0\t1\tA control drawn\tB\t0=Hidden|1=Shown\n",
+              "On-screen controls/Buttons\tcontrols_b_shown\t\tint\t0\t1\tA control drawn\tB\t0=Hidden|1=Shown\n"
+              "User\tuser\t1\tint\t1\t8\tThe console's user the game plays as\t\t\n",
               stdout);
         return 0;
     }
@@ -871,7 +892,6 @@ int main(int argc, char** argv) {
     }
     if (argc > 2 && !strcmp(argv[1], "-r") && strstr(argv[2], "room dump")) { /* R's, its room asked: not played */
         int i = 3;
-        if (SNX_GUI_HAS_GCCJIT) assert(!strcmp(argv[i++], "--backend=gcc"));
         assert(i + 2 == argc && !strcmp(argv[i], "--repo") && argv[i + 1][0]);
         puts("Recompiling room dump");
         return 0;
@@ -889,9 +909,7 @@ int main(int argc, char** argv) {
     }
     if (argc > 1 && strstr(argv[1], "option flags")) {
         int i = 2;
-        assert(argc == 8 + SNX_GUI_HAS_GCCJIT && !strcmp(argv[i++], "--fullscreen=1") &&
-               !strcmp(argv[i++], "--controls=0"));
-        if (SNX_GUI_HAS_GCCJIT) assert(!strcmp(argv[i++], "--backend=gcc"));
+        assert(argc == 8 && !strcmp(argv[i++], "--fullscreen=1") && !strcmp(argv[i++], "--controls=0"));
         assert(!strcmp(argv[i++], "-S") && !strcmp(argv[i++], "-s"));
         assert(!strcmp(argv[i++], "--repo") && argv[i++][0] && i == argc);
         puts("Recompiling option flags\nScarletNX - option flags"); /* the runner's banner: now loading */
@@ -900,7 +918,6 @@ int main(int argc, char** argv) {
     if (argc > 2 && !strcmp(argv[1], "-r") && strstr(argv[2], "folder game")) { /* R on it: recompiled, not played */
         int i = 3;
         assert(strstr(argv[0], "runtime") && snx_is_file(argv[2]));
-        if (SNX_GUI_HAS_GCCJIT) assert(!strcmp(argv[i++], "--backend=gcc"));
         assert(i + 2 == argc && !strcmp(argv[i], "--repo") && argv[i + 1][0]);
         puts("Recompiling folder game (1 modules)\nBuilt folder game");
         return 0;
@@ -1260,7 +1277,7 @@ int main(int argc, char** argv) {
     /* Settings: the launcher's own, then each setting the runtime lists, a row each with its help above; what the
        menu's items used to set is in them */
     key(&app, SDLK_SPACE);
-    assert(app.editing && app.editor.object && app.editor.count == GUI_SETTINGS_OWN + 3);
+    assert(app.editing && app.editor.object && app.editor.count == 6); /* User the last */
     /* and the disk: what ScarletNX's folders take, counted on a thread, and what is left */
     {
         char line[256], used[32], left[32];
@@ -1302,7 +1319,7 @@ int main(int argc, char** argv) {
     /* the groups first: App, then a group per section the runtime lists, and the reset of them all; beside them the
        focused group's rows, in the tips what it holds */
     render(&app);
-    assert(app.form == GUI_FORM_SETTINGS && app.groups == 5 && gui_editor_rows(&app.editor) == 6);
+    assert(app.form == GUI_FORM_SETTINGS && app.groups == 6 && gui_editor_rows(&app.editor) == 7);
     shows(&app, "SETTINGS", normal);
     shows(&app, "The theme, the menu's", normal);
     shows(&app, "- App", yellow);
@@ -1310,30 +1327,33 @@ int main(int argc, char** argv) {
     shows(&app, "- Display", normal);
     shows(&app, "- Graphics", normal);
     shows(&app, "- On-screen controls", normal);
+    shows(&app, "- User", normal);
     shows(&app, "- Reset all to the defaults", normal);
     hides(&app, "\x1e", rgb(app.theme.soft)); /* every row shows: no arrows */
     hides(&app, "\x1f", rgb(app.theme.soft));
     key(&app, SDLK_DOWN);
     render(&app);
-    shows(&app, "libgccjit, gdbstub", normal); /* a group's help names its settings */
-    key(&app, SDLK_RIGHT);                     /* a group opens with Enter only */
+    shows(&app, "gdbstub, Extract to tmpfs", normal); /* a group's help names its settings */
+    key(&app, SDLK_RIGHT);                            /* a group opens with Enter only */
     assert(app.form == GUI_FORM_SETTINGS);
     key(&app, SDLK_RETURN);
     /* a group's settings on the right, a row each with its help in the tips; the group named over them */
     assert(app.form == GUI_FORM_GROUP && app.group == 1 && app.editor.count == GUI_SETTINGS_OWN);
     render(&app);
     shows(&app, "Launch", normal);
-    shows(&app, SNX_GUI_HAS_GCCJIT ? "libgccjit will be" : "Program was not", normal); /* in the tips */
-    shows(&app, "- libgccjit off", yellow);
+    shows(&app, "Enables gdbstub", normal); /* in the tips */
+    shows(&app, "- gdbstub ", yellow); /* its value in the column after the longest name, Extract to tmpfs's */
+    shows(&app, "- Extract to tmpfs off", normal);
     key(&app, SDLK_RIGHT);
-    assert(setting_is(&app, "libgccjit", SNX_GUI_HAS_GCCJIT ? "on" : NULL));
+    assert(setting_is(&app, "gdbstub", "on"));
     key(&app, SDLK_LEFT);
-    assert(!gui_settings_value(&app.settings, "libgccjit"));
-    point(&app, row_box(&app, 1, true), true); /* a click focuses a row, one on the focused row changes it */
-    assert(app.editor.row == 1 && !gui_settings_value(&app.settings, "gdbstub"));
+    assert(!gui_settings_value(&app.settings, "gdbstub"));
+    key(&app, SDLK_DOWN);
     render(&app);
-    shows(&app, "Enables gdbstub", normal);
-    point(&app, row_box(&app, 1, true), true);
+    shows(&app, "Extract to t", normal); /* the tips follow the focus, the row itself yellow */
+    point(&app, row_box(&app, 0, true), true); /* a click focuses a row, one on the focused row changes it */
+    assert(app.editor.row == 0 && !gui_settings_value(&app.settings, "gdbstub"));
+    point(&app, row_box(&app, 0, true), true);
     assert(setting_is(&app, "gdbstub", "on"));
     key(&app, SDLK_RETURN);
     assert(!gui_settings_value(&app.settings, "gdbstub"));
@@ -1422,7 +1442,7 @@ int main(int argc, char** argv) {
     /* App: the theme and the letters, either way round, and the theme editor, which comes back here */
     app.editor.row = 0;
     key(&app, SDLK_RETURN);
-    assert(app.form == GUI_FORM_APP && app.editor.row == GUI_APP_THEME && GUI_APP_ROWS == 6);
+    assert(app.form == GUI_FORM_APP && app.editor.row == GUI_APP_THEME && GUI_APP_ROWS == 7);
     {
         char first[64], line[1024];
         snprintf(first, sizeof first, "%s", app.theme.name);
@@ -1431,6 +1451,7 @@ int main(int argc, char** argv) {
         snprintf(line, sizeof line, "- %-18s %s", "Theme", first);
         shows(&app, line, yellow);
         shows(&app, "- Text size          Auto", normal);
+        shows(&app, "- Language           Auto: English", normal); /* SDL_PREFERRED_LOCALES, the test's */
         shows(&app, "- Theme editor", normal);
         /* under the rows, the three folders Folders moves, whole: the extractions too */
         shows(&app, "- Folders            Defaults", normal);
@@ -1484,8 +1505,10 @@ int main(int argc, char** argv) {
         key(&app, SDLK_RIGHT); /* the next theme */
         snprintf(id, sizeof id, "%s", app.theme.id);
         assert(strcmp(id, first_id));
-        snprintf(expected, sizeof expected,
-                 "; Settings > App in the launcher, as they were left\n[app]\ntheme = %s\ntext_size = 1\n", id);
+        snprintf(
+            expected, sizeof expected,
+            "; Settings > App in the launcher, as they were left\n[app]\ntheme = %s\ntext_size = 1\nlanguage = auto\n",
+            id);
         kept = (char*)snx_read_file(app.app_file, &size);
         assert(kept && size == strlen(expected) && !memcmp(kept, expected, size));
         free(kept);
@@ -1501,7 +1524,8 @@ int main(int argc, char** argv) {
         key(&app, SDLK_LEFT);
         assert(!strcmp(app.theme.id, first_id) && !app.menu.text_size && !app.editor.note[0]);
         snprintf(expected, sizeof expected,
-                 "; Settings > App in the launcher, as they were left\n[app]\ntheme = %s\ntext_size = auto\n",
+                 "; Settings > App in the launcher, as they were left\n[app]\ntheme = %s\ntext_size = auto\n"
+                 "language = auto\n",
                  first_id);
         kept = (char*)snx_read_file(app.app_file, &size);
         assert(kept && size == strlen(expected) && !memcmp(kept, expected, size));
@@ -1530,6 +1554,88 @@ int main(int argc, char** argv) {
         remove(blocker);
         free(blocker);
         app.editor.note[0] = 0;
+    }
+    /* Language: Auto (the system's: English here, SDL_PREFERRED_LOCALES), English, then the test's xx (tests/po), round
+       either way; kept in app.ini and read back; its words on the screens, a key of the foot found by its own */
+    {
+        size_t size = 0;
+        char *kept, expected[512], line[128];
+        const char* other = "[app]\nlanguage = xx\n";
+        const char* unknown = "[app]\nlanguage = tlh\n";
+        open_app(&app, GUI_APP_LANGUAGE);
+        assert(!app.language && snx_tr_language() == 0 && !strcmp(app.app_form.language, "Auto: English"));
+        key(&app, SDLK_RIGHT);
+        assert(app.language == 1 && snx_tr_language() == 0 && !strcmp(app.app_form.language, "English"));
+        key(&app, SDLK_RETURN); /* Enter goes round too */
+        assert(app.language == 2 && snx_tr_language() == 1 && !strcmp(app.app_form.language, "Test\303\252s"));
+        snprintf(expected, sizeof expected,
+                 "; Settings > App in the launcher, as they were left\n[app]\ntheme = %s\ntext_size = auto\n"
+                 "language = xx\n",
+                 app.theme.id);
+        kept = (char*)snx_read_file(app.app_file, &size);
+        assert(kept && size == strlen(expected) && !memcmp(kept, expected, size));
+        free(kept);
+        render(&app);
+        /* the labels' columns as they read: xx's Language, its i accented, is 6 of them in 7 bytes (the font's one) */
+        snprintf(line, sizeof line, "- L\241ngua%12s Test", "");
+        shows(&app, line, yellow);
+        shows(&app, "- Text size", normal); /* not translated in xx: English */
+        shows(&app, "Ajustes", yellow);     /* the tab */
+        shows_foot(&app, "linha", normal);
+        shows_foot(&app, "tela", normal);
+        hides_foot(&app, "change or open", normal);
+        key(&app, SDLK_RIGHT);
+        assert(!app.language && snx_tr_language() == 0); /* Auto again: English */
+        key(&app, SDLK_LEFT);
+        assert(app.language == 2 && snx_tr_language() == 1);
+        /* a start with them: xx as it was left, a language the menu does not have named and left out */
+        app.language = 0;
+        language_apply(&app);
+        assert(!snx_write_file(app.app_file, other, strlen(other)));
+        app.message[0] = 0;
+        app_load(&app);
+        assert(app.language == 2 && snx_tr_language() == 1 && !app.message[0]);
+        assert(!snx_write_file(app.app_file, unknown, strlen(unknown)));
+        app_load(&app);
+        assert(app.language == 2 && snx_tr_language() == 1);
+        snprintf(expected, sizeof expected, "Fora de uso em %s: language = tlh", app.app_file); /* in xx: its words */
+        assert(!strcmp(app.message, expected));
+        app.message[0] = 0;
+        /* the foot's Back, as xx says it, presses Back: the App's rows left for the groups */
+        assert(hint_press(&app, "Volta", 0) && app.editing && app.form == GUI_FORM_SETTINGS);
+        assert(hint_press(&app, "Back", 0) && !app.editing); /* and as English does */
+        /* Auto: the first of the system's languages the menu has, for its country or another; English for none. Over
+           the test's SDL_PREFERRED_LOCALES, which a hint of normal priority does not override */
+        SDL_SetHintWithPriority(SDL_HINT_PREFERRED_LOCALES, "ja_JP,xx_YY,en_US", SDL_HINT_OVERRIDE);
+        assert(language_auto() == 1);
+        SDL_SetHintWithPriority(SDL_HINT_PREFERRED_LOCALES, "ja_JP,en_US,xx", SDL_HINT_OVERRIDE);
+        assert(language_auto() == 0);
+        SDL_SetHintWithPriority(SDL_HINT_PREFERRED_LOCALES, "ja_JP", SDL_HINT_OVERRIDE);
+        assert(language_auto() == 0);
+        SDL_ResetHint(SDL_HINT_PREFERRED_LOCALES); /* the test's own again, en_US */
+        assert(language_auto() == 0);
+        /* English for what follows, kept so, on App as the next part opens it */
+        open_app(&app, GUI_APP_LANGUAGE);
+        key(&app, SDLK_RIGHT);
+        assert(!app.language && snx_tr_language() == 0);
+    }
+    /* the Latin letters past CP437 drawn from Unifont's glyphs (latin.h), the a and the o with a tilde beside CP437's
+       c with a cedilla, by each way the menu draws a line: at a cell, in a box, and in the title's bigger letters */
+    {
+        static const char words[] = "n\303\243o a\303\247\303\265es";
+        SDL_Color white = {255, 255, 255, 255};
+        int x, y, w = cell_w(&app), h = cell_h(&app);
+        SDL_SetRenderDrawColor(app.renderer, 0, 0, 0, 255);
+        SDL_RenderClear(app.renderer);
+        text(&app, 2, 1, words, white);
+        assert(find_letters(&app, words, white, 1, &x, &y) && x == 2 * w && y == h);
+        assert(!find_text(&app, "n?o a\207?es", white, 1, &x, &y)); /* not CP437's question marks */
+        SDL_RenderClear(app.renderer);
+        text_in(&app, gui_rect(0, 0, 40 * w, 4 * h), 3 * w, 2 * h, words, white);
+        assert(find_letters(&app, words, white, 1, &x, &y) && x == 3 * w && y == 2 * h);
+        SDL_RenderClear(app.renderer);
+        big_text(&app, gui_rect(0, 0, 60 * w, 6 * h), w, h, words, 2, white);
+        assert(find_letters(&app, words, white, 2, &x, &y) && x == w && y == h);
     }
     /* Clean old settings, Enter twice: the first says what it would do, another key in between starts again, the
        second does it and shows what it did over the screen, until a key closes it; then there is nothing left */
@@ -1581,7 +1687,9 @@ int main(int argc, char** argv) {
         shows(&app, "Clean old settings: 3 done", title);
         shows(&app, "[Deprecated] taken out", rgb(app.theme.soft));
         shows(&app, "- OK", yellow);
-        key(&app, SDLK_DOWN); /* closes it, and does nothing else */
+        key(&app, SDLK_DOWN); /* the three show: nothing to go to */
+        assert(app.cleaned_shown && !app.files_top && app.editor.row == GUI_APP_CLEAN);
+        key(&app, SDLK_LEFT); /* closes it, and does nothing else */
         assert(!app.cleaned_shown && app.editing && app.form == GUI_FORM_APP && app.editor.row == GUI_APP_CLEAN);
         render(&app);
         hides(&app, "Clean old settings: 3 done", title);
@@ -2185,8 +2293,8 @@ int main(int argc, char** argv) {
         free(games);
     }
 
-    /* a dump not extracted yet, with less room than its extraction and RomFS copy take: asked first, Run anyway
-       pressed twice; Back runs nothing. With room, extracted already or an NRO, it runs at once */
+    /* a dump not extracted yet, with less room than its extraction takes (straight into its game's folder: once):
+       asked first, Run anyway pressed twice; Back runs nothing. With room, made already or an NRO, it runs at once */
     {
         char *dump = snx_path_join(temporary, "room dump.nsp"), *nro = snx_path_join(temporary, "room dump.nro");
         char *work_was = app.work_dir, *games_was = app.games_dir, *out;
@@ -2199,11 +2307,11 @@ int main(int argc, char** argv) {
         app.games_dir = snx_path_join(temporary, "room games");
         app.menu.selected = GUI_SWITCH;
         launcher(&app, true);
-        app.room_free = 4u << 20; /* 6 MB to take */
+        app.room_free = 2u << 20; /* 3 MB to take */
         launch(&app, snx_strdup(dump), false);
         assert(!app.menu.running && app.confirm.shown && app.confirm.ask == GUI_ASK_ROOM && app.room_file);
         render(&app);
-        shows(&app, "Needs about 6 MB, 4 MB free.", rgb(app.theme.warning));
+        shows(&app, "Needs about 3 MB, 2 MB free.", rgb(app.theme.warning));
         shows(&app, "- Back", yellow);
         shows(&app, "- Run anyway", normal);
         key(&app, SDLK_RETURN);
@@ -2236,7 +2344,7 @@ int main(int argc, char** argv) {
         touch_box(&app, list_box(&l, 1));
         assert(!app.confirm.shown && app.menu.running);
         finish(&app, 0);
-        app.room_free = 6u << 20;
+        app.room_free = 3u << 20;
         launch(&app, snx_strdup(dump), false);
         assert(!app.confirm.shown && app.menu.running);
         finish(&app, 0);
@@ -2244,11 +2352,17 @@ int main(int argc, char** argv) {
         launch(&app, snx_strdup(nro), false);
         assert(!app.confirm.shown && app.menu.running);
         finish(&app, 0);
-        out = dump_out(&app, dump, NULL);
-        assert(!snx_mkdirs(out));
-        launch(&app, snx_strdup(dump), false);
-        assert(!app.confirm.shown && app.menu.running);
-        finish(&app, 0);
+        out = snx_path_join(app.games_dir, "0100ABCD12345000"); /* made already: its folder links to the dump */
+        {
+            char* link = snx_path_join(out, "0100ABCD12345000.source");
+            assert(!snx_mkdirs(out));
+            if (!snx_symlink(dump, link)) { /* Windows without the right to make one: none to test */
+                launch(&app, snx_strdup(dump), false);
+                assert(!app.confirm.shown && app.menu.running);
+                finish(&app, 0);
+            }
+            free(link);
+        }
         assert(!snx_remove_tree(out));
         free(out);
         app.room_free = 0;
@@ -3741,7 +3855,7 @@ int main(int argc, char** argv) {
             render(&app);
             form_boxes(&app, &f);
             text_px_is(&app, f.place.side.x + cw, f.place.side.y + 2 * s, "Launch", normal, black);
-            text_px_is(&app, list_box(&f.right, 0).x + cw / 2, item_text_y(&app, list_box(&f.right, 0)), "- libgccjit",
+            text_px_is(&app, list_box(&f.right, 0).x + cw / 2, item_text_y(&app, list_box(&f.right, 0)), "- gdbstub",
                        normal, black);
             key(&app, SDLK_RETURN);
             assert(app.form == GUI_FORM_GROUP && app.group == launch && !app.editor.row);
@@ -3750,7 +3864,7 @@ int main(int argc, char** argv) {
             b = list_box(&f.left, launch);
             text_px_is(&app, b.x + cw / 2, item_text_y(&app, b), "- Launch", yellow, black); /* the group open */
             b = list_box(&f.right, 0);
-            text_px_is(&app, b.x + cw / 2, item_text_y(&app, b), "- libgccjit", yellow, black);
+            text_px_is(&app, b.x + cw / 2, item_text_y(&app, b), "- gdbstub", yellow, black);
             {
                 char start[16]; /* in the tips, its first row: in the foot here, in its letters */
                 snprintf(start, sizeof start, "%s", app.settings.keys[0].about);
@@ -3760,11 +3874,11 @@ int main(int argc, char** argv) {
             launcher(&app, false);
             b = list_box(&f.right, 1);
             mouse_px(&app, b.x + 4, b.y + 4, true);
-            assert(app.form == GUI_FORM_GROUP && app.editor.row == 1 && setting_is(&app, "gdbstub", NULL));
+            assert(app.form == GUI_FORM_GROUP && app.editor.row == 1 && setting_is(&app, "tmpfs", NULL));
             mouse_px(&app, b.x + 4, b.y + 4, true);
-            assert(setting_is(&app, "gdbstub", "on"));
+            assert(setting_is(&app, "tmpfs", "on"));
             key(&app, SDLK_LEFT); /* back as it was */
-            assert(setting_is(&app, "gdbstub", NULL));
+            assert(setting_is(&app, "tmpfs", NULL));
             /* a click on App in the list opens it, from a group's rows */
             b = list_box(&f.left, 0);
             mouse_px(&app, b.x + 4, b.y + 4, true);
@@ -3879,8 +3993,10 @@ int main(int argc, char** argv) {
                 text_px_is(&app, r.x + cw + 2 * cw, r.y + head_h(&app) + 4 * s + 16 * s, "counting",
                            rgb(app.theme.soft), black);
             }
-            key(&app, SDLK_DOWN);
-            assert(!app.left_shown && app.menu.selected == GUI_EXIT); /* the key closed it and did nothing else */
+            key(&app, SDLK_DOWN); /* one file: nothing to go to */
+            assert(app.left_shown && app.menu.selected == GUI_EXIT);
+            key(&app, SDLK_RETURN);
+            assert(!app.left_shown && app.menu.selected == GUI_EXIT && !app.confirm.shown); /* closed, nothing else */
             free(app.left);
             app.left = NULL;
             app.lefts = 0;
@@ -4069,12 +4185,12 @@ int main(int argc, char** argv) {
             press_key(&app, "Enter", 0, false, yellow);
             assert(app.form == GUI_FORM_GROUP && app.group == launch && !app.editor.row);
             press_key(&app, "Up/Down", 5, false, yellow);
-            assert(app.editor.row == 1 && !strcmp(app.settings.keys[app.first + 1].key, "gdbstub"));
-            assert(gui_settings_set(&app.settings, "gdbstub", "off"));
+            assert(app.editor.row == 1 && !strcmp(app.settings.keys[app.first + 1].key, "Extract to tmpfs"));
+            assert(gui_settings_set(&app.settings, "tmpfs", "off"));
             press_key(&app, "Left/Right", 6, false, yellow);
-            assert(setting_is(&app, "gdbstub", "on"));
+            assert(setting_is(&app, "tmpfs", "on"));
             press_key(&app, "Del", 0, false, yellow);
-            assert(setting_is(&app, "gdbstub", NULL));
+            assert(setting_is(&app, "tmpfs", NULL));
             press_key(&app, "ESC", 0, false, yellow);
             assert(app.editing && app.form == GUI_FORM_SETTINGS);
             press_key(&app, "ESC", 0, false, yellow);
@@ -4175,6 +4291,29 @@ int main(int argc, char** argv) {
         app.theme.tips_wrap = true;
         render(&app);
         shows_foot(&app, "its rows.", page);
+        /* longer than the foot's rows: its last row slides what is left, which nothing else would show */
+        {
+            int fs = foot_scale(&app), cols = r.w / (8 * fs), n = 0, x, y, found, scale = app.scale, over;
+            const char* rest = app.message;
+            while (n < 6 * cols) n += snprintf(app.message + n, sizeof app.message - (size_t)n, "a row of words ");
+            snprintf(app.message + n, sizeof app.message - (size_t)n, "and its end.");
+            render(&app);
+            menu_boxes(&app, &m);
+            r = foot_room(&app, m.place.tips, app.theme.tips_box);
+            hides_foot(&app, "its end.", page);
+            for (int row = 1; row < r.h / (16 * fs); ++row) /* the rows over the last, as they wrap */
+                for (rest += wrap_at(rest, cols, 0); *rest == ' ';) ++rest;
+            over = (int)SDL_utf8strlen(rest) - cols;
+            assert(r.h >= 2 * 16 * fs && over > 0);
+            for (app.clock = 1; gui_slide(over, app.clock, app.theme.scroll_ms) != over;)
+                app.clock += app.theme.scroll_ms;
+            render(&app);
+            app.scale = fs;
+            found = find_text(&app, "and its end.", page, 1, &x, &y);
+            app.scale = scale;
+            assert(found && x + 12 * 8 * fs == r.x + cols * 8 * fs && y == r.y + r.h / (16 * fs) * 16 * fs - 16 * fs);
+            app.clock = 1;
+        }
         app.theme.tips_wrap = false;
         app.message[0] = 0;
         app.clock = 0;
@@ -4191,10 +4330,95 @@ int main(int argc, char** argv) {
                    !wrap_in(&app, gui_rect(0, 0, 10 * cw, 8), 0, 0, many, 0, ink));
             app.theme.text = GUI_TEXT_WRAP;
         }
-        /* its title twice the text's size, in the row of tabs against its right; with its shadow, in the dim colour a big
-           pixel down and right */
+        /* the users of the app's users/: Aogo and Xuji. The head shows Settings' user, 1, in a box at its right */
+        {
+            char* users = snx_path_join(temporary, "users");
+            char* ini = snx_path_join(users, "users.ini");
+            static const char text[] =
+                "[user1]\nnickname=Aogo\n[user2]\nuid=5f3c0d9e8a7b41c2963e0f1a2b3c4d5e\nnickname=Xuji\n";
+            assert(!snx_mkdirs(users) && !snx_write_file(ini, text, sizeof text - 1));
+            free(app.users_dir);
+            app.users_dir = users;
+            users_read(&app);
+            free(ini);
+            render(&app);
+            menu_boxes(&app, &m);
+        }
+        /* its title twice the text's size, in the row of tabs against its right, or two columns before the user
+           there; with its shadow, in the dim colour a big pixel down and right */
         r = m.place.title;
-        assert(r.h == 2 * 16 * s && r.x + r.w == m.place.head.x + m.place.head.w && r.y < m.place.tabs.y);
+        assert(app.user == 1 && !strcmp(app.user_name, "Aogo") && m.place.badge.h == r.h);
+        assert(m.place.badge.x + m.place.badge.w == m.place.head.x + m.place.head.w);
+        assert(r.h == 2 * 16 * s && r.x + r.w == m.place.badge.x - 2 * cw && r.y < m.place.tabs.y);
+        { /* the box framed in the dim colour and filled with the page's, as YoRHa's boxes; the nickname a column in, in
+             ink; Wimsy (no users/<uid>.jpg) against its right, two pixels in */
+            GuiRect b = m.place.badge;
+            int nx, ny, side = b.h - 4 * s;
+            render(&app);
+            assert(find_text(&app, "Aogo", rgb(app.theme.ink), 1, &nx, &ny) && nx == b.x + cw && ny > b.y &&
+                   ny + 16 * s < b.y + b.h);
+            assert(same_colour(pixel(&app, (float)b.x, (float)(b.y + b.h / 2)), rgb(app.theme.dim)));
+            assert(same_colour(pixel(&app, (float)(b.x + b.w - 1), (float)(b.y + b.h / 2)), rgb(app.theme.dim)));
+            assert(same_colour(pixel(&app, (float)(b.x + b.w - 1 - s), (float)(b.y + b.h / 2)), rgb(app.theme.page)));
+            assert(!same_colour(pixel(&app, (float)(b.x + b.w - 2 * s - side / 2), (float)(b.y + 2 * s + side / 2)),
+                                rgb(app.theme.page)));
+            /* a click on it opens the box of users, the one shown in focus; Down and Return pick Xuji, kept as
+               Settings' user in settings.ini, and the head shows them */
+            swipe_px(&app, b.x + b.w / 2, b.y + b.h / 2, b.x + b.w / 2, b.y + b.h / 2);
+            assert(app.users_shown && app.users_focus == 0);
+            render(&app);
+            assert(find_text(&app, "Xuji", rgb(app.theme.ink), 1, &nx, &ny));
+            assert(find_text(&app, "Who plays the games", rgb(app.theme.page), 1, &nx, &ny)); /* whole: none cut */
+            key(&app, SDLK_DOWN);
+            assert(app.users_shown && app.users_focus == 1);
+            key(&app, SDLK_RETURN);
+            assert(!app.users_shown && app.user == 2 && !strcmp(app.user_name, "Xuji"));
+            {
+                size_t size;
+                char* kept = (char*)snx_read_file(app.settings_file, &size);
+                assert(kept && strstr(kept, "[User]\nuser=2\n"));
+                free(kept);
+            }
+            /* ESC closes it, as does a click off it, the user kept; Up and Return pick Aogo again, kept as picked */
+            render(&app);
+            menu_boxes(&app, &m);
+            b = m.place.badge;
+            swipe_px(&app, b.x + b.w / 2, b.y + b.h / 2, b.x + b.w / 2, b.y + b.h / 2);
+            assert(app.users_shown && app.users_focus == 1);
+            key(&app, SDLK_ESCAPE);
+            assert(!app.users_shown && app.user == 2);
+            swipe_px(&app, b.x + b.w / 2, b.y + b.h / 2, b.x + b.w / 2, b.y + b.h / 2);
+            assert(app.users_shown);
+            swipe_px(&app, 1, 1, 1, 1);
+            assert(!app.users_shown && app.user == 2);
+            swipe_px(&app, b.x + b.w / 2, b.y + b.h / 2, b.x + b.w / 2, b.y + b.h / 2);
+            key(&app, SDLK_UP);
+            key(&app, SDLK_RETURN);
+            assert(!app.users_shown && app.user == 1 && !strcmp(app.user_name, "Aogo"));
+            {
+                size_t size;
+                char* kept = (char*)snx_read_file(app.settings_file, &size);
+                assert(kept && strstr(kept, "[User]\nuser=1\n"));
+                free(kept);
+                /* back to no pick, as the runs below were written for: theirs has no --user */
+                gui_settings_reset(&app.settings, setting_row(&app, "user"));
+                gui_settings_sync(&app.settings);
+                assert(!gui_settings_save(&app.settings, app.settings_file));
+                kept = (char*)snx_read_file(app.settings_file, &size);
+                assert(!kept || !strstr(kept, "user="));
+                free(kept);
+            }
+            /* none: neither the box nor the nickname, and the title against the right again */
+            app.theme.picture = GUI_PICTURE_NONE;
+            render(&app);
+            menu_boxes(&app, &m);
+            assert(!m.place.badge.h && m.place.title.x + m.place.title.w == m.place.head.x + m.place.head.w);
+            assert(!find_text(&app, "Aogo", rgb(app.theme.ink), 1, &nx, &ny));
+            app.theme.picture = GUI_PICTURE_SQUARE;
+            render(&app);
+            menu_boxes(&app, &m);
+            r = m.place.title;
+        }
         assert(m.place.tabs.y + m.place.tabs.h == r.y + r.h && r.y + r.h <= m.place.list.y);
         for (int pass = 0; pass < 2; ++pass) {
             const unsigned char* g = &gui_vga_font['S' * 16];
@@ -4716,6 +4940,54 @@ int main(int argc, char** argv) {
                 }
                 assert(more > 0);
                 shows(&app, "- OK", yellow);
+                hides(&app, "\x1e", rgb(app.theme.soft));
+                /* Up/Down go over them, a file at a time, an arrow beside the first saying some are above it; down
+                   only while some are under; PgUp/PgDn as many as show, the wheel a file a notch */
+                {
+                    int top;
+                    const char* last = strrchr(app.left, '\n');
+                    while (last > app.left && last[-1] != '\n') --last; /* the last file's line */
+                    left_paths(last, paths[0], paths[1], sizeof paths[0]);
+                    line = snx_format("%.*s", (int)gui_wrap(paths[0], width - 2), paths[0]);
+                    assert(app.files_top == 0 && app.files_shown == app.lefts - more);
+                    key(&app, SDLK_UP);
+                    assert(app.left_shown && app.files_top == 0);
+                    key(&app, SDLK_DOWN);
+                    assert(app.left_shown && app.files_top == 1 && app.menu.selected == selected);
+                    render(&app);
+                    shows(&app, "\x1e", rgb(app.theme.soft));
+                    for (n = 0; n < 10 && app.files_top + app.files_shown < app.lefts; ++n) {
+                        key(&app, SDLK_DOWN);
+                        render(&app);
+                    }
+                    assert(app.files_top + app.files_shown == app.lefts && app.files_top > 0);
+                    hides(&app, "which Share log lists", rgb(app.theme.soft));
+                    shows(&app, line, failure);
+                    free(line);
+                    top = app.files_top;
+                    key(&app, SDLK_DOWN);
+                    render(&app);
+                    assert(app.files_top == top);
+                    key(&app, SDLK_PAGEUP);
+                    assert(app.files_top == SDL_max(0, top - app.files_shown));
+                    key(&app, SDLK_PAGEDOWN);
+                    assert(app.files_top == SDL_max(0, top - app.files_shown) + app.files_shown);
+                    key(&app, SDLK_HOME); /* another key closes it, and does nothing else */
+                    assert(!app.left_shown && app.menu.selected == selected);
+                    app.left_shown = true;
+                    app.files_top = 0;
+                    render(&app);
+                    {
+                        SDL_Event wheel = {0};
+                        wheel.type = SDL_EVENT_MOUSE_WHEEL;
+                        wheel.wheel.integer_y = -1;
+                        event(&app, &wheel);
+                        assert(app.left_shown && app.files_top == 1 && app.menu.selected == selected);
+                        wheel.wheel.integer_y = 3;
+                        event(&app, &wheel);
+                        assert(app.files_top == 0);
+                    }
+                }
                 app.menu.text_size = text_size;
                 assert(SDL_SetWindowSize(app.window, window_w, window_h));
                 SDL_SyncWindow(app.window);
@@ -4729,8 +5001,8 @@ int main(int argc, char** argv) {
                     event(&app, &wheel);
                     assert(app.left_shown && app.menu.selected == selected);
                 }
-                /* a key closes it and does nothing else; nothing was moved */
-                key(&app, SDLK_DOWN);
+                /* another key closes it and does nothing else; nothing was moved */
+                key(&app, SDLK_RIGHT);
                 assert(!app.left_shown && app.menu.selected == selected && snx_is_file(loose));
                 /* Clean old settings cleans settings only: what an older version left stays where it is */
                 clean_old(&app);

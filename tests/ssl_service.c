@@ -10,6 +10,7 @@
 
 #include "hle/services/network/bsd.swipc.h"
 #include "nx/hle/services/network/ssl.c"
+#include "nx/hle/hle.c"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -19,7 +20,7 @@
 
 u8* g_mem;
 int g_verbose;
-int g_opt_network;
+int g_opt_network, g_opt_airplane;
 static unsigned test_objects;
 static void test_fail(const char* expression, int line) {
     fprintf(stderr, "ssl_service.c:%d: check failed: %s\n", line, expression);
@@ -56,21 +57,21 @@ void fatal(const char* format, ...) {
     va_end(a);
     exit(1);
 }
-SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t size) {
+SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*)) {
     SvcObj* obj = calloc(1, sizeof *obj);
     CHECK(obj != NULL);
     obj->name = name;
     obj->dispatch = dispatch;
     obj->refs = 1;
-    if (size) obj->data = calloc(1, size);
     test_objects++;
     return obj;
 }
+#include "svcobj_data.h"
 void svcobj_ref(SvcObj* obj) { obj->refs++; }
 void svcobj_unref(SvcObj* obj) {
     if (!obj || --obj->refs) return;
     if (obj->destroy) obj->destroy(obj);
-    free(obj->data);
+    test_svcobj_data_free(obj);
     free(obj);
     test_objects--;
 }
@@ -317,7 +318,13 @@ static int ssl_read(SvcObj* c, u32 cmd, u32 size, u32* n) {
     return r;
 }
 
+int kobj_never_signaled(KObj* o) {
+    (void)o;
+    return 0;
+}
+
 int main(void) {
+    hle_init();
     SvcObj *ssl, *context, *other, *c;
     SnxSockAddr lo;
     u8 der[4096];
@@ -378,7 +385,7 @@ int main(void) {
     CHECK(call(ssl) == SSL_RESULT(202));
 
     context = new_context(ssl);
-    CHECK(g_roots || g_roots_dir[0]); /* the host's roots, from somewhere */
+    CHECK(g_hle.ssl.roots || g_hle.ssl.roots_dir[0]); /* the host's roots, from somewhere */
     request(1);                       /* GetContextCount */
     CHECK(call(ssl) == 0 && reply32(0) == 1);
     request(1); /* ISslContext GetOption(CrlImportDateCheckEnable): 1 when made */
