@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors
    gsp::Gpu wire shapes and GX queue formats referenced against Azahar
-   core/hle/service/gsp/* and libctru services/gspgpu.c. Bounded model: one
+   core/hle/service/gsp/ and libctru services/gspgpu.c. Bounded model: one
    shared GX/interrupt block per process, four relay threads, a checked GX/LCD
    register file and host-paced 60 Hz display timing. The GX queue's DMA, memory
    fills, display transfers and texture copies run on physical memory through the
@@ -17,14 +17,13 @@
 #include <stdlib.h>
 #include <string.h>
 #define GSP_SHARED_SIZE        0x1000u
-#define GSP_REG_BYTES          (CTR_GSP_REGS * 4u)
 #define GSP_ERR_INVALID_HANDLE 0xd8e007f7u
+#define GSP_ERR_NO_RIGHT       0xd8202a06u
 #define GSP_ERR_OOM            0xd86007f3u
 #define GSP_ERR_REGS_RANGE     0xe0e02a01u
 #define GSP_ERR_REGS_SIZE      0xe0e02becu
 #define GSP_ERR_REGS_ALIGN     0xe0e02bf2u
 #define GSP_FIRST_INIT         0x2a07u
-#define GSP_TIMED_OUT          0x09401bfeu
 #define GSP_VBLANK_NS          UINT64_C(16666667)
 
 static CtrSharedMap* shared_map(SnxCtrProcess* p, uint32_t object) {
@@ -76,18 +75,14 @@ static uint32_t screen_height(uint32_t screen) { return screen ? 320u : 400u; }
 static uint32_t bpp_of(uint32_t format) { return format == 0 ? 4u : format == 1 ? 3u : 2u; }
 /* A buffer swap, from SetBufferSwap or a shared FrameBufferUpdate block: info is FrameBufferInfo {active_fb,
    address_left, address_right, stride, format, shown_fb, unknown}. active_fb picks the register pair written,
-   shown_fb the pair the LCD shows from now on. The right eye differs only for a stereoscopic top screen. As
-   GPU::SetBufferSwap in Azahar video_core/gpu.cpp (GPL-3.0-or-later). */
+   shown_fb (one bit of the register) the pair the LCD shows from now on. As GPU::SetBufferSwap in Azahar
+   video_core/gpu.cpp (GPL-3.0-or-later). The right eye's address is not kept until stereoscopic output is (F4).
+   Format and stride are checked when the frame is presented, whichever path set them. */
 static void buffer_swap(SnxCtrProcess* p, uint32_t screen, const uint32_t* info) {
-    unsigned pair = info[0] ? 1u : 0u;
-    if (screen == 0) {
-        bool stereoscopic = (info[4] & 0x70) == 0x20;
-        p->gsp.fb_screen[0].right[pair] = !stereoscopic || !info[2] ? info[1] : info[2];
-    }
-    p->gsp.fb_screen[screen].left[pair] = info[1];
+    p->gsp.fb_screen[screen].left[info[0] ? 1 : 0] = info[1];
     p->gsp.fb_screen[screen].stride = info[3];
     p->gsp.fb_screen[screen].format = info[4];
-    p->gsp.fb_screen[screen].active = info[5] & 0xff;
+    p->gsp.fb_screen[screen].active = info[5] & 1;
     p->gsp.fb_pending[screen] = 1;
 }
 /* libctru gspPresentBuffer posts framebuffers into the shared FrameBufferUpdate
@@ -102,7 +97,7 @@ static void latch_shared_framebuffers(SnxCtrProcess* p) {
             uint32_t base = map->va + 0x200 + thread * 0x80 + screen * 0x40;
             unsigned char header[4];
             if (snx_ctr_read_ram(p->space, base, header, sizeof header) != SNX_CTR_MEM_OK) continue;
-            if (!header[1]) continue;
+            if (!(header[1] & 1)) continue; /* the update flag is bit 0 (libctru gspPresentBuffer) */
             unsigned slot = header[0] & 1;
             unsigned char info[28];
             if (snx_ctr_read_ram(p->space, base + 4 + slot * 28, info, sizeof info) != SNX_CTR_MEM_OK) continue;
@@ -118,23 +113,21 @@ static void latch_shared_framebuffers(SnxCtrProcess* p) {
     }
 }
 /* Present one latched buffer swap: the left eye of the pair the LCD shows, as the software renderer's
-   LoadFBToScreenInfo reads it, from guest RAM through the Vulkan presenter. */
+   LoadFBToScreenInfo reads it, from guest RAM through the Vulkan presenter. A swap whose shown pair has no
+   address, an unknown format, a stride too short for a row or memory the guest cannot read is dropped: the screen
+   keeps its last frame instead of showing stale or invented pixels, and the next swap is tried afresh. */
 static void present_screen(SnxCtrProcess* p, uint32_t screen) {
-    uint32_t address = p->gsp.fb_screen[screen].left[p->gsp.fb_screen[screen].active ? 1 : 0];
+    uint32_t address = p->gsp.fb_screen[screen].left[p->gsp.fb_screen[screen].active];
     uint32_t stride = p->gsp.fb_screen[screen].stride, format = p->gsp.fb_screen[screen].format & 7;
-    if (!address || format > 4) return;
-    uint32_t height = screen_height(screen), width = 240, bytes = bpp_of(format);
-    if (stride < width * bytes || stride > 0x40000) return;
+    uint32_t height = screen_height(screen), width = 240;
+    p->gsp.fb_pending[screen] = 0;
+    if (!address || format > 4 || stride < width * bpp_of(format) || stride > 0x40000) return;
     uint64_t span = (uint64_t)stride * height;
-    if (span > 8u * 1024 * 1024) return;
     unsigned char* pixels = malloc((size_t)span);
     if (!pixels) return;
     if (snx_ctr_check_ram(p->space, address, (size_t)span, SNX_CTR_READ) != SNX_CTR_MEM_OK ||
         snx_ctr_read_ram(p->space, address, pixels, (size_t)span) != SNX_CTR_MEM_OK) {
-        /* The configured framebuffer cannot be read: stop explicitly rather
-           than present stale or fabricated pixels. */
         free(pixels);
-        p->gsp.fb_pending[screen] = 0;
         return;
     }
     uint64_t hash = 0;
@@ -143,7 +136,6 @@ static void present_screen(SnxCtrProcess* p, uint32_t screen) {
         return;
     }
     free(pixels);
-    p->gsp.fb_pending[screen] = 0;
     ++p->gsp.frame_seq;
 }
 /* Host-paced display timing: one vblank delivers both PDC interrupts to every
@@ -151,7 +143,11 @@ static void present_screen(SnxCtrProcess* p, uint32_t screen) {
 void snx_ctr_gsp_vblank(SnxCtrProcess* p) {
     if (!p->gsp.shared_object) return;
     ++p->gsp.vblank_count;
+    /* the next vblank one period on; a display more than a period behind the host (a slow frame) starts again from
+       now instead of delivering the missed vblanks back to back, as the DSP's frames and the timers do */
+    uint64_t now = snx_ctr_now_ns();
     p->gsp.next_vblank_ns += GSP_VBLANK_NS;
+    if (p->gsp.next_vblank_ns + GSP_VBLANK_NS < now) p->gsp.next_vblank_ns = now + GSP_VBLANK_NS;
     latch_shared_framebuffers(p);
     for (uint32_t screen = 0; screen < 2; ++screen)
         if (p->gsp.fb_pending[screen]) present_screen(p, screen);
@@ -162,95 +158,59 @@ void snx_ctr_gsp_vblank(SnxCtrProcess* p) {
         signal_registered(p, thread);
     }
 }
-bool snx_ctr_gsp_event(const SnxCtrProcess* p, uint32_t object) {
-    if (!object) return false;
-    for (uint32_t thread = 0; thread < CTR_GSP_THREADS; ++thread)
-        if (p->gsp.event_object[thread] == object) return true;
-    return false;
-}
-/* Waits on a registered interrupt event that is not signaled block the thread on it; the scheduler delivers
-   vblanks when due (snx_ctr_schedule), which signals the event and wakes it, while the other threads run. A finite
-   wait times out at its deadline instead. */
-SnxCtrSvcResult snx_ctr_gsp_wait(SnxCtrProcess* p, uint32_t object, uint32_t* r) {
-    if (!r[2] && !r[3]) {
-        r[0] = GSP_TIMED_OUT;
-        return SNX_CTR_SVC_RETURN;
+void snx_ctr_gsp_session_closed(SnxCtrProcess* p, uint32_t session) {
+    if (p->gsp.rights_thread == session) p->gsp.rights_thread = UINT32_MAX;
+    uint32_t thread = p->objects[session].data.session.gsp_thread;
+    if (thread >= CTR_GSP_THREADS) return;
+    if (p->gsp.event_object[thread]) {
+        uint32_t event = p->gsp.event_object[thread];
+        p->gsp.event_object[thread] = 0;
+        snx_ctr_object_release(p, event);
     }
-    snx_ctr_thread_block(p, object, 0);
-    snx_ctr_thread_deadline(p, r[2], r[3]); /* a finite wait times out at its deadline */
-    return SNX_CTR_SVC_BLOCKED;
+    p->gsp.relay_flags[thread] = 0;
+    p->gsp.thread_mask &= ~(1u << thread);
 }
-static uint32_t* regs(SnxCtrProcess* p) {
-    if (!p->gsp.regs) p->gsp.regs = calloc(CTR_GSP_REGS, 4);
-    return p->gsp.regs;
+/* the GPU right: the session that holds it (Azahar GSP_GPU::HasGpuRight) */
+static bool has_right(SnxCtrIpc* c) { return c->process->gsp.rights_thread == c->object; }
+/* one handle, copied or moved: what Azahar's PopObject takes */
+static bool one_handle(const SnxCtrIpc* c, uint32_t word) { return !(c->in[word] & ~0x10u); }
+/* WriteHWRegs and WriteHWRegsWithMask (Azahar GSP::WriteHWRegs*): the data's static buffer gives the size (the size
+   word is ignored, as on hardware), checked after the right, the address below 0x420000, then at most 0x80 bytes
+   in whole words. The runtime models no register a write here would change (framebuffers come from SetBufferSwap
+   and the shared FrameBufferUpdate blocks, transfers from GX commands), so the values themselves are not kept. */
+static uint32_t regs_check(SnxCtrIpc* c, uint32_t size) {
+    if (!has_right(c)) return GSP_ERR_NO_RIGHT;
+    if ((c->in[1] & 3) || c->in[1] >= 0x420000) return GSP_ERR_REGS_RANGE;
+    if (size > 0x80) return GSP_ERR_REGS_SIZE;
+    return size & 3 ? GSP_ERR_REGS_ALIGN : 0;
 }
 static void write_regs(SnxCtrIpc* c) {
     if (!snx_ctr_ipc_expect(c, 2, 2)) return;
-    SnxCtrProcess* p = c->process;
-    uint32_t at = c->in[1], size = c->in[2];
-    if ((at & 3) || (size & 3) || size > 512 || (uint64_t)at + size > GSP_REG_BYTES) {
-        snx_ctr_ipc_error_reply(c, (at & 3)     ? GSP_ERR_REGS_ALIGN
-                                   : (size & 3) ? GSP_ERR_REGS_ALIGN
-                                   : size > 512 ? GSP_ERR_REGS_SIZE
-                                                : GSP_ERR_REGS_RANGE);
-        return;
-    }
-    if (c->in[3] != ((size << 14) | 2)) {
+    if ((c->in[3] & 0x3fff) != 2) { /* static buffer 0, the data */
         snx_ctr_ipc_bad(c);
         return;
     }
-    unsigned char data[512];
-    if (snx_ctr_read_ram(p->space, c->in[4], data, size) != SNX_CTR_MEM_OK) {
-        c->transport_result = 0xe0e01bf5u;
-        return;
-    }
-    uint32_t* file = regs(p);
-    if (!file) {
-        snx_ctr_ipc_error_reply(c, GSP_ERR_OOM);
-        return;
-    }
-    memcpy((unsigned char*)file + at, data, size);
-    c->out[0] = (c->in[0] & 0xffff0000u) | 0x40;
+    snx_ctr_ipc_error_reply(c, regs_check(c, c->in[3] >> 14));
 }
 static void write_regs_mask(SnxCtrIpc* c) {
     if (!snx_ctr_ipc_expect(c, 2, 4)) return;
-    SnxCtrProcess* p = c->process;
-    uint32_t at = c->in[1], size = c->in[2];
-    if ((at & 3) || (size & 3) || size > 512 || (uint64_t)at + size > GSP_REG_BYTES) {
-        snx_ctr_ipc_error_reply(c, GSP_ERR_REGS_RANGE);
-        return;
-    }
-    if (c->in[3] != ((size << 14) | 2) || c->in[5] != ((size << 14) | (1u << 11) | 2)) {
+    /* static buffer 0 the data, 1 the mask (libctru GSPGPU_WriteHWRegsWithMask); a shorter mask reads as zeros */
+    if ((c->in[3] & 0x3fff) != 2 || (c->in[5] & 0x3fff) != ((1u << 10) | 2)) {
         snx_ctr_ipc_bad(c);
         return;
     }
-    unsigned char data[512], mask[512];
-    if (snx_ctr_read_ram(p->space, c->in[4], data, size) != SNX_CTR_MEM_OK ||
-        snx_ctr_read_ram(p->space, c->in[6], mask, size) != SNX_CTR_MEM_OK) {
-        c->transport_result = 0xe0e01bf5u;
-        return;
-    }
-    uint32_t* file = regs(p);
-    if (!file) {
-        snx_ctr_ipc_error_reply(c, GSP_ERR_OOM);
-        return;
-    }
-    uint32_t words = size / 4;
-    uint32_t* target = (uint32_t*)((unsigned char*)file + at);
-    for (uint32_t i = 0; i < words; ++i) {
-        uint32_t v = 0, m = 0;
-        memcpy(&v, data + i * 4, 4);
-        memcpy(&m, mask + i * 4, 4);
-        target[i] = (target[i] & ~m) | (v & m);
-    }
-    c->out[0] = (c->in[0] & 0xffff0000u) | 0x40;
+    snx_ctr_ipc_error_reply(c, regs_check(c, c->in[3] >> 14));
 }
 static void set_buffer_swap(SnxCtrIpc* c) {
     if (!snx_ctr_ipc_expect(c, 8, 0)) return;
     SnxCtrProcess* p = c->process;
     /* words: screen, then FrameBufferInfo {active_fb, address_left,
        address_right, stride, format, shown_fb, unknown} */
-    uint32_t screen = c->in[1], stride = c->in[5], format = c->in[6] & 7, shown = c->in[7];
+    uint32_t screen = c->in[1], format = c->in[6] & 7;
+    if (!has_right(c)) {
+        snx_ctr_ipc_error_reply(c, GSP_ERR_NO_RIGHT);
+        return;
+    }
     /* Real hardware ignores an invalid screen and still answers success (Azahar gsp_gpu.cpp) */
     if (screen > 1) {
         c->out[0] = (c->in[0] & 0xffff0000u) | 0x40;
@@ -262,20 +222,20 @@ static void set_buffer_swap(SnxCtrIpc* c) {
         c->state = SNX_CTR_IPC_UNSUPPORTED;
         return;
     }
-    if (shown > 1 || (uint64_t)stride * screen_height(screen) > 8u * 1024 * 1024) {
-        snx_ctr_ipc_error_reply(c, GSP_ERR_REGS_RANGE);
-        return;
-    }
     buffer_swap(p, screen, &c->in[2]);
     /* A swap schedules the frame for the next real vblank; if display time has
        already passed while the guest ran, service it now. */
-    if (p->gsp.shared_object && (uint64_t)(snx_seconds() * 1e9) >= p->gsp.next_vblank_ns) snx_ctr_gsp_vblank(p);
+    if (p->gsp.shared_object && snx_ctr_now_ns() >= p->gsp.next_vblank_ns) snx_ctr_gsp_vblank(p);
     c->out[0] = (c->in[0] & 0xffff0000u) | 0x40;
 }
 static void cache_op(SnxCtrIpc* c) {
     if (!snx_ctr_ipc_expect(c, 2, 2)) return;
     /* Host memory is coherent with guest reads; a data cache flush/invalidate
        is a genuine no-op in this model. The process handle must be real. */
+    if (!one_handle(c, 3)) {
+        snx_ctr_ipc_bad(c);
+        return;
+    }
     if (c->handle_in[0] != CTR_PROCESS_HANDLE) {
         snx_ctr_ipc_error_reply(c, GSP_ERR_INVALID_HANDLE);
         return;
@@ -290,13 +250,13 @@ static void register_relay(SnxCtrIpc* c) {
     if (!snx_ctr_ipc_expect(c, 1, 2)) return;
     SnxCtrProcess* p = c->process;
     CtrObject* session = &p->objects[c->object];
+    if (!one_handle(c, 2)) {
+        snx_ctr_ipc_bad(c);
+        return;
+    }
     uint32_t event = snx_ctr_handle_object(p, c->handle_in[0]);
     if (!event || p->objects[event].type != CTR_OBJ_EVENT) {
         snx_ctr_ipc_error_reply(c, GSP_ERR_INVALID_HANDLE);
-        return;
-    }
-    if (!p->gsp.regs && !regs(p)) {
-        snx_ctr_ipc_error_reply(c, GSP_ERR_OOM);
         return;
     }
     if (!p->gsp.shared_object) {
@@ -312,7 +272,7 @@ static void register_relay(SnxCtrIpc* c) {
         p->objects[id].data.shared.size = GSP_SHARED_SIZE;
         p->objects[id].data.shared.permissions = 3;
         p->gsp.shared_object = id;
-        p->gsp.next_vblank_ns = (uint64_t)(snx_seconds() * 1e9) + GSP_VBLANK_NS;
+        p->gsp.next_vblank_ns = snx_ctr_now_ns() + GSP_VBLANK_NS;
         /* The block keeps its own reference while the process holds it. */
         ++p->objects[id].refs;
     }
@@ -362,6 +322,10 @@ static void unregister_relay(SnxCtrIpc* c) {
 static void acquire(SnxCtrIpc* c) {
     if (!snx_ctr_ipc_expect(c, 1, 2)) return;
     SnxCtrProcess* p = c->process;
+    if (!one_handle(c, 2)) {
+        snx_ctr_ipc_bad(c);
+        return;
+    }
     if (c->handle_in[0] != CTR_PROCESS_HANDLE || c->in[1] > 7) {
         snx_ctr_ipc_error_reply(c, c->handle_in[0] != CTR_PROCESS_HANDLE ? GSP_ERR_INVALID_HANDLE : GSP_ERR_REGS_RANGE);
         return;
@@ -465,13 +429,14 @@ static GxStep gx_dma(SnxCtrIpc* c, const uint32_t* a, GxInterrupts* irq) {
 
 /* MemoryFill: GPU::Execute writes each requested region's registers, GPU::MemoryFill runs it when its control
    word carries the trigger bit, from start to end rounded down to 8 bytes (the registers hold address / 8). With
-   both regions requested only the second raises an interrupt, PSC0 */
+   both regions requested only the second raises an interrupt, PSC0. The end is an open bound, so it may be the very
+   end of its memory region (Azahar's GetPhysicalRef takes a region's end address as valid for this) */
 static GxStep gx_fill_region(SnxCtrIpc* c, uint32_t start, uint32_t end, uint32_t value, uint32_t control,
                              int interrupt, GxInterrupts* irq) {
     SnxCtrProcess* p = c->process;
     uint32_t pa_start = start & ~7u, pa_end = end & ~7u;
     if (!(control & 1)) return GX_DONE; /* not triggered: no fill, no interrupt */
-    if (gx_valid(p, pa_start) && gx_valid(p, pa_end) && pa_end > pa_start) {
+    if (pa_end > pa_start && gx_valid(p, pa_start) && gx_valid(p, pa_end - 1)) {
         uint32_t size = pa_end - pa_start;
         unsigned char* staged = size <= GX_STAGE_LIMIT ? malloc(size) : NULL;
         if (!staged) {

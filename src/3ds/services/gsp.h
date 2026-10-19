@@ -9,7 +9,7 @@ void snx_ctr_gsp_dispatch(SnxCtrIpc* c);
 /* One host-paced vblank: shows latched framebuffers and queues PDC interrupts.
    Not cycle accurate. */
 void snx_ctr_gsp_vblank(struct SnxCtrProcess* p);
-bool snx_ctr_gsp_event(const struct SnxCtrProcess* p, uint32_t object);
-/* WaitSynchronization1 on one: blocks the thread until a vblank signals it (SnxCtrSvcResult) */
-uint32_t snx_ctr_gsp_wait(struct SnxCtrProcess* p, uint32_t object, uint32_t* registers);
+/* a gsp::Gpu session's last reference went: it gives up the GPU right, its relay thread slot and its event (Azahar
+   GSP_GPU::ClientDisconnected and SessionData's destructor) */
+void snx_ctr_gsp_session_closed(struct SnxCtrProcess* p, uint32_t session);
 #endif

@@ -223,6 +223,7 @@ static void service(void) {
     unsigned char code[0x3000] = {0};
     SnxCtrImage image = {.segment = {{0x100000, 1, 16}, {0x200000, 1, 4}, {0x300000, 1, 4}},
                          .stack_size = 0x4000,
+                         .main_priority = 0x30,
                          .bss_size = 0x3000,
                          .code = code,
                          .code_size = sizeof code};
@@ -240,6 +241,12 @@ static void service(void) {
     const uint32_t load[] = {0x001100c2, 0x300, 0xff, 0xff, 0x300 << 4 | 0xa, DATA};
     request(p, dsp, load, 6);
     assert(reply(p, 0) == 0x00110082 && !reply(p, 1) && reply(p, 2) == 1 && reply(p, 4) == DATA);
+    /* the event comes in one copied or moved handle; any other descriptor is refused */
+    const uint32_t pid_form[] = {0x00150082, 2, SNX_CTR_DSP_PIPE_AUDIO, 0x20, event};
+    for (unsigned i = 0; i < 5; ++i) word(p, CMD + i * 4, pid_form[i]);
+    p->cpu.state.cpu.r[0] = dsp;
+    assert(snx_ctr_svc(p, 0x32) == SNX_CTR_SVC_RETURN && p->cpu.state.cpu.r[0] == SNX_CTR_IPC_BAD_DESCRIPTOR);
+    assert(!p->dsp.interrupt[2 + SNX_CTR_DSP_PIPE_AUDIO]);
     const uint32_t interrupts[] = {0x00150082, 2, SNX_CTR_DSP_PIPE_AUDIO, 0, event};
     request(p, dsp, interrupts, 5);
     assert(reply(p, 0) == 0x00150040 && !reply(p, 1) && p->dsp.interrupt[2 + SNX_CTR_DSP_PIPE_AUDIO] == id);

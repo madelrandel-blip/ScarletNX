@@ -74,7 +74,11 @@ int snx_ctr_aot_run(const char* directory, SnxCtrModel model, uint64_t limit, un
     }
     SnxArmCPU* cpu = snx_ctr_process_cpu(process);
     if (state == SNX_CTR_RUN_EXIT) {
-        printf("Guest ExitProcess: r0=%" PRIu32 " blocks=%" PRIu64 "\n", cpu->r[0], executed);
+        /* ExitThread ends the process when it was the last thread, and its r0 means nothing then */
+        if (process->last_svc == 0x09)
+            printf("Guest's last thread exited: blocks=%" PRIu64 "\n", executed);
+        else
+            printf("Guest ExitProcess: r0=%" PRIu32 " blocks=%" PRIu64 "\n", cpu->r[0], executed);
         result = 0;
     } else if (closed) {
         printf("Closed: blocks=%" PRIu64 "\n", executed);

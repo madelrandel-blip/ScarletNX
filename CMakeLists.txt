@@ -52,7 +52,7 @@ endif()
 
 option(SNX_BUILD_NX "Build the Switch Horizon/Maxwell runtime" ON)
 option(SNX_BUILD_GNUABI "Build the CPU-only Linux AArch64 runtime" ON)
-option(SNX_BUILD_3DS "Build 3DS extraction/memory support" ON)
+option(SNX_BUILD_3DS "Build the 3DS driver: extraction, the ARM11 AOT compiler and the runtime" ON)
 # Reject stale backend selections instead of silently changing an existing build's behavior.
 if(SNX_BUILD_NX AND DEFINED SNX_BACKEND AND NOT SNX_BACKEND STREQUAL "sdl3")
     message(FATAL_ERROR "SNX_BACKEND=${SNX_BACKEND}: SDL3 is now mandatory for the NX runtime. "

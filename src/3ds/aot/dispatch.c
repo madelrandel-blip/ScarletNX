@@ -17,12 +17,21 @@ bool snx_ctr_module_compatible(const SnxCtrModule* m, const SnxCtrImage* image) 
            m->thumb_count == m->text_bytes / 2 && m->arm_blocks && m->thumb_blocks &&
            !memcmp(m->image_identity, image->identity, 32);
 }
+/* Schedule a thread to run: false when none runs now, with the dispatch's result in stop. An idle wake (a vblank or
+   an audio frame that woke nobody) ends the dispatch as a spent budget, so the caller can look at its window and
+   dispatch again; no thread ever running again is BLOCKED. */
+static bool scheduled(SnxCtrProcess* process, SnxCtrRunResult* stop) {
+    SnxCtrSchedule s = snx_ctr_schedule(process);
+    *stop = s == SNX_CTR_SCHED_IDLE ? SNX_CTR_RUN_BUDGET : SNX_CTR_RUN_BLOCKED;
+    return s == SNX_CTR_SCHED_RUN;
+}
 SnxCtrRunResult snx_ctr_dispatch(const SnxCtrModule* m, SnxCtrProcess* process, uint64_t limit, uint64_t* executed) {
     if (!executed) return SNX_CTR_RUN_FAULT;
     *executed = 0;
     SnxArmCPU* cpu = snx_ctr_process_cpu(process);
     if (!cpu || !m) return SNX_CTR_RUN_FAULT;
-    if (!snx_ctr_schedule(process)) return SNX_CTR_RUN_BLOCKED;
+    SnxCtrRunResult stop;
+    if (!scheduled(process, &stop)) return stop;
     uint32_t since_poll = 0;
     while (*executed < limit) {
         /* Every block returns here, so a loop that makes no SVC still reaches the scheduler: due vblanks, audio frames,
@@ -30,7 +39,7 @@ SnxCtrRunResult snx_ctr_dispatch(const SnxCtrModule* m, SnxCtrProcess* process, 
            interrupt would preempt it on the console */
         if (++since_poll == SNX_CTR_POLL_BLOCKS) {
             since_poll = 0;
-            if (!snx_ctr_schedule(process)) return SNX_CTR_RUN_BLOCKED;
+            if (!scheduled(process, &stop)) return stop;
         }
         uint32_t pc = cpu->r[15];
         bool thumb = !!(cpu->cpsr & SNX_ARM_T);
@@ -65,13 +74,13 @@ SnxCtrRunResult snx_ctr_dispatch(const SnxCtrModule* m, SnxCtrProcess* process, 
             SnxCtrSvcResult result = snx_ctr_svc(process, cpu->syndrome);
             if (result == SNX_CTR_SVC_EXIT) return SNX_CTR_RUN_EXIT;
             if (result == SNX_CTR_SVC_BLOCKED) {
-                if (!snx_ctr_schedule(process)) return SNX_CTR_RUN_BLOCKED;
+                if (!scheduled(process, &stop)) return stop;
                 continue;
             }
             if (result == SNX_CTR_SVC_UNSUPPORTED) return SNX_CTR_RUN_UNSUPPORTED;
             cpu->exit = SNX_ARM_OK;
             cpu->syndrome = 0;
-            if (!snx_ctr_schedule(process)) return SNX_CTR_RUN_BLOCKED;
+            if (!scheduled(process, &stop)) return stop;
             continue;
         }
         if (cpu->exit == SNX_ARM_BACKEND_UNSUPPORTED || cpu->exit == SNX_ARM_CODE_CHANGED)

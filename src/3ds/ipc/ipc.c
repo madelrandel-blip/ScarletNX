@@ -94,11 +94,12 @@ uint32_t snx_ctr_named_connect(SnxCtrProcess* p, uint32_t address, uint32_t* out
     }
     return 0xe0e0181eu;
 }
-enum { WIRE_OK, WIRE_BAD, WIRE_ADDRESS };
+enum { WIRE_OK, WIRE_BAD, WIRE_ADDRESS, WIRE_HANDLES };
 /* The request's translation descriptors, any well-formed one (Azahar kernel/hle_ipc.cpp, ipc.h): handles copied or
-   moved (up to SNX_CTR_IPC_HANDLES, captured for the handler), the caller's PID, static and PXI buffers the service
-   reads, and mapped buffers it reads, writes or both. Every buffer is checked against the caller's memory for the
-   access it grants before any handler runs. Handlers still check the exact form each command takes. */
+   moved (up to SNX_CTR_IPC_HANDLES, captured for the handler), the caller's PID, static buffers the service reads,
+   PXI buffers it reads or also writes, and mapped buffers it reads, writes or both. Every buffer is checked against
+   the caller's memory for the access it grants before any handler runs. Handlers still check the exact form each
+   command takes. */
 static unsigned translation(SnxCtrIpc* c, uint32_t normal, uint32_t translated) {
     uint32_t position = 1 + normal, end = position + translated;
     while (position < end) {
@@ -113,13 +114,16 @@ static unsigned translation(SnxCtrIpc* c, uint32_t normal, uint32_t translated) 
             size = d >> 14; /* static buffer, id in bits 10..13 */
             access = SNX_CTR_READ;
         } else if ((d & 15) == 4 || (d & 15) == 6) {
-            size = d >> 8; /* PXI buffer: 4 read-only, 6 read-write */
-            access = (d & 15) == 6 ? SNX_CTR_READ | SNX_CTR_WRITE : SNX_CTR_READ;
-        } else if (d == 0x20) {
-            /* the calling process's ID, written by the kernel */
+            size = d >> 8; /* PXI buffer: 6 read-only, 4 read-write (libctru IPC_Desc_PXIBuffer) */
+            access = (d & 15) == 6 ? SNX_CTR_READ : SNX_CTR_READ | SNX_CTR_WRITE;
+        } else if ((d & 0x3f) == 0x20) {
+            /* the calling process's ID: the kernel writes it over whatever the client put there (Azahar reads only
+               the low six bits of the descriptor) */
+            if (position < end) c->in[position] = c->caller_pid;
         } else if (!(d & 0x03ffffefu)) { /* copied (0x00) or moved (0x10) handles, count - 1 in bits 26..31 */
             payload = (d >> 26) + 1;
-            if (payload > end - position || c->handle_count + payload > SNX_CTR_IPC_HANDLES) return WIRE_BAD;
+            if (payload > end - position) return WIRE_BAD;
+            if (c->handle_count + payload > SNX_CTR_IPC_HANDLES) return WIRE_HANDLES;
             for (uint32_t i = 0; i < payload; ++i) {
                 if (d & 0x10) c->handle_moved |= 1u << c->handle_count;
                 c->handle_in[c->handle_count++] = c->in[position + i];
@@ -133,25 +137,29 @@ static unsigned translation(SnxCtrIpc* c, uint32_t normal, uint32_t translated) 
     }
     return WIRE_OK;
 }
+/* the --ipc-stubs name of each SNX_CTR_SERVICE_*: a file session is fs's */
 static const char* const families[] = {"", "srv", "fs", "apt", "ptm", "hid", "fs", "gsp", "cfg", "dsp"};
+_Static_assert(sizeof families / sizeof *families == SNX_CTR_SERVICE_COUNT, "a family name per service");
 int snx_ctr_ipc_stub_mask(const char* list, uint32_t* mask) {
-    *mask = 0;
-    if (!list) return 1;
+    uint32_t names = 0;
+    if (!list || !*list) return 0;
     if (!strcmp(list, "all")) {
         *mask = UINT32_MAX;
         return 1;
     }
-    while (*list) {
+    for (;;) {
         size_t length = strcspn(list, ",");
         bool known = false;
         for (unsigned i = 1; i < sizeof families / sizeof *families; ++i)
             if (strlen(families[i]) == length && !strncmp(families[i], list, length)) {
-                *mask |= 1u << i;
+                names |= 1u << i;
                 known = true;
             }
-        if (!known) return 0;
-        list += length + (list[length] == ',');
+        if (!known) return 0; /* also an empty name: a leading, doubled or trailing comma */
+        if (!list[length]) break;
+        list += length + 1;
     }
+    *mask |= names;
     return 1;
 }
 SnxCtrSvcResult snx_ctr_ipc_send(SnxCtrProcess* p, uint32_t handle, uint32_t* result) {
@@ -185,6 +193,11 @@ SnxCtrSvcResult snx_ctr_ipc_send(SnxCtrProcess* p, uint32_t handle, uint32_t* re
         return SNX_CTR_SVC_RETURN;
     }
     unsigned wire = translation(&c, normal, translated);
+    if (wire == WIRE_HANDLES) {
+        fprintf(stderr, "3ds ipc: header 0x%08x sends more than %u handles, which the runtime does not translate\n",
+                c.in[0], SNX_CTR_IPC_HANDLES);
+        return SNX_CTR_SVC_UNSUPPORTED;
+    }
     if (wire != WIRE_OK) {
         *result = wire == WIRE_BAD ? SNX_CTR_IPC_BAD_DESCRIPTOR : 0xe0e01bf5u; /* ResultInvalidAddress */
         return SNX_CTR_SVC_RETURN;
@@ -204,13 +217,22 @@ SnxCtrSvcResult snx_ctr_ipc_send(SnxCtrProcess* p, uint32_t handle, uint32_t* re
     if (c.state == SNX_CTR_IPC_UNKNOWN) {
         const char* family =
             p->last_ipc_service < sizeof families / sizeof *families ? families[p->last_ipc_service] : "?";
+        const char* kind = p->last_ipc_service == SNX_CTR_SERVICE_FILE ? " file" : "";
+        uint32_t key = p->last_ipc_service << 16 | c.in[0] >> 16, seen = 0;
         if (!(p->ipc_stubs & (1u << p->last_ipc_service))) {
-            fprintf(stderr, "3ds ipc: %s has no command 0x%04x (header 0x%08x); --ipc-stubs=%s answers it\n", family,
-                    c.in[0] >> 16, c.in[0], family);
+            fprintf(stderr,
+                    "3ds ipc: %s%s has no command 0x%04x (header 0x%08x). Run with --ipc-stubs %s to answer it with "
+                    "success.\n",
+                    family, kind, c.in[0] >> 16, c.in[0], family);
             return SNX_CTR_SVC_UNSUPPORTED;
         }
-        /* Azahar's ReportUnimplementedFunction: one normal word, success */
-        fprintf(stderr, "3ds ipc: stub answered %s command 0x%04x (header 0x%08x)\n", family, c.in[0] >> 16, c.in[0]);
+        /* Azahar's ReportUnimplementedFunction: one normal word, success. Each command is reported the first time */
+        while (seen < p->stub_logged_count && p->stub_logged[seen] != key) ++seen;
+        if (seen == p->stub_logged_count) {
+            if (seen < sizeof p->stub_logged / sizeof *p->stub_logged) p->stub_logged[p->stub_logged_count++] = key;
+            fprintf(stderr, "3ds ipc: stub answered %s%s command 0x%04x (header 0x%08x)\n", family, kind, c.in[0] >> 16,
+                    c.in[0]);
+        }
         memset(c.out, 0, sizeof c.out);
         c.out[0] = (c.in[0] & 0xffff0000u) | 0x40;
         c.state = SNX_CTR_IPC_RETURN;
@@ -218,12 +240,14 @@ SnxCtrSvcResult snx_ctr_ipc_send(SnxCtrProcess* p, uint32_t handle, uint32_t* re
     if (c.state == SNX_CTR_IPC_UNSUPPORTED) return SNX_CTR_SVC_UNSUPPORTED;
     if (c.state == SNX_CTR_IPC_BLOCKED) return SNX_CTR_SVC_BLOCKED;
     if (c.state == SNX_CTR_IPC_FAULT) return SNX_CTR_SVC_UNSUPPORTED;
+    /* The handles the request moved leave the caller's table once the service has taken the request, whatever it
+       answers: the kernel moves them while it translates the request, before the service runs. They stay until
+       here because handlers resolve them by value. */
+    for (uint32_t i = 0; i < c.handle_count; ++i)
+        if ((c.handle_moved >> i & 1) && c.handle_in[i]) (void)snx_ctr_handle_close(p, c.handle_in[i]);
     *result = c.transport_result;
     if (*result) return SNX_CTR_SVC_RETURN;
     for (unsigned i = 0; i < SNX_CTR_IPC_WORDS; ++i) store32(bytes + i * 4, c.out[i]);
     if (snx_ctr_write_ram(p->space, address, bytes, sizeof bytes) != SNX_CTR_MEM_OK) return SNX_CTR_SVC_UNSUPPORTED;
-    /* the handles the request moved leave the caller's table now that it is answered */
-    for (uint32_t i = 0; i < c.handle_count; ++i)
-        if ((c.handle_moved >> i & 1) && c.handle_in[i]) (void)snx_ctr_handle_close(p, c.handle_in[i]);
     return SNX_CTR_SVC_RETURN;
 }

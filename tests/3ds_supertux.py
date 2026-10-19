@@ -7,6 +7,7 @@ No download, title assets or native cache are shipped/reused. Takes DRIVER CIA P
 
 import hashlib
 from pathlib import Path
+import re
 import subprocess
 import struct
 import sys
@@ -42,6 +43,9 @@ def oracle(output, native):
         emu.reg_write(reg, 0)
     emu.reg_write(R.UC_ARM_REG_SP, 0x10000000)
     emu.reg_write(R.UC_ARM_REG_C13_C0_3, 0x1FF82000)
+    # the main thread's FPSCR as the kernel sets it, as the runtime does (Azahar SetupMainThread): default NaN, flush
+    # to zero, round toward zero
+    emu.reg_write(R.UC_ARM_REG_FPSCR, 0x03C00010)
     seen = []
 
     def interrupt(cpu, number, context):
@@ -175,10 +179,10 @@ def main():
         )
         text = result.stdout + result.stderr
         print(text)
-        # Past the archive timestamp the title loads and draws: the block budget ends the run, nothing unsupported
+        # Past the archive timestamp the title goes on loading: the block budget ends the run, nothing unsupported
         # does. Where it ends depends on host-paced vblank and DSP time, so the pc and SVC count are not checked.
         assert result.returncode == 3 and 'static block budget exhausted' in result.stderr
-        assert 'blocks=100000' in result.stderr and 'unsupported guest operation' not in text
+        assert re.search(r'\bblocks=100000\b', result.stderr) and 'unsupported guest operation' not in text
         assert 'Running ARM11 static AOT' in result.stdout and 'Guest ExitProcess' not in text
         assert 'AddressSanitizer' not in text and 'runtime error:' not in text
         assert (
@@ -193,9 +197,7 @@ def main():
         assert 'SuperTux main entry reached: pc=0x00167d88 blocks=50569' in state.stdout
         if '--oracle' in sys.argv[4:]:
             oracle(output, state.stdout)
-    print(
-        'Pinned SuperTux reaches main, opens RomFS, answers its archive timestamp and runs on to the block budget.'
-    )
+    print('Pinned SuperTux reaches main, opens RomFS, answers its archive timestamp and runs on to the block budget.')
 
 
 if __name__ == '__main__':

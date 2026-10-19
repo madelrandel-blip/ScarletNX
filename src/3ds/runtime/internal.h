@@ -8,9 +8,11 @@
 #define CTR_HANDLES        256u
 #define CTR_OBJECTS        256u
 #define CTR_GSP_THREADS    4u
-#define CTR_GSP_REGS       1024u
 #define CTR_PHYS_BASE      0x20000000u
 #define CTR_CONFIG         0x1ff80000u
+#define CTR_SHARED_PAGE    0x1ff81000u
+#define CTR_THREAD_LIMIT   32u                       /* the APPLICATION resource limit's threads */
+#define CTR_TLS_BYTES      (CTR_THREAD_LIMIT * 512u) /* one 512-byte TLS slot per thread from SNX_CTR_INITIAL_TLS */
 #define CTR_HEAP           0x08000000u
 #define CTR_HEAP_END       0x10000000u
 #define CTR_LINEAR         0x14000000u
@@ -54,12 +56,18 @@ typedef struct {
        UINT64_MAX sleeping forever; a waiting thread times out at it (CTR_TIMED_OUT), and waits without one forever */
     uint64_t wake_ns;
     uint32_t yield; /* SleepThread(0): runs again only when no other thread can, at the next scheduling */
-    uint32_t core;  /* the processor CreateThread asked for; every core's threads share one serialized scheduler */
+    /* Queue order among equal priorities, as Azahar's per-priority ready and wait lists keep it: ready_seq is taken
+       each time the thread becomes runnable (a preempted thread keeps its own, so it stays first), wait_seq each time
+       it starts waiting */
+    uint64_t ready_seq, wait_seq;
+    /* WaitSynchronizationN on no handles with a deadline: it wakes there with Timeout and -1 (Azahar's wait-any) */
+    uint32_t wait_nothing;
     uint32_t wait_multiple, wait_all, wait_more_count, wait_more[63];
     char waiting_service[9];
 } CtrThread;
 typedef struct {
     uint32_t type, refs;
+    uint32_t from_app; /* made by the application's own SVC, so counted against its resource limit */
     union {
         struct {
             uint32_t service, client_pid, sdk_version, gsp_thread;
@@ -98,24 +106,22 @@ typedef struct {
 typedef struct {
     uint32_t generation, object;
 } CtrHandle;
-/* gsp::Gpu model: one shared GX command/interrupt block, a bounded GX/LCD
-   register file, per-registration relay threads and latched buffer swaps.
+/* gsp::Gpu model: one shared GX command/interrupt block, per-registration relay threads and latched buffer swaps.
    Display timing is host-paced 60 Hz, not cycle accurate. */
 typedef struct {
     uint32_t shared_object;              /* CTR_OBJ_SHARED backing the 0x1000 block */
-    uint32_t thread_mask, rights_thread; /* rights_thread 0xffffffff: no holder */
+    uint32_t thread_mask, rights_thread; /* the session object holding the GPU right, 0xffffffff: none */
     uint32_t first_registration;         /* one genuine FirstInitialization reply */
     uint32_t lcd_black, frame_seq, vblank_count;
     uint32_t event_object[CTR_GSP_THREADS]; /* registered interrupt events (retained) */
     uint32_t relay_flags[CTR_GSP_THREADS];
-    uint32_t fb_pending[2]; /* a SetBufferSwap latched since the last present */
+    uint32_t fb_pending[2]; /* a swap (SetBufferSwap or a FrameBufferUpdate block) latched since the last present */
     /* each screen's framebuffer_config registers: two address pairs (left/right eye), the one active selects which
        pair the LCD scans out; a swap writes the pair its active_fb names (Azahar video_core/gpu.cpp) */
     struct {
-        uint32_t left[2], right[2], stride, format, active;
+        uint32_t left[2], stride, format, active;
     } fb_screen[2];
     uint64_t next_vblank_ns; /* host monotonic deadline, 60 Hz */
-    uint32_t* regs;          /* bounded GX/LCD register file, CTR_GSP_REGS words */
     /* the transfer engine's registers (DisplayTransferConfig), physical addresses: a GX command writes some of them
        and triggers it, the rest keep their last values, as on hardware (gpu/transfer.h) */
     struct {
@@ -162,17 +168,33 @@ struct SnxCtrProcess {
     uint64_t svc_count;
     /* the codeset GetProcessInfo describes: segments as loaded, BSS, title and name (ExHeader) */
     SnxCtrSegment segment[3];
-    uint32_t bss_size;
+    uint32_t bss_size, stack_size; /* the main thread's stack, page-rounded, below SNX_CTR_STACK_TOP */
     uint64_t title_id;
     char name[8];
     uint32_t resource_limit; /* CTR_OBJ_RESOURCE_LIMIT object, 0 until the first GetResourceLimit */
     uint32_t ipc_stubs;      /* services whose unknown commands answer success (bit per SNX_CTR_SERVICE_*) */
+    /* the stubbed commands already reported, service << 16 | command, so each is logged once */
+    uint32_t stub_logged[32], stub_logged_count;
     uint64_t time_update_ns; /* host monotonic deadline of the shared page's next hourly time entry */
+    uint64_t sched_seq;      /* the last ready_seq/wait_seq handed out */
     unsigned char physical_owner[];
 };
 CtrThread* snx_ctr_thread(SnxCtrProcess* p);
 uint32_t snx_ctr_thread_create(SnxCtrProcess* p, const uint32_t* registers, uint32_t* out);
-bool snx_ctr_schedule(SnxCtrProcess* p);
+/* snx_ctr_schedule's answer: no thread will ever run again, a thread runs now, or the host slept to a vblank or an
+   audio frame that woke nobody (the caller can look at its window, then schedule again) */
+typedef enum { SNX_CTR_SCHED_BLOCKED, SNX_CTR_SCHED_RUN, SNX_CTR_SCHED_IDLE } SnxCtrSchedule;
+SnxCtrSchedule snx_ctr_schedule(SnxCtrProcess* p);
+/* a thread becomes runnable: it goes behind the runnable threads of its priority */
+void snx_ctr_thread_ready(SnxCtrProcess* p, uint32_t thread);
+/* the priority a thread runs at: its own, or a better one inherited from the waiters of mutexes it holds */
+uint32_t snx_ctr_thread_priority(SnxCtrProcess* p, uint32_t thread);
+/* every object's effective priority at once (CTR_OBJECTS entries; 64 for what is not a thread) */
+void snx_ctr_thread_priorities(SnxCtrProcess* p, uint32_t* priority);
+/* an object type a thread can wait on */
+bool snx_ctr_waitable(uint32_t type);
+/* host monotonic nanoseconds, the clock every deadline is on */
+uint64_t snx_ctr_now_ns(void);
 SnxCtrSvcResult snx_ctr_wait_many(SnxCtrProcess* p, uint32_t* registers);
 void snx_ctr_wake_waiters(SnxCtrProcess* p, uint32_t object);
 /* The current thread's wait or sleep deadline from an SVC's s64 nanoseconds (low, high words): -1 is none, another

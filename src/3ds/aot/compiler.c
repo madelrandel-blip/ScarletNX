@@ -102,9 +102,11 @@ static bool descriptor(LLVMModuleRef mod, LLVMTargetDataRef layout, const SnxCtr
     LLVMSetInitializer(global, LLVMConstNamedStruct(structure, values, 18));
     LLVMSetGlobalConstant(global, 1);
 #ifdef _WIN32
-    /* COFF has no hidden visibility: without an explicit export, lld exports every global of the DLL, a block
-       function each, past PE's 65535 exports. Exporting the descriptor alone turns that off, as the ELF module's
-       hidden blocks leave it the only symbol the loader looks up. */
+    /* COFF has no hidden visibility. A DLL without any explicit export gets every global exported by lld, one per
+       block function, past the 65535 exports PE allows. Once one symbol is exported explicitly lld exports nothing
+       else, so the descriptor, the only symbol the loader looks up, is marked. The module is built for the host the
+       compiler runs on, so the compiler's own _WIN32 says the module is a DLL (an MSYS2 or Cygwin build of the
+       compiler targets Windows too and defines it). */
     LLVMSetDLLStorageClass(global, LLVMDLLExportStorageClass);
 #endif
     return true;
@@ -306,7 +308,7 @@ int snx_ctr_aot_compile(const char* extracted, char* error, size_t error_size) {
         goto done;
     }
     runtime = snx_path_join(stage, "arm-runtime.a");
-    if (!runtime || snx_write_file(runtime, snx_ctr_aot_runtime, snx_ctr_aot_runtime_size)) {
+    if (snx_write_file(runtime, snx_ctr_aot_runtime, snx_ctr_aot_runtime_size)) {
         snprintf(error, error_size, "cannot stage bounded native semantic helpers");
         goto done;
     }
@@ -325,18 +327,23 @@ int snx_ctr_aot_compile(const char* extracted, char* error, size_t error_size) {
     command[arg++] = "-Wl,-undefined,error";
 #elif !defined(_WIN32)
     command[arg++] = "-Wl,-z,defs,-z,noexecstack,-z,relro,-z,now";
+#else
+    /* A PE DLL needs none of those: an unresolved symbol is always a link error, and it has no lazily bound PLT for
+       relro and now to protect (lld's MinGW driver refuses -z). It is asked for DEP and ASLR compatibility outright
+       rather than through the linker's defaults. lld writes no import library unless asked (--out-implib), so the
+       published folder holds the DLL alone. */
+    command[arg++] = "-Wl,--nxcompat,--dynamicbase";
 #endif
-    /* A PE DLL needs none of those: an unresolved symbol is always a link error, lld marks it NXCOMPAT, and it has no
-       lazily bound PLT for relro and now to protect. lld's MinGW driver refuses -z. */
     /* The linker runs in the staging directory and is given the files' names alone. With full paths a large image's
        hundreds of chunks pass the 32767 characters a Windows command line holds (CreateProcessW fails with
-       ERROR_FILENAME_EXCED_RANGE); 1024 chunks, the most the entry limit allows, take about 15000 by name. */
+       ERROR_FILENAME_EXCED_RANGE). 1024 chunks, the most the entry limit allows, take about 16500 by name, quotes
+       included. */
     for (unsigned i = 0; i < files; ++i) command[arg++] = leaf(objects[i]);
     command[arg++] = leaf(runtime);
     command[arg++] = "-o";
     command[arg++] = leaf(module);
     if (snx_run_stage(command, stage, "native linking")) {
-        snprintf(error, error_size, "native linker failed; no runnable module published");
+        snprintf(error, error_size, "the native linker failed, so no module was published");
         goto done;
     }
     if (!snx_is_file(module) || snx_is_link(module) || !snx_file_size(module)) {
@@ -348,15 +355,23 @@ int snx_ctr_aot_compile(const char* extracted, char* error, size_t error_size) {
         result = 3;
         goto done;
     }
-    if (!snx_ctr_image_load(directory, &check, error, error_size) || memcmp(image.identity, check.identity, 32)) {
+    if (!snx_ctr_image_load(directory, &check, error, error_size)) goto done; /* its own error says why */
+    if (memcmp(image.identity, check.identity, 32)) {
         snprintf(error, error_size, "extracted image changed during compilation");
         goto done;
     }
-    /* a module from an earlier compile is replaced, only once the new one is complete */
+    /* A module from an earlier compile is replaced only once the new one is complete. If the new one cannot take
+       its place the old one goes back, so a failed publish leaves what was there. On Windows a folder whose DLL a
+       running copy of the game has loaded cannot be moved. */
     previous = snx_path_join(directory, "native.previous");
-    if ((snx_path_exists(previous) && snx_remove_tree(previous)) ||
-        (snx_path_exists(target) && snx_replace(target, previous)) || snx_replace(stage, target)) {
-        snprintf(error, error_size, "cannot publish new native output");
+    bool had_target = snx_path_exists(target);
+    if ((snx_path_exists(previous) && snx_remove_tree(previous)) || (had_target && snx_replace(target, previous))) {
+        snprintf(error, error_size, "cannot move the previous module aside (%s). Is the game still running?", target);
+        goto done;
+    }
+    if (snx_replace(stage, target)) {
+        if (had_target) (void)snx_replace(previous, target);
+        snprintf(error, error_size, "cannot publish the new module as %s", target);
         goto done;
     }
     (void)snx_remove_tree(previous);

@@ -79,6 +79,12 @@ static bool new_object(SnxCtrIpc* c, uint32_t kind, uint32_t writable, void* hos
 }
 /* Bounded path decode shared by every path-carrying command. PATH_BINARY and
    PATH_UTF16 carry UTF-16LE; PATH_ASCII carries ASCII bytes. */
+/* The path's descriptor, the word before its pointer: static buffer 0 of the path's size (libctru's FSUSER_*) */
+static bool path_descriptor(SnxCtrIpc* c, uint32_t size_word, uint32_t ptr_word) {
+    if (c->in[ptr_word - 1] == ((c->in[size_word] << 14) | 2)) return true;
+    snx_ctr_ipc_bad(c);
+    return false;
+}
 static bool read_path(SnxCtrIpc* c, uint32_t type_word, uint32_t size_word, uint32_t ptr_word, char out[768],
                       const char** relative) {
     uint32_t type = c->in[type_word], size = c->in[size_word];
@@ -283,7 +289,7 @@ static void open_directory(SnxCtrIpc* c) {
     }
     char path[768];
     const char* relative = NULL;
-    if (!read_path(c, 3, 4, 6, path, &relative)) return;
+    if (!path_descriptor(c, 4, 6) || !read_path(c, 3, 4, 6, path, &relative)) return;
     if (a->kind != 1) {
         c->state = SNX_CTR_IPC_UNSUPPORTED;
         return;
@@ -318,7 +324,7 @@ static void create_entry(SnxCtrIpc* c, int is_dir) {
     uint64_t file_size = is_dir ? 0 : (uint64_t)c->in[7] | (uint64_t)c->in[8] << 32;
     char path[768];
     const char* relative = NULL;
-    if (!read_path(c, 4, 5, is_dir ? 8 : 10, path, &relative)) return;
+    if (!path_descriptor(c, 5, is_dir ? 8 : 10) || !read_path(c, 4, 5, is_dir ? 8 : 10, path, &relative)) return;
     pm_lock(&p->tree->lock);
     FsTreeResult rc = fs_tree_create(p->tree, p->sd, relative, is_dir, file_size, NULL);
     pm_unlock(&p->tree->lock);
@@ -342,7 +348,7 @@ static void remove_entry(SnxCtrIpc* c, int is_dir) {
     }
     char path[768];
     const char* relative = NULL;
-    if (!read_path(c, 4, 5, 7, path, &relative)) return;
+    if (!path_descriptor(c, 5, 7) || !read_path(c, 4, 5, 7, path, &relative)) return;
     pm_lock(&p->tree->lock);
     FsTreeResult rc = fs_tree_remove(p->tree, p->sd, relative, is_dir, 0, 0);
     pm_unlock(&p->tree->lock);

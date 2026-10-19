@@ -3,6 +3,7 @@
 #include "3ds/runtime/internal.h"
 #include "3ds/gpu/pica.h"
 #include "3ds/services/dsp.h"
+#include "3ds/services/file.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -58,27 +59,44 @@ static bool special_mappings(SnxCtrProcess* p, const uint32_t* caps) {
     }
     return true;
 }
-/* UTC now in milliseconds since 1900, the shared page's date_time */
-static bool utc_1900_ms(uint64_t* out) {
+/* The host's local wall-clock time in milliseconds since 1900, the shared page's date_time: the console keeps local
+   time, and Azahar gives it the host's (Handler::GetSystemTimeSince1900, daylight saving included). The console
+   allows no time before 2000, so an earlier host clock reads as 2000-01-01 as Azahar has it. */
+static bool local_1900_ms(uint64_t* out) {
     struct timespec now;
+    struct tm local;
     if (
 #if defined(__ANDROID__) && __ANDROID_API__ < 29
         clock_gettime(CLOCK_REALTIME, &now)
 #else
         !timespec_get(&now, TIME_UTC)
 #endif
-        || now.tv_sec < 0 || (uint64_t)now.tv_sec > (UINT64_MAX - 999) / 1000 - UINT64_C(2208988800))
+    )
         return false;
-    *out = ((uint64_t)now.tv_sec + UINT64_C(2208988800)) * 1000 + (uint64_t)now.tv_nsec / 1000000;
+    time_t seconds = now.tv_sec;
+#ifdef _WIN32
+    if (localtime_s(&local, &seconds)) return false;
+#else
+    if (!localtime_r(&seconds, &local)) return false;
+#endif
+    /* days from 1900-01-01 to the local date (the proleptic Gregorian count of H. Hinnant's days_from_civil) */
+    int64_t year = (int64_t)local.tm_year + 1900 - (local.tm_mon < 2);
+    int64_t era = (year >= 0 ? year : year - 399) / 400, of_era = year - era * 400;
+    int64_t month = local.tm_mon < 2 ? local.tm_mon + 10 : local.tm_mon - 2; /* from March */
+    int64_t of_year = (153 * month + 2) / 5 + local.tm_mday - 1;
+    int64_t days = era * 146097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719468 + 25567;
+    int64_t ms = ((days * 24 + local.tm_hour) * 60 + local.tm_min) * 60 + local.tm_sec;
+    ms = ms * 1000 + now.tv_nsec / 1000000;
+    *out = ms > INT64_C(3155673600000) ? (uint64_t)ms : UINT64_C(3155673600000);
     return true;
 }
 void snx_ctr_shared_page_time(SnxCtrProcess* p) {
     /* Azahar's UpdateTimeCallback: the entry the counter's parity does not select gets the time, the tick it was
        taken at and the tick rate; then the counter moves on, so readers (index counter & 1) switch to it whole */
     uint64_t rtc, ticks = (uint64_t)((snx_seconds() - p->clock_origin) * 268111856.0), values[4];
-    p->time_update_ns = (uint64_t)(snx_seconds() * 1e9) + UINT64_C(3600000000000);
+    p->time_update_ns = snx_ctr_now_ns() + UINT64_C(3600000000000);
     unsigned char counter[4];
-    if (!utc_1900_ms(&rtc) || snx_ctr_phys_read(p->memory, 0x1ff81000, counter, 4) != SNX_CTR_MEM_OK) return;
+    if (!local_1900_ms(&rtc) || snx_ctr_phys_read(p->memory, 0x1ff81000, counter, 4) != SNX_CTR_MEM_OK) return;
     uint32_t count =
         (uint32_t)counter[0] | (uint32_t)counter[1] << 8 | (uint32_t)counter[2] << 16 | (uint32_t)counter[3] << 24;
     values[0] = rtc;
@@ -96,10 +114,12 @@ void snx_ctr_shared_page_time(SnxCtrProcess* p) {
 }
 void snx_ctr_process_free(SnxCtrProcess* p) {
     if (!p) return;
-    free(p->gsp.regs);
     if (p->gsp.pica) snx_ctr_pica_free(p->gsp.pica);
     free(p->gsp.pica);
     snx_ctr_dsp_close(p);
+    /* files still open when the process ends close their host files and release their nodes before the tree goes */
+    for (uint32_t i = 1; i < CTR_OBJECTS; ++i)
+        if (p->objects[i].type == CTR_OBJ_FILE && !p->objects[i].data.file.closed) snx_ctr_file_release(p, i);
     snx_ctr_romfs_free(p->romfs);
     if (p->tree) {
         fs_tree_destroy(p->tree);
@@ -127,7 +147,8 @@ SnxCtrProcess* snx_ctr_process_new(const SnxCtrImage* image, SnxCtrModel model) 
     p->objects[1] = (CtrObject){.type = CTR_OBJ_PROCESS, .refs = 1};
     p->objects[2] = (CtrObject){.type = CTR_OBJ_THREAD, .refs = 1};
     p->current_thread = 2;
-    p->objects[2].data.thread.priority = 0x30;
+    /* the ExHeader's ARM11 local capabilities give the main thread's priority (Azahar Process::Run) */
+    p->objects[2].data.thread.priority = image->main_priority;
     p->memory = snx_ctr_memory_new(model);
     if (!p->memory || !(p->space = snx_ctr_space_new(p->memory))) goto fail;
     size_t offset = 0;
@@ -147,11 +168,15 @@ SnxCtrProcess* snx_ctr_process_new(const SnxCtrImage* image, SnxCtrModel model) 
         offset += (size_t)bytes;
     }
     uint32_t stack = (image->stack_size + 4095) & ~4095u;
+    p->stack_size = stack;
     if (offset != image->code_size || !map(p, SNX_CTR_STACK_TOP - stack, stack, SNX_CTR_READ | SNX_CTR_WRITE) ||
         !map(p, SNX_CTR_INITIAL_TLS, 4096, SNX_CTR_READ | SNX_CTR_WRITE) ||
         !snx_ctr_cpu_init(&p->cpu, p->space, image->segment[0].address, SNX_CTR_STACK_TOP, false))
         goto fail;
     p->cpu.state.cpu.tpidruro = SNX_CTR_INITIAL_TLS;
+    /* default NaN, flush-to-zero, round toward zero and the inexact enable, as Azahar's SetupMainThread starts the main
+       thread (kernel/thread.cpp); created threads start without the inexact bit (snx_ctr_thread_create) */
+    p->cpu.state.cpu.fpscr = 0x03c00010u;
     p->objects[2].data.thread.context = p->cpu.state.cpu;
     /* Configuration-page layout and kernel personality facts from Citra/Azahar
        config_mem.{h,cpp}, memory.cpp (GPL-2.0-or-later, revision in docs/3DS.md).
@@ -180,7 +205,7 @@ SnxCtrProcess* snx_ctr_process_new(const SnxCtrImage* image, SnxCtrModel model) 
        slider down. The time entry is written now and then every hour; clients interpolate between with SVC 0x28.
        Host-paced monotonic ticks, not an instruction/cycle-accuracy claim. */
     uint64_t rtc;
-    if (!utc_1900_ms(&rtc)) goto fail;
+    if (!local_1900_ms(&rtc)) goto fail;
     p->clock_origin = snx_seconds();
     unsigned char shared[4096] = {0};
     shared[0x04] = 1;    /* running_hw: product */

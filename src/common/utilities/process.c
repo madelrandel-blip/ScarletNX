@@ -185,7 +185,7 @@ static int run_stage(const char* const* argv, const char* cwd, const char* stage
         if (tty) sigaction(SIGTTOU, &old_ttou, NULL);
         sigprocmask(SIG_SETMASK, &previous, NULL);
         if (cwd && chdir(cwd)) {
-            perror("scarletnx: chdir to game directory");
+            perror("scarletnx: chdir to the child's working directory");
             _exit(126);
         }
         execvp(argv[0], (char* const*)argv);

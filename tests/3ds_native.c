@@ -120,7 +120,12 @@ int main(int argc, char** argv) {
             assert(read_word(space, 0x10004c) == 0xe59f3038 && read_word(space, 0x100054) == 0xe12fff13);
             uint32_t main_pc = read_word(space, 0x10008c);
             assert(main_pc == 0x167d88);
-            bool entered_main = false, opened_direct = false, opened_archive = false, controlled = false;
+            /* One block at a time, so each reply is seen in the command buffer of the thread that sent it (its TLS
+               taken before the block, as the scheduler may switch threads after the SVC). The startup must reach
+               the archive timestamp within the bound; then a fixed number of blocks more must run */
+            const uint64_t bound = 500000, after = 50000;
+            bool entered_main = false, opened_direct = false, opened_archive = false, timestamp = false;
+            uint64_t controlled = 0; /* blocks when ControlArchive GET_TIMESTAMP was answered with success */
             do {
                 if (cpu->r[15] == main_pc) {
                     assert(cpu->r[14] == 0x1626c4);
@@ -128,23 +133,29 @@ int main(int argc, char** argv) {
                     printf("SuperTux main entry reached: pc=0x%08x blocks=%llu\n", main_pc,
                            (unsigned long long)executed);
                 }
+                uint32_t command = cpu->tpidruro + 0x80, header = read_word(space, command);
+                /* FSUSER_ControlArchive's request: archive, then the action, 1 = GET_TIMESTAMP */
+                bool asks_timestamp = header == 0x080d0144 && read_word(space, command + 12) == 1;
                 state = snx_ctr_dispatch(native.module, process, 1, &continued);
                 executed += continued;
-                uint32_t command = cpu->tpidruro + 0x80, header = read_word(space, command);
+                header = read_word(space, command);
                 if (header == 0x08030042 && !read_word(space, command + 4) && read_word(space, command + 12))
                     opened_direct = true;
                 if (header == 0x080c00c0 && !read_word(space, command + 4) &&
                     (read_word(space, command + 8) || read_word(space, command + 12)))
                     opened_archive = true;
-                if (header == 0x080d0040 && !read_word(space, command + 4))
-                    controlled = true; /* ControlArchive (the archive timestamp) answered with success */
-            } while (state == SNX_CTR_RUN_BUDGET && executed < 500000);
+                if (asks_timestamp) timestamp = header == 0x080d0040 && !read_word(space, command + 4);
+                if (timestamp && !controlled) controlled = executed;
+            } while (state == SNX_CTR_RUN_BUDGET && (controlled ? executed < controlled + after : executed < bound));
             printf("SuperTux post-startup boundary: state=%u pc=0x%08x syndrome=0x%08x blocks=%llu\n", (unsigned)state,
                    cpu->r[15], cpu->syndrome, (unsigned long long)executed);
-            /* Past the archive timestamp the title loads its data and draws: the probe's budget ends the run,
-               nothing unsupported does. Where it ends depends on host-paced vblank and DSP time. */
+            /* Past the archive timestamp the title goes on loading: only the probe's count ends the run, nothing
+               unsupported does. Where it is by then depends on host-paced vblank and DSP time. */
             assert(entered_main && opened_direct && opened_archive && controlled);
-            assert(state == SNX_CTR_RUN_BUDGET && executed >= 500000);
+            assert(state == SNX_CTR_RUN_BUDGET && executed == controlled + after);
+            /* and in the driver's slices, which poll the scheduler every SNX_CTR_POLL_BLOCKS blocks */
+            state = snx_ctr_dispatch(native.module, process, 4 * SNX_CTR_POLL_BLOCKS, &continued);
+            assert(state == SNX_CTR_RUN_BUDGET && continued == 4 * SNX_CTR_POLL_BLOCKS);
         } else if (!strcmp(argv[2], "kernel")) {
             assert(state == SNX_CTR_RUN_EXIT && executed == 14 && cpu->r[0] == 42);
             assert(read_word(snx_ctr_process_space(process), 0x08000000) == 1);

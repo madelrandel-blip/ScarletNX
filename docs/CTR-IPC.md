@@ -23,18 +23,26 @@ for that separate profile, and [3DS status](3DS.md) for outstanding work.
   Full RAM read/write permissions are checked **before** invoking handlers or
   allocating output handles. MMIO is never used for command-buffer transfers.
   Serialization makes the write preflight stable through response publication.
-- Translation framing checks descriptor forms and payload counts, classifying
-  buffers before handles. PID is a 32-bit kernel-supplied caller identity, not
-  the value claimed by the guest. Incoming handles and PXI buffers remain
-  **unsupported**. Mapped writable output buffers are accepted only for the
-  checked FSFILE Read path. Static buffers are accepted only by APT utility /
-  ReceiveParameter, FS absent-SD and SelfNCCH paths below, not a general schema type.
-  Other static-buffer commands stop explicitly; Switch descriptors are never used.
+- Translation (Azahar's `hle_ipc.cpp`) takes any well-formed descriptor and
+  classifies buffers before handles: copied (`0x00`) and moved (`0x10`) handles,
+  up to 8 in all, the calling PID (`0x20`, the kernel writes the real PID over the
+  client's word), static buffers (`2`) the service reads, PXI buffers (`6` the
+  service reads, `4` it also writes, as libctru's `IPC_Desc_PXIBuffer`), and
+  mapped buffers (`0xA` read, `0xC` write, `0xE` both). Every buffer is checked
+  against the caller's memory for the access it grants before any handler runs,
+  and handlers still check the exact form each command takes. A request with more
+  than 8 handles stops the run, since the runtime does not translate it. Switch
+  descriptors are never used.
 - The response repeats the command ID; its first normal word is the service
   result. Transport SVC result and service result are distinct. Failed service
   calls publish a result-only response. Malformed requests return a transport
-  error without changing the command buffer or invoking the handler. Unknown
-  commands and valid-but-unimplemented translation features stop explicitly.
+  error without changing the command buffer or invoking the handler. Moved handles
+  leave the caller's table once a handler has taken the request, even when it
+  answers with a transport error. Unknown commands stop the run, unless
+  `--ipc-stubs` names their service (`all`, or `srv`, `fs`, `apt`, `ptm`, `hid`,
+  `gsp`, `cfg`, `dsp`, where `fs` covers file sessions too). Then they answer
+  success with one normal word, as Azahar's ReportUnimplementedFunction does, and
+  each is logged the first time it is answered.
 - Sessions are real typed kernel objects. Duplicates share state and retain a
   reference; final close frees the object. Output handles are newly owned client
   references, published with the declared copy/move descriptor and relinquished
@@ -43,7 +51,8 @@ for that separate profile, and [3DS status](3DS.md) for outstanding work.
 - Bounds are 256 handles/256 object slots including roots; endpoint caps are
   64 `srv:` and 32 FS sessions. These are bounded implementation quotas, not
   complete hardware resource-limit/ExHeader capability enforcement. APT/PTM/HID
-  session caps are 2 each; thread cap is 16 including the initial thread.
+  session caps are 2 each. Threads and the other kernel objects follow the
+  APPLICATION resource limit (32 threads including the initial one).
   Read-only FSFILE objects have a separate 64-object cap.
 
 ## Generator subset
@@ -79,14 +88,17 @@ other translation units include the generated `.h`.
   GetProcessId (`0x35`) identifies the real single application's process root;
   PID `0x10` is local to that independently owned board/process instance.
 - `srv:` RegisterClient (`1`) associates the caller process with that session.
-  GetServiceHandle (`5`) returns real FS/APT/PTM/HID sessions. An absent endpoint
-  with the non-wait flag returns ServiceNotRegistered; a waiting request blocks
-  its actual thread without a response/session. Peers can execute; the wait is
-  not completed without registration. Dynamic service installation is unsupported.
+  GetServiceHandle (`5`) returns real FS, APT, PTM, HID, GSP, cfg and DSP sessions.
+  An absent endpoint with the non-wait flag returns ServiceNotRegistered. A waiting
+  request blocks its actual thread without a response or session, and the runtime
+  prints the service's name, since no other process can register it. Peers can
+  execute. Dynamic service installation is unsupported.
 - `fs:USER` Initialize (`0x801`) and InitializeWithSdkVersion (`0x861`) record
   caller/SDK association. OpenArchive (`0x80c`) accepts an empty path and a
-  checked size-one static descriptor. Archive 9 returns FS NotFound (`0xc8804478`)
-  because no SD backing exists. Archive 3 binds the real process RomFS: 32
+  checked size-one static descriptor. Archive 9 (SDMC) binds a read-write host
+  folder for the title, where CreateFile, DeleteFile, CreateDirectory,
+  DeleteDirectory, Rename and OpenDirectory work on UTF-16 paths whose static
+  buffer descriptor (buffer 0, the path's size) is checked. Archive 3 binds the real process RomFS: 32
   live typed FS-private tokens, monotonically issued 64-bit IDs, never reused
   and never kernel handles. CloseArchive (`0x80e`) retires that binding;
   invalid/stale tokens return `0xc8804465`. Existing files outlive archive close.
@@ -96,7 +108,9 @@ other translation units include the generated `.h`.
   archive or mount. OpenFile (`0x802`) accepts a live archive token and the same
   read-only binary selector. Missing RomFS returns its genuine NotFound error.
   Token exhaustion and file/handle publication failures leave resources unchanged.
-  ControlArchive/timestamps remain unsupported; no synthetic timestamp is returned.
+  ControlArchive (`0x80d`) GET_TIMESTAMP returns the backing host file's real
+  modification time, COMMIT_SAVE_DATA on SDMC succeeds since writes have already
+  reached the host, and other actions stop.
 - FSFILE GetSize (`0x804`), Close (`0x808`) and Read (`0x802`) expose a CTR
   level-3 view reconstructed over extracted `romfs/`. `common/filesystem/`
   supplies the same indexed nodes, immutable shared mappings and fallback
@@ -104,8 +118,9 @@ other translation units include the generated `.h`.
   reopened. Reads are capped at 16 MiB/request, clamp at EOF, preflight the
   whole requested writable RAM span and stage all host IO before guest writes.
   Malformed descriptors, MMIO and permissions cannot publish partial reads;
-  host IO failure stops without a reply or guest writes. Duplicates share close state. Writes,
-  general archive/path opens, SD/save backing and other commands stop explicitly.
+  host IO failure stops without a reply or guest writes. Duplicates share close
+  state. On SDMC files Write and SetSize reach the host file. Save data, extdata
+  and other archives stop explicitly (parity roadmap F3).
 - `APT:S`: GetLockHandle (`1`), Initialize (`2`), Enable (`3`), NotifyToWait
   (`0x43`), ReceiveParameter (`0xd`), AppletUtility (`0x4b`), IsNew3DS (`0x102`).
   One application slot (`0x300`, attributes 0), persistent recursive mutex,
@@ -126,30 +141,34 @@ other translation units include the generated `.h`.
   read-only page at `0x10000000` (permissions 1/`0x10000000`). No periodic input
   updates/events or writable/general shared-memory mappings are implemented.
 
-Serialized kernel support includes CreateThread (`8`), fixed per-thread priorities,
-ReleaseMutex (`0x14`), Create/Signal/ClearEvent (`0x17`/`0x18`/`0x19`),
-WaitSynchronization1/N (`0x24`/`0x25`), mutex recursion, waiter references and
-priority-ordered event/mutex/arbiter wakeups. Pending thread CPU/TLS/wait state
-is preserved across native dispatch. Only immediate / infinite waits are supported;
-finite nonzero pending deadlines stop before mutation. Timers, time slicing,
-full thread lifecycle and multicore remain unsupported; no host-thread safety
-or hardware-complete scheduler claim is made. With no runnable peers a real
-wait stays BLOCKED, never a fabricated successful return.
+Serialized kernel support includes CreateThread (`8`), ExitThread (`9`),
+SleepThread (`0xa`), Get/SetThreadPriority with effective (inherited)
+priorities, ReleaseMutex (`0x14`), Create/Signal/ClearEvent (`0x17`/`0x18`/`0x19`),
+timers (`0x1a`–`0x1d`), WaitSynchronization1/N (`0x24`/`0x25`) with finite
+timeouts, mutex recursion, waiter references and wakeups by effective priority,
+then by how long the thread waited. Pending thread CPU/TLS/wait state is preserved
+across native dispatch. The dispatcher polls the scheduler every 4096 blocks, so a
+thread a deadline wakes with a better priority preempts one that makes no SVC.
+Multicore timing is not modeled and no host-thread safety or hardware-complete
+scheduler claim is made. With no runnable peers and no deadline a real wait stays
+BLOCKED, never a fabricated successful return.
 
 GetSystemTick (`0x28`) uses a process-owned host monotonic origin and the
 268111856 Hz base domain on both models. A read-only shared page at `0x1ff81000`
-holds a host-UTC snapshot (milliseconds since 1900) and its tick reference.
-This is host-paced time, not cycle accuracy, timers or pending finite waits.
+holds the host's local date and time (milliseconds since 1900) and its tick
+reference, rewritten every hour into the entry its counter does not select, as
+Azahar does. This is host-paced time, not cycle accuracy.
 
 SuperTux **reaches and executes main**, opens its real reconstructed RomFS,
-executes scalar VFP in `gettimeofday`, then opens its SelfNCCH archive and
-stops at timestamp ControlArchive (`0x80d`), before its first file read.
-See [the exact witness](3DS-SUPERTUX.md). No first frame is claimed.
+executes scalar VFP in `gettimeofday`, answers its archive timestamp request,
+and goes on to draw its title screen and play its music.
+See [the exact witness](3DS-SUPERTUX.md).
 
 ## Tests and reference provenance
 
 `3ds_ipc` executes real sessions/handlers against checked memory on both models,
-including forged PID replacement, malformed counts/descriptors, read-only,
+including forged PID replacement, PXI buffer directions, the handle limit, stub
+lists and moved handles on success and on refusal, malformed counts/descriptors, read-only,
 unmapped/misaligned/MMIO TLS, stale/duplicate handles, endpoint/handle exhaustion,
 rollback and non-resumable waits. `ctr_swipc_dispatch` is a generator-only C90
 fixture with deliberately test-local resource accounting; it checks declaration
@@ -173,7 +192,8 @@ contents, forces on-demand IO and checks failed-read atomicity, unavailable
 resources, EOF/permissions/MMIO, handle/object caps and duplicate/close ownership.
 The unchanged NX tree/service/raw-image fixtures also run in CTR-only builds.
 
-Reference facts: Azahar `68202bc4ff7edf9d7280ec0dcd6572b7cd1ae26e`,
+Reference facts: Azahar `68202bc4ff7edf9d7280ec0dcd6572b7cd1ae26e` (and
+`987f18405073960622e1043bb44005989135c6e1` for F1's translation, stubs and GSP),
 `core/hle/ipc.h`, `kernel/hle_ipc.cpp`, `kernel/svc.cpp`,
 `service/sm/{srv.cpp,sm.h}`, `service/fs/fs_user.cpp`, `service/apt/`,
 `service/hid/`, `kernel/{mutex,event,thread}.cpp` (GPL-2.0-or-later), and libctru's

@@ -103,6 +103,7 @@ def ncch(
     put(exheader, 0x20, '<3I', 0x200000, 1, 16)
     put(exheader, 0x30, '<4I', 0x300000, 1, 4, 0x1000)
     put(exheader, 0x200, '<Q', TITLE)
+    exheader[0x20F] = 0x30  # the main thread's priority (ARM11 local capabilities), an application's usual one
     if patch_exheader:
         patch_exheader(exheader)
     code = bytearray(0x3000)

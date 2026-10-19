@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
     unsigned char code[0x3000] = {0};
     SnxCtrImage image = {.segment = {{0x100000, 1, 16}, {0x200000, 1, 4}, {0x300000, 1, 4}},
                          .stack_size = 0x4000,
+                         .main_priority = 0x30,
                          .bss_size = 0x3000,
                          .code = code,
                          .code_size = sizeof code};
@@ -135,13 +136,19 @@ int main(int argc, char** argv) {
         p->cpu.state.cpu.r[2] = 3;
         p->cpu.state.cpu.r[3] = 0x10000000;
         assert(snx_ctr_svc(p, 0x1f) == SNX_CTR_SVC_RETURN && !p->cpu.state.cpu.r[0]);
-        /* QueryMemory reports the registered mapping as shared. */
-        word(p, 0x300000, 0);
-        p->cpu.state.cpu.r[0] = 0x300000;
-        p->cpu.state.cpu.r[1] = 0x300010;
-        p->cpu.state.cpu.r[2] = QUEUE;
-        assert(snx_ctr_svc(p, 0x02) == SNX_CTR_SVC_RETURN && !p->cpu.state.cpu.r[0]);
-        assert(at(p, 0x300000) == QUEUE && at(p, 0x300004) == 0x1000 && at(p, 0x300008) == 3 && at(p, 0x30000c) == 6);
+        /* QueryMemory reports the registered mapping as shared, in registers as libctru's svcQueryMemory reads
+           them: base r1, size r2, permissions r3, state r4, page flags r5 */
+        uint32_t* q = p->cpu.state.cpu.r;
+        q[0] = 0x300000;
+        q[1] = 0x300010;
+        q[2] = QUEUE + 0x10;
+        q[5] = 0xdeadbeef;
+        assert(snx_ctr_svc(p, 0x02) == SNX_CTR_SVC_RETURN && !q[0]);
+        assert(q[1] == QUEUE && q[2] == 0x1000 && q[3] == 3 && q[4] == 6 && !q[5]);
+        q[2] = 0x100000; /* the code segment: Code (4), read and execute */
+        assert(snx_ctr_svc(p, 0x02) == SNX_CTR_SVC_RETURN && !q[0] && q[1] == 0x100000 && q[3] == 5 && q[4] == 4);
+        q[2] = 0x1ff81000; /* the shared page: Shared, read-only */
+        assert(snx_ctr_svc(p, 0x02) == SNX_CTR_SVC_RETURN && !q[0] && q[3] == 1 && q[4] == 6);
         /* GPU right + process handle check. */
         request(p, gsp, acquire, 4, SNX_CTR_SVC_RETURN, 0);
         assert(!get(p, 1));
@@ -149,22 +156,55 @@ int main(int argc, char** argv) {
         request(p, gsp, acquire, 4, SNX_CTR_SVC_RETURN, 0);
         assert(get(p, 1) == 0xd8e007f7);
         acquire[3] = CTR_PROCESS_HANDLE;
-        /* Register writes land in the bounded register file with exact values. */
-        uint32_t hw[] = {0x00010082, 0x51c, 8, (8u << 14) | 2, 0x300200};
+        /* Register writes as libctru's GSPGPU_WriteHWRegs and WriteHWRegsWithMask send them, checked as Azahar
+           checks them: the right, then an address below 0x420000, then at most 0x80 bytes (the static buffer's
+           size, not the size word), then whole words */
+        uint32_t hw[] = {0x00010082, 0x400468, 8, (8u << 14) | 2, 0x300200};
         word(p, 0x300200, 0x01c501c1);
         word(p, 0x300204, 0x000001c1);
         request(p, gsp, hw, 5, SNX_CTR_SVC_RETURN, 0);
         assert(!get(p, 1));
-        hw[1] = 0x1000;
+        hw[2] = 0;
         request(p, gsp, hw, 5, SNX_CTR_SVC_RETURN, 0);
-        assert(get(p, 1) == 0xe0e02a01); /* out of the modeled register range */
-        hw[1] = 0x51c;
-        hw[2] = 6;
+        assert(!get(p, 1));
+        hw[1] = 0x420000;
+        request(p, gsp, hw, 5, SNX_CTR_SVC_RETURN, 0);
+        assert(get(p, 1) == 0xe0e02a01);
+        hw[1] = 0x40046a;
+        request(p, gsp, hw, 5, SNX_CTR_SVC_RETURN, 0);
+        assert(get(p, 1) == 0xe0e02a01);
+        hw[1] = 0x400468;
+        hw[3] = (0x84u << 14) | 2;
+        request(p, gsp, hw, 5, SNX_CTR_SVC_RETURN, 0);
+        assert(get(p, 1) == 0xe0e02bec);
         hw[3] = (6u << 14) | 2;
         request(p, gsp, hw, 5, SNX_CTR_SVC_RETURN, 0);
-        assert(get(p, 1) == 0xe0e02bf2); /* register writes are word-sized */
-        hw[2] = 8;
+        assert(get(p, 1) == 0xe0e02bf2);
         hw[3] = (8u << 14) | 2;
+        /* the mask is static buffer 1, and may be shorter than the data */
+        uint32_t masked[] = {0x00020084, 0x400468, 8, (8u << 14) | 2, 0x300200, (4u << 14) | (1u << 10) | 2, 0x300200};
+        request(p, gsp, masked, 7, SNX_CTR_SVC_RETURN, 0);
+        assert(!get(p, 1));
+        masked[5] = (8u << 14) | (2u << 10) | 2;
+        request(p, gsp, masked, 7, SNX_CTR_SVC_RETURN, SNX_CTR_IPC_BAD_DESCRIPTOR);
+        masked[5] = (4u << 14) | (1u << 10) | 2;
+        /* without the GPU right, writes and buffer swaps fail with GX's NoPermission */
+        uint32_t release[] = {0x00170000};
+        request(p, gsp, release, 1, SNX_CTR_SVC_RETURN, 0);
+        assert(!get(p, 1));
+        request(p, gsp, hw, 5, SNX_CTR_SVC_RETURN, 0);
+        assert(get(p, 1) == 0xd8202a06);
+        request(p, gsp, masked, 7, SNX_CTR_SVC_RETURN, 0);
+        assert(get(p, 1) == 0xd8202a06);
+        uint32_t no_right_swap[] = {0x00050200, 0, 0, 0x300200, 0x300200, 960, 0, 0, 0};
+        request(p, gsp, no_right_swap, 9, SNX_CTR_SVC_RETURN, 0);
+        assert(get(p, 1) == 0xd8202a06);
+        request(p, gsp, acquire, 4, SNX_CTR_SVC_RETURN, 0);
+        assert(!get(p, 1));
+        /* the process handle must come in a handle descriptor */
+        acquire[2] = 0x20;
+        request(p, gsp, acquire, 4, SNX_CTR_SVC_RETURN, SNX_CTR_IPC_BAD_DESCRIPTOR);
+        acquire[2] = 0;
         /* MemoryFill through the real shared GX queue. */
         uint32_t target = 0;
         assert(!snx_ctr_kernel_memory(p, 0x10003, 0, 0, 0x1000, 3, &target) && target);
@@ -403,10 +443,20 @@ int main(int argc, char** argv) {
             snx_ctr_gsp_vblank(p);
             frame_pixel(argv[1], 3, 200, 120, rgb);
             assert(rgb[0] == 0x40 && rgb[1] == 0x50 && rgb[2] == 0x60);
-            /* RGB5A1 and RGBA4 framebuffers are accepted, and an invalid screen is ignored with success */
+            /* shown_fb is one bit of the register: 2 shows pair 1 */
+            uint32_t shown2[] = {0x00050200, 0, 0, fb, fb, 960, 0, 2, 0};
+            request(p, gsp, shown2, 9, SNX_CTR_SVC_RETURN, 0);
+            assert(!get(p, 1));
+            snx_ctr_gsp_vblank(p);
+            frame_pixel(argv[1], 4, 200, 120, rgb);
+            assert(rgb[0] == 0x10 && rgb[1] == 0x20 && rgb[2] == 0x30);
+            /* RGB5A1 and RGBA4 framebuffers are accepted and presented, and an invalid screen is ignored with
+               success */
             uint32_t rgba4_swap[] = {0x00050200, 0, 0, fb, fb, 480, 4, 0, 0};
             request(p, gsp, rgba4_swap, 9, SNX_CTR_SVC_RETURN, 0);
             assert(!get(p, 1));
+            snx_ctr_gsp_vblank(p);
+            frame_pixel(argv[1], 5, 200, 120, rgb);
             uint32_t bad_screen[] = {0x00050200, 2, 0, fb, fb, 960, 0, 0, 0};
             request(p, gsp, bad_screen, 9, SNX_CTR_SVC_RETURN, 0);
             assert(!get(p, 1));
@@ -424,12 +474,6 @@ int main(int argc, char** argv) {
             uint64_t hash2 = 0;
             assert(snx_ctr_present_frame(1, 1, 1, 1, 3, bgr, &hash2));
             const unsigned char expect2[4] = {0x30, 0x20, 0x10, 255};
-            if (hash2 != fnv(expect2, sizeof expect2)) {
-                unsigned char probe[4] = {0x10, 0x20, 0x30, 0};
-                (void)probe;
-                fprintf(stderr, "hash2=%llx want=%llx\n", (unsigned long long)hash2,
-                        (unsigned long long)fnv(expect2, sizeof expect2));
-            }
             assert(hash2 == fnv(expect2, sizeof expect2));
             /* RGBA8 (A,B,G,R bytes) and RGBA4 decode on the host */
             unsigned char abgr[4] = {0x40, 0x30, 0x20, 0x10}, rgba4[2] = {0x8c, 0x1f};

@@ -21,11 +21,10 @@ static uint32_t snx_ctr_file_wire_GetSize(SnxCtrIpc* c, uint64_t* size) {
     pm_unlock(&p->tree->lock);
     return 0;
 }
-static uint32_t snx_ctr_file_wire_Close(SnxCtrIpc* c) {
-    CtrObject* object = &c->process->objects[c->object];
-    if (object->data.file.closed) return SNX_CTR_IPC_INVALID_STATE;
+void snx_ctr_file_release(SnxCtrProcess* p, uint32_t id) {
+    CtrObject* object = &p->objects[id];
     object->data.file.closed = 1;
-    if (object->data.file.kind == CTR_FILE_HOST) {
+    if (object->data.file.kind == CTR_FILE_HOST && object->data.file.host) {
         fclose((FILE*)object->data.file.host);
         object->data.file.host = NULL;
     }
@@ -33,6 +32,11 @@ static uint32_t snx_ctr_file_wire_Close(SnxCtrIpc* c) {
         fs_tree_release((FsNode*)object->data.file.node);
         object->data.file.node = NULL;
     }
+}
+static uint32_t snx_ctr_file_wire_Close(SnxCtrIpc* c) {
+    CtrObject* object = &c->process->objects[c->object];
+    if (object->data.file.closed) return SNX_CTR_IPC_INVALID_STATE;
+    snx_ctr_file_release(c->process, c->object);
     return 0;
 }
 void snx_ctr_file_dispatch(SnxCtrIpc* c) {

@@ -30,7 +30,7 @@ uint32_t snx_ctr_dsp_open(SnxCtrProcess* p) {
     if (p->dsp.core) return 0;
     p->dsp.core = snx_ctr_dsp_new(p->memory, dsp_interrupt, p);
     if (!p->dsp.core) return 0xd86007f3u; /* out of memory */
-    p->dsp.next_frame_ns = (uint64_t)(snx_seconds() * 1e9) + SNX_CTR_DSP_FRAME_NS;
+    p->dsp.next_frame_ns = snx_ctr_now_ns() + SNX_CTR_DSP_FRAME_NS;
     return 0;
 }
 void snx_ctr_dsp_close(SnxCtrProcess* p) {
@@ -57,8 +57,14 @@ static void stop(SnxCtrIpc* c, const char* reason) {
 static uint32_t* slot(SnxCtrProcess* p, uint32_t type, uint32_t pipe) {
     return &p->dsp.interrupt[type < DSP_INTERRUPT_PIPE ? type : DSP_INTERRUPT_PIPE + pipe];
 }
+/* one handle, copied or moved, after the command's normal words: what Azahar's PopObject takes */
+static bool one_handle(SnxCtrIpc* c, uint32_t word) {
+    if (!(c->in[word] & ~0x10u)) return true;
+    snx_ctr_ipc_bad(c);
+    return false;
+}
 static void register_interrupt(SnxCtrIpc* c) {
-    if (!snx_ctr_ipc_expect(c, 2, 2)) return;
+    if (!snx_ctr_ipc_expect(c, 2, 2) || !one_handle(c, 3)) return;
     SnxCtrProcess* p = c->process;
     uint32_t type = c->in[1], pipe = c->in[2];
     if (type > DSP_INTERRUPT_PIPE || pipe >= SNX_CTR_DSP_PIPES) {
@@ -230,7 +236,7 @@ void snx_ctr_dsp_dispatch(SnxCtrIpc* c) {
             break;
         case 0x13: /* FlushDataCache */
         case 0x14: /* InvalidateDCache: host memory is coherent with the DSP's reads, nothing to do */
-            if (!snx_ctr_ipc_expect(c, 2, 2)) return;
+            if (!snx_ctr_ipc_expect(c, 2, 2) || !one_handle(c, 3)) return;
             if (c->handle_in[0] != CTR_PROCESS_HANDLE) {
                 snx_ctr_ipc_error_reply(c, DSP_ERR_HANDLE);
                 return;

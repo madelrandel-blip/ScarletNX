@@ -56,6 +56,7 @@ int main(void) {
     unsigned char code[0x3000] = {0};
     SnxCtrImage image = {.segment = {{0x100000, 1, 16}, {0x200000, 1, 4}, {0x300000, 1, 4}},
                          .stack_size = 0x4000,
+                         .main_priority = 0x30,
                          .bss_size = 0x1000,
                          .code = code,
                          .code_size = sizeof code};
@@ -139,6 +140,12 @@ int main(void) {
         assert(word(p, 0) == unknown[0] && objects(p) == 4);
         uint32_t mask = 0;
         assert(snx_ctr_ipc_stub_mask("apt,fs", &mask) && !snx_ctr_ipc_stub_mask("fs,nope", &mask));
+        /* a file session is fs's; a refused list leaves the mask as it was, and lists add up */
+        assert(mask == (1u << SNX_CTR_SERVICE_APT | 1u << SNX_CTR_SERVICE_FS | 1u << SNX_CTR_SERVICE_FILE));
+        assert(!snx_ctr_ipc_stub_mask("", &mask) && !snx_ctr_ipc_stub_mask("fs,", &mask) &&
+               !snx_ctr_ipc_stub_mask(",fs", &mask) && !snx_ctr_ipc_stub_mask("fs,,apt", &mask));
+        assert(snx_ctr_ipc_stub_mask("dsp", &mask) && (mask & 1u << SNX_CTR_SERVICE_DSP) &&
+               (mask & 1u << SNX_CTR_SERVICE_APT));
         assert(snx_ctr_ipc_stub_mask("fs", &p->ipc_stubs));
         request(p, unknown, 1);
         sync(p, fs, SNX_CTR_SVC_RETURN, 0);
@@ -152,6 +159,18 @@ int main(void) {
         uint32_t unmapped[] = {0x08010002, 0x0000100a, 0x00500000};
         request(p, unmapped, 3);
         sync(p, fs, SNX_CTR_SVC_RETURN, 0xe0e01bf5u);
+        /* PXI buffers (libctru IPC_Desc_PXIBuffer): 6 the service only reads, so read-only code passes; 4 it also
+           writes, so the same memory does not */
+        uint32_t pxi[] = {0x08010002, 0x00001006, 0x100000};
+        request(p, pxi, 3);
+        sync(p, fs, SNX_CTR_SVC_RETURN, 0xd9001830u);
+        pxi[1] = 0x00001004;
+        request(p, pxi, 3);
+        sync(p, fs, SNX_CTR_SVC_RETURN, 0xe0e01bf5u);
+        /* more handles than the runtime translates stop the run instead of inventing an answer */
+        uint32_t many[11] = {0xbeef000a, 0x20000000};
+        request(p, many, 11);
+        sync(p, fs, SNX_CTR_SVC_UNSUPPORTED, 0);
         /* a moved handle leaves the caller's table once the request is answered (here a stubbed command) */
         uint32_t moved = 0;
         assert(!snx_ctr_object_create(p, CTR_OBJ_EVENT, &moved));
@@ -161,6 +180,12 @@ int main(void) {
         sync(p, fs, SNX_CTR_SVC_RETURN, 0);
         assert(!snx_ctr_handle_object(p, moved) && objects(p) == 4);
         p->ipc_stubs = 0;
+        /* ... and also when the service refuses the request's form */
+        assert(!snx_ctr_object_create(p, CTR_OBJ_EVENT, &moved));
+        uint32_t refused[] = {0x08010004, 0x20, 0, 0x10, moved};
+        request(p, refused, 5);
+        sync(p, fs, SNX_CTR_SVC_RETURN, 0xd9001830u);
+        assert(!snx_ctr_handle_object(p, moved) && objects(p) == 4);
         close_handle(p, fs);
         request(p, init, 4);
         sync(p, fs, SNX_CTR_SVC_RETURN, 0xd8e007f7);

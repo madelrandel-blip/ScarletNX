@@ -52,10 +52,10 @@ static void timing(SnxCtrProcess* p) {
     uint32_t timer = svc(p, 0x1a, 0, CTR_RESET_ONESHOT, 0, 0, 0, SNX_CTR_SVC_RETURN),
              id = snx_ctr_handle_object(p, timer);
     assert(!r[0] && p->objects[id].type == CTR_OBJ_TIMER);
+    double start = snx_seconds(); /* before the timer starts, so a host stall cannot shorten what is measured */
     svc(p, 0x1b, timer, 0, 1000000, 0, 0, SNX_CTR_SVC_RETURN); /* initial r2:r3, interval r1:r4 */
     assert(!r[0] && p->objects[id].data.timer.deadline && !p->objects[id].data.timer.signaled);
     svc(p, 0x24, timer, 0, UINT32_MAX, UINT32_MAX, 0, SNX_CTR_SVC_BLOCKED);
-    double start = snx_seconds();
     assert(snx_ctr_schedule(p) && p->current_thread == 2 && !r[0] && snx_seconds() - start >= 0.0009);
     assert(!p->objects[id].data.timer.signaled && !p->objects[id].data.timer.deadline); /* acquired, not periodic */
     /* negative delays are refused before the handle is looked up */
@@ -112,7 +112,7 @@ static void preemption(SnxCtrProcess* p) {
     arm[2] = exit_block; /* 0x100008 */
     SnxCtrModule module = {.text_address = 0x100000, .text_bytes = 4096, .arm_blocks = arm, .thumb_blocks = thumb};
     uint32_t better = thread(p, 0x20, 0x100008), bid = snx_ctr_handle_object(p, better);
-    p->objects[bid].data.thread.wake_ns = (uint64_t)(snx_seconds() * 1e9) + 2000000; /* asleep for 2 ms */
+    p->objects[bid].data.thread.wake_ns = snx_ctr_now_ns() + 2000000; /* asleep for 2 ms */
     p->cpu.state.cpu.r[15] = 0x100000;
     finished = 0;
     uint64_t executed = 0;
@@ -123,6 +123,7 @@ int main(void) {
     unsigned char code[0x3000] = {0};
     SnxCtrImage image = {.segment = {{0x100000, 1, 16}, {0x200000, 1, 4}, {0x300000, 1, 4}},
                          .stack_size = 0x4000,
+                         .main_priority = 0x30,
                          .bss_size = 4096,
                          .code = code,
                          .code_size = sizeof code};
@@ -200,6 +201,20 @@ int main(void) {
         r[2] = 0;
         r[3] = 1;
         assert(snx_ctr_svc(p, 0x22) == SNX_CTR_SVC_RETURN && !r[0] && snx_ctr_schedule(p) && p->current_thread == 2);
+        assert(!r[0] && !snx_ctr_kernel_blocked(p));
+        /* a timed wait (WaitIfLessThanWithTimeout, 1 s in r4:r5) signaled before its deadline wakes with success */
+        r[0] = arbiter;
+        r[1] = 0x300300;
+        r[2] = 3;
+        r[3] = 1;
+        r[4] = 1000000000u;
+        r[5] = 0;
+        assert(snx_ctr_svc(p, 0x22) == SNX_CTR_SVC_BLOCKED && snx_ctr_schedule(p) && p->current_thread == tid);
+        r[0] = arbiter;
+        r[1] = 0x300300;
+        r[2] = 0;
+        r[3] = 1;
+        assert(snx_ctr_svc(p, 0x22) == SNX_CTR_SVC_RETURN && !r[0] && snx_ctr_schedule(p) && p->current_thread == 2);
         assert(!r[0] && !snx_ctr_kernel_blocked(p) && !snx_ctr_handle_close(p, arbiter));
         uint32_t first = event(p, 0), second = event(p, 0);
         uint32_t first_id = snx_ctr_handle_object(p, first), second_id = snx_ctr_handle_object(p, second);
@@ -231,24 +246,34 @@ int main(void) {
         r[2] = r[3] = 0;
         assert(snx_ctr_svc(p, 0x24) == SNX_CTR_SVC_RETURN && r[0] == 0x09401bfe);
         /* A finite wait blocks until its deadline and then times out: the main thread (0x30) takes the core back
-           from tid (49) at the first scheduling past it */
+           from tid (49) at the first scheduling past it. 20 ms, so a stalled host does not pass the deadline
+           before tid is scheduled */
         r[0] = second;
-        r[2] = 1000000; /* 1 ms */
+        r[2] = 20000000;
         r[3] = 0;
         assert(snx_ctr_svc(p, 0x24) == SNX_CTR_SVC_BLOCKED && snx_ctr_kernel_blocked(p));
         assert(snx_ctr_schedule(p) && p->current_thread == tid);
-        spin_ms(2);
+        spin_ms(25);
         assert(snx_ctr_schedule(p) && p->current_thread == 2 && r[0] == 0x09401bfe && !snx_ctr_kernel_blocked(p));
         assert(p->objects[second_id].refs == 1); /* the wait's reference is gone */
+        /* the same wait signaled before its deadline (1 s) wakes with success */
+        r[0] = second;
+        r[2] = 1000000000u;
+        r[3] = 0;
+        assert(snx_ctr_svc(p, 0x24) == SNX_CTR_SVC_BLOCKED && snx_ctr_schedule(p) && p->current_thread == tid);
+        r[0] = second;
+        assert(snx_ctr_svc(p, 0x18) == SNX_CTR_SVC_RETURN && !r[0]);
+        assert(snx_ctr_schedule(p) && p->current_thread == 2 && !r[0] && !snx_ctr_kernel_blocked(p));
+        assert(!p->objects[second_id].data.event.signaled && p->objects[second_id].refs == 1);
         word(p, 0x300204, second);
-        r[0] = 1000000;
+        r[0] = 20000000;
         r[1] = 0x300200;
         r[2] = 2;
         r[3] = 1;
         r[4] = 0;
         assert(snx_ctr_svc(p, 0x25) == SNX_CTR_SVC_BLOCKED && p->objects[first_id].data.event.signaled);
         assert(snx_ctr_schedule(p) && p->current_thread == tid);
-        spin_ms(2);
+        spin_ms(25);
         assert(snx_ctr_schedule(p) && p->current_thread == 2 && r[0] == 0x09401bfe && r[1] == UINT32_MAX);
         assert(p->objects[first_id].data.event.signaled); /* a wait-all that timed out consumed nothing */
         assert(!snx_ctr_handle_close(p, thread) && p->objects[tid].refs == 1); /* live thread root */

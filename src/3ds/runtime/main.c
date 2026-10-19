@@ -32,7 +32,8 @@ static void usage(FILE* out) {
           "  --max-blocks N  Stop after N native blocks (default: run until the game exits or its window\n"
           "                  closes)\n"
           "  --ipc-stubs L   Answer a service command the runtime lacks with success instead of stopping, for\n"
-          "                  the services in L: all, or a comma list of srv, fs, apt, ptm, hid, gsp, cfg, dsp\n"
+          "                  the services in L: all, or a comma list of srv, fs, apt, ptm, hid, gsp, cfg, dsp.\n"
+          "                  Given more than once, the lists add up\n"
           "An extraction and a compiled module already there are used as they are: the ARM11 code is compiled\n"
           "again only when its module is missing or no longer matches the build or the extracted code.\n"
           "Encrypted content is not implemented.\n",
@@ -133,8 +134,10 @@ int main(int argc, char** argv) {
         } else
             input = arg;
     }
+    /* --ipc-stubs only changes a run: with an option that does not run the game it is a mistake to report */
     if ((!input && !info) || (info && (input || extract_only || recompile || output || budget_set)) ||
-        (extract_only && (budget_set || recompile)) || (recompile && budget_set)) {
+        (extract_only && (budget_set || recompile)) || (recompile && budget_set) ||
+        (ipc_stubs && (info || extract_only || recompile))) {
         usage(stderr);
         return 2;
     }

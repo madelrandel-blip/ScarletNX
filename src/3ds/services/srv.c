@@ -4,6 +4,7 @@
 #include "3ds/runtime/internal.h"
 #include "3ds/services/dsp.h"
 #include "services/srv.swipc.inc"
+#include <stdio.h>
 #include <string.h>
 static uint32_t snx_ctr_srv_RegisterClient(SnxCtrIpc* c, uint32_t process) {
     if (process != CTR_PROCESS_ID) return SNX_CTR_IPC_INVALID_STATE;
@@ -32,11 +33,13 @@ static uint32_t snx_ctr_srv_GetServiceHandle(SnxCtrIpc* c, const uint8_t* name, 
         return result ? result : snx_ctr_session_create(p, SNX_CTR_SERVICE_DSP, session);
     }
     if (flags & 1) return 0xd0406401u;
-    /* This endpoint is genuinely absent. Waiting for its registration cannot
-       complete in the current single-process/no-scheduler kernel. */
+    /* The console waits for the service to be registered (Azahar's GetServiceHandle). No other process runs here
+       to register it, so the thread waits forever: say which service it was. */
     snx_ctr_thread_block(p, c->object, 0);
     memcpy(snx_ctr_thread(p)->waiting_service, name, length);
     snx_ctr_thread(p)->waiting_service[length] = 0;
+    fprintf(stderr, "3ds srv: the runtime has no service %s. The thread that asked for it waits forever.\n",
+            snx_ctr_thread(p)->waiting_service);
     c->state = SNX_CTR_IPC_BLOCKED;
     return 0;
 }

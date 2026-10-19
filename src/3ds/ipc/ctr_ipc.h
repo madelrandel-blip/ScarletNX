@@ -16,7 +16,8 @@ enum {
     SNX_CTR_SERVICE_FILE,
     SNX_CTR_SERVICE_GSP,
     SNX_CTR_SERVICE_CFG,
-    SNX_CTR_SERVICE_DSP
+    SNX_CTR_SERVICE_DSP,
+    SNX_CTR_SERVICE_COUNT
 };
 /* SNX_CTR_IPC_UNKNOWN: a command the service does not have, as opposed to a form of a known one it does not
    support (SNX_CTR_IPC_UNSUPPORTED) */
@@ -40,12 +41,13 @@ typedef struct {
     uint32_t object, caller_pid, transport_result;
     uint32_t in[SNX_CTR_IPC_WORDS], out[SNX_CTR_IPC_WORDS];
     /* Incoming copied and moved handles in descriptor order: raw words, resolved and type-checked by the handler.
-       Zero: none. A moved handle leaves the caller's table once the request is answered. */
+       Zero: none. A moved handle leaves the caller's table once a handler has taken the request, even when it
+       answers with a transport error. */
     uint32_t handle_in[SNX_CTR_IPC_HANDLES], handle_count, handle_moved;
     SnxCtrIpcState state;
 } SnxCtrIpc;
-/* The --ipc-stubs list ("all", or service families: srv, fs, apt, ptm, hid, gsp, cfg, dsp, comma separated) as a
-   mask over SNX_CTR_SERVICE_*; false for a name it does not know */
+/* Adds the --ipc-stubs list ("all", or service families: srv, fs, apt, ptm, hid, gsp, cfg, dsp, comma separated)
+   to a mask over SNX_CTR_SERVICE_*; false, with the mask unchanged, for an empty list or a name it does not know */
 int snx_ctr_ipc_stub_mask(const char* list, uint32_t* mask);
 int snx_ctr_ipc_expect(SnxCtrIpc* c, uint32_t normal, uint32_t translated);
 void snx_ctr_ipc_bad(SnxCtrIpc* c);

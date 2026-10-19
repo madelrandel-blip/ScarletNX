@@ -288,7 +288,8 @@ cmake --preset default -B build -DSNX_FFMPEG_ASM=OFF && cmake --build build
   `SNX_DEPS_CACHE`, else none).
 - `-DSNX_BUILD_NX=OFF`: omit the Switch runtime (default ON).
 - `-DSNX_BUILD_GNUABI=OFF`: omit the CPU-only Linux AArch64 runtime, see [GNUABI.md](GNUABI.md) (default ON).
-- `-DSNX_BUILD_3DS=OFF`: omit the 3DS extraction and memory support, see [3DS.md](3DS.md) (default ON).
+- `-DSNX_BUILD_3DS=OFF`: omit the 3DS driver `scarletnx-3ds` (extraction, the ARM11 AOT compiler and the runtime),
+  see [3DS.md](3DS.md) (default ON).
 - `-DSNX_BUILD_GUI=OFF`: omit the SDL3 launcher. The default is ON when `SNX_BUILD_NX` is on and neither
   `SNX_TOOLS_ONLY` nor `SNX_HACTOOL_ONLY` is, OFF otherwise.
 - `-DSNX_TOOLS_ONLY=ON`: build the extraction/recompilation driver without the runtime, see below (default OFF).

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 the ScarletNX contributors
-# Extraction/memory do not need the NX runtime, LLVM, SDL or an Azahar build tree.
+# The board, loader and memory libraries need neither the NX runtime nor an Azahar build tree. The driver links LLVM
+# for its compiler, and its presenter and audio output use SDL3 and the Vulkan headers.
 add_library(snx_ctr_board STATIC board/board.c)
 set_target_properties(snx_ctr_board PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 target_compile_options(snx_ctr_board PRIVATE -Wall -Wextra -Werror=missing-prototypes)
@@ -33,6 +34,20 @@ target_compile_definitions(scarletnx-3ds PRIVATE SNX_SOURCE_DIR="${CMAKE_SOURCE_
 set_target_properties(scarletnx-3ds PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 target_compile_options(scarletnx-3ds PRIVATE -Wall -Wextra -Werror=missing-prototypes)
+# Windows: the runtime's application manifest, as scarletnx has it (src/nx/runtime/driver/CMakeLists.txt). Its
+# longPathAware lets the native linker start in a staging folder past MAX_PATH (aot/compiler.c), its UTF-8 code page
+# lets a CIA's path hold any character
+if(WIN32)
+    if(CMAKE_C_SIMULATE_ID STREQUAL "MSVC")
+        target_link_options(scarletnx-3ds PRIVATE
+                            "LINKER:/MANIFESTINPUT:${CMAKE_SOURCE_DIR}/src/nx/runtime/platform/runtime.manifest")
+    else()
+        enable_language(RC)
+        target_sources(scarletnx-3ds PRIVATE "${CMAKE_SOURCE_DIR}/src/nx/runtime/platform/runtime.rc")
+        target_include_directories(scarletnx-3ds PRIVATE
+                                   "$<$<COMPILE_LANGUAGE:RC>:${CMAKE_SOURCE_DIR}/src/nx/runtime/platform>")
+    endif()
+endif()
 include(GNUInstallDirs)
 include("${PROJECT_SOURCE_DIR}/cmake/llvm.cmake")
 if(NOT TARGET snx_arm_llvm)

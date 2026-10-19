@@ -47,6 +47,7 @@ int main(void) {
     unsigned char code[0x3000] = {0};
     SnxCtrImage image = {.segment = {{0x100000, 1, 16}, {0x200000, 1, 4}, {0x300000, 1, 4}},
                          .stack_size = 0x4000,
+                         .main_priority = 0x30,
                          .bss_size = 4096,
                          .code = code,
                          .code_size = sizeof code};
@@ -216,7 +217,8 @@ int main(void) {
         assert(snx_ctr_write_ram(p->space, 0x10000000, fill, 1) == SNX_CTR_MEM_PERMISSION);
         for (unsigned i = 0; i < 6; ++i) {
             assert(!snx_ctr_handle_close(p, get(p, 3 + i)));
-            assert(p->objects[p->hid_objects[i]].refs == 1); /* device retains resources */
+            /* the device retains its resources; the shared page mapped above is also kept by its mapping */
+            assert(p->objects[p->hid_objects[i]].refs == (i == 0 ? 2u : 1u));
         }
         request(p, hid_args, 1);
         send(p, hid, SNX_CTR_SVC_RETURN, 0);

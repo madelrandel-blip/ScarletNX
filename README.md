@@ -88,12 +88,12 @@ output and combined CPU/RAM usage. See [GUI launcher](docs/GUI.md).
 
 The experimental `scarletnx-3ds` driver and **Load 3DS CIA** menu entry support
 decrypted application CIA extraction (`scarletnx-3ds -x game.cia`) and an independent
-page-based memory controller. It runs them through an experimental
+page-based memory controller. It runs the extracted titles through an experimental
 **extract -> offline AOT -> native run** pipeline on 64-bit Linux and Windows, using an
 explicit ARM11/checked-memory profile without changing shared A57 defaults.
 The homebrew SuperTux draws its title and loading screens with a software port of
 Azahar's PICA pipeline and plays its music through a port of Azahar's HLE DSP.
-It is not playable yet, because input, the bottom screen and parts of the OS are missing.
+It is not playable yet: there is no input, the bottom screen is not shown, and parts of the OS are missing.
 See the [3DS port](docs/3DS.md) for limits, build instructions and the parity roadmap.
 
 For more detailed information please see: [Build + run](./docs/BUILD.md). For the Android app (arm64 and x86_64),

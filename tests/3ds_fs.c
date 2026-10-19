@@ -244,6 +244,11 @@ static void sd_area(SnxCtrProcess* p, uint32_t fs, const char* directory) {
     static const uint16_t file16[] = {'d', '/', 'f', '.', 'b', 'i', 'n', 0};
     static const uint16_t moved16[] = {'d', '/', 'm', '.', 'b', 'i', 'n', 0};
     utf16(p, 0x300400, dir16, 4);
+    /* the path's static buffer descriptor must name buffer 0 with the path's size */
+    uint32_t bad_mkdir[] = {0x8090182, 0, lo, hi, 4, 4, 0, 0x10402, 0x300400};
+    request(p, fs, bad_mkdir, 9, SNX_CTR_SVC_RETURN, SNX_CTR_IPC_BAD_DESCRIPTOR);
+    uint32_t bad_rmdir[] = {0x8060142, 0, lo, hi, 4, 4, 0x20002, 0x300400};
+    request(p, fs, bad_rmdir, 8, SNX_CTR_SVC_RETURN, SNX_CTR_IPC_BAD_DESCRIPTOR);
     uint32_t mkdir[] = {0x8090182, 0, lo, hi, 4, 4, 0, 0x10002, 0x300400};
     request(p, fs, mkdir, 9, SNX_CTR_SVC_RETURN, 0);
     assert(!get(p, 1));
@@ -330,6 +335,7 @@ int main(int argc, char** argv) {
     unsigned char code[0x3000] = {0};
     SnxCtrImage image = {.segment = {{0x100000, 1, 16}, {0x200000, 1, 4}, {0x300000, 1, 4}},
                          .stack_size = 0x4000,
+                         .main_priority = 0x30,
                          .bss_size = 0x3000,
                          .code = code,
                          .code_size = sizeof code};

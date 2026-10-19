@@ -102,7 +102,7 @@ static void information(SnxCtrProcess* p, unsigned model) {
     info(p, 0x38, 0, CTR_PROCESS_HANDLE, 0, 0, 0);
     uint32_t limit = r[1], id = snx_ctr_handle_object(p, limit);
     assert(id && p->objects[id].type == CTR_OBJ_RESOURCE_LIMIT);
-    assert(info(p, 0x29, 0, limit, 1, 0, 0) == p->objects[id].refs - 1);
+    assert(info(p, 0x29, 0, limit, 1, 0, 0) == 1); /* references less one: the process's and this handle's */
     const uint32_t names[] = {0, 1, 2, 6};
     for (unsigned i = 0; i < 4; ++i) put(p, 0x300100 + i * 4, names[i]);
     info(p, 0x39, 0x300200, limit, 0x300100, 4, 0);
@@ -118,7 +118,7 @@ static void information(SnxCtrProcess* p, unsigned model) {
         r[4] = (uint32_t)processor;
         info(p, 8, 0x30, 0x100004, 0, SNX_CTR_STACK_TOP, 0);
         uint32_t tid = snx_ctr_handle_object(p, r[1]);
-        assert(p->objects[tid].data.thread.core == (processor < 0 ? 0u : (uint32_t)processor));
+        assert(tid && p->objects[tid].data.thread.context.fpscr == 0x03c00000u); /* DN, FZ, round to zero */
         p->objects[tid].data.thread.dead = 1; /* out of the way of the scheduling below */
         close_handle(p, r[1], 0);
         snx_ctr_object_release(p, tid);
@@ -161,10 +161,10 @@ static void memory_blocks(SnxCtrProcess* p) {
     put(p, 0x0c001000, 0xcafe);
     assert(word(p, 0x08001000) == 0xcafe);
     assert(control(p, 1, 0x08000000, 0, 0x1000, 0) == state);
-    assert(control(p, 4, 0x0d000000, 0x08000000, 0x1000, 3) == state);   /* the source is aliased already */
-    assert(control(p, 4, 0x08001000, 0x08000000, 0x2000, 3) == state);   /* overlapping */
-    assert(control(p, 4, 0x0d000000, 0x14000000, 0x1000, 3) == address); /* not heap */
-    assert(control(p, 5, 0x0c000000, 0x08000000, 0x1000, 3) == state);   /* not the pair MAP made */
+    assert(control(p, 4, 0x0d000000, 0x08000000, 0x1000, 3) == state);       /* the source is aliased already */
+    assert(control(p, 4, 0x08001000, 0x08000000, 0x2000, 3) == state);       /* overlapping */
+    assert(control(p, 4, 0x0d000000, 0x14000000, 0x1000, 3) == address);     /* not heap */
+    assert(control(p, 5, 0x0c000000, 0x08000000, 0x1000, 3) == 0xd8e007f5u); /* not the pair MAP made */
     assert(!control(p, 5, 0x0c000000, 0x08000000, 0x2000, 3));
     assert(snx_ctr_query(p->space, 0x0c000000, NULL, NULL) != SNX_CTR_MEM_OK && word(p, 0x08000000) == 0x12345678);
     /* a block over the application's own heap: Locked while it lives, mapped elsewhere as a mirror */
@@ -179,8 +179,14 @@ static void memory_blocks(SnxCtrProcess* p) {
     r[0] = block;
     r[1] = 0x0d000000;
     r[2] = 1;
-    r[3] = 0;
+    r[3] = 0; /* another process's rights must include the block's own */
+    assert(snx_ctr_svc(p, 0x1f) == SNX_CTR_SVC_RETURN && r[0] == 0xd900182eu);
+    r[0] = block;
+    r[1] = 0x0d000000;
+    r[2] = 1;
+    r[3] = 3;
     assert(snx_ctr_svc(p, 0x1f) == SNX_CTR_SVC_RETURN && !r[0] && word(p, 0x0d000000) == 0x12345678);
+    assert(control(p, 1, 0x0d000000, 0, 0x1000, 0) == state); /* the mirror is not plain private heap either */
     assert(snx_ctr_check_ram(p->space, 0x0d000000, 4, SNX_CTR_WRITE) != SNX_CTR_MEM_OK); /* mapped read-only */
     r[0] = block;
     r[1] = 0x0d000000;
@@ -196,25 +202,13 @@ static void memory_blocks(SnxCtrProcess* p) {
     assert(snx_ctr_query(p->space, 0x0d000000, NULL, NULL) != SNX_CTR_MEM_OK);
     close_handle(p, block, 0);
     assert(!control(p, 1, 0x08000000, 0, 0x2000, 0)); /* free again once the block is gone */
-    /* a new block (address 0) is zeroed and maps, by default, where the linear heap shows its memory */
+    /* an application may not ask the kernel for a new block (address 0): 0xD92007EA (3dbrew) */
     r[0] = dont_care;
     r[1] = 0;
     r[2] = 0x1000;
     r[3] = 3;
-    assert(snx_ctr_svc(p, 0x1e) == SNX_CTR_SVC_RETURN && !r[0]);
-    block = r[1];
-    id = snx_ctr_handle_object(p, block);
-    uint32_t linear = CTR_LINEAR + (p->objects[id].data.shared.physical - CTR_PHYS_BASE);
-    r[0] = block;
-    r[1] = 0;
-    r[2] = 3;
-    r[3] = dont_care;
-    assert(snx_ctr_svc(p, 0x1f) == SNX_CTR_SVC_RETURN && !r[0] && !word(p, linear));
-    r[0] = block;
-    r[1] = linear;
-    assert(snx_ctr_svc(p, 0x20) == SNX_CTR_SVC_RETURN && !r[0]);
-    close_handle(p, block, 0);
-    /* refusals: a size not in pages, an execute permission, a range that is not private heap */
+    assert(snx_ctr_svc(p, 0x1e) == SNX_CTR_SVC_RETURN && r[0] == 0xd92007eau && !r[1]);
+    /* refusals: a size not in pages, an execute permission, a range that is not private heap, an unaligned one */
     r[0] = 0;
     r[1] = 0;
     r[2] = 0x800;
@@ -227,11 +221,15 @@ static void memory_blocks(SnxCtrProcess* p) {
     r[1] = 0x09000000;
     r[3] = 3;
     assert(snx_ctr_svc(p, 0x1e) == SNX_CTR_SVC_RETURN && r[0] == state);
+    r[0] = 0;
+    r[1] = 0x08000800;
+    assert(snx_ctr_svc(p, 0x1e) == SNX_CTR_SVC_RETURN && r[0] == 0xe0e01bf1u);
 }
 int main(void) {
     unsigned char code[0x3000] = {0};
     SnxCtrImage image = {.segment = {{0x100000, 1, 16}, {0x200000, 1, 4}, {0x300000, 1, 4}},
                          .stack_size = 0x4000,
+                         .main_priority = 0x30,
                          .bss_size = 0x1000,
                          .title_id = UINT64_C(0x0004000000998200),
                          .name = {'t', 'e', 's', 't'},
@@ -389,12 +387,19 @@ int main(void) {
         assert(snx_ctr_svc(p, 0x27) == SNX_CTR_SVC_RETURN && r[0] == 0xd8600413u && !r[1]);
         assert(snx_ctr_svc(p, 0x21) == SNX_CTR_SVC_RETURN && r[0] == 0xd8600413u && !r[1] && object_count(p) == 2);
         for (unsigned i = 0; i < CTR_HANDLES; ++i) close_handle(p, handles[i], 0);
+        /* the application may make two arbiters (its resource limit), then OutOfAddressArbiters */
+        uint32_t arbiters[2];
+        for (unsigned i = 0; i < 2; ++i) arbiters[i] = create(p);
+        assert(snx_ctr_svc(p, 0x21) == SNX_CTR_SVC_RETURN && r[0] == 0xc8601833u && !r[1]);
+        for (unsigned i = 0; i < 2; ++i) close_handle(p, arbiters[i], 0);
+        /* the object table itself runs out after all but the process, the main thread and the null slot */
         unsigned count = 0;
-        while (snx_ctr_svc(p, 0x21) == SNX_CTR_SVC_RETURN && !r[0]) {
+        uint32_t made = 0;
+        while (!snx_ctr_object_create(p, CTR_OBJ_EVENT, &made)) {
             assert(count < CTR_HANDLES);
-            handles[count++] = r[1];
+            handles[count++] = made;
         }
-        assert(count == CTR_OBJECTS - 3 && !r[1] && object_count(p) == CTR_OBJECTS - 1);
+        assert(count == CTR_OBJECTS - 3 && !made && object_count(p) == CTR_OBJECTS - 1);
         for (unsigned i = 0; i < count; ++i) close_handle(p, handles[i], 0);
         assert(object_count(p) == 2);
         /* thread priorities and mutexes over the real object model */
@@ -407,8 +412,11 @@ int main(void) {
         r[0] = mutex;
         assert(snx_ctr_svc(p, 0x14) == SNX_CTR_SVC_RETURN && r[0] == 0xd8e0041fu);
         close_handle(p, mutex, 0);
-        r[1] = 2;
-        assert(snx_ctr_svc(p, 0x13) == SNX_CTR_SVC_RETURN && r[0] == INVALID_ENUM && !r[1]);
+        r[1] = 2; /* any nonzero value locks it, as a bool */
+        assert(snx_ctr_svc(p, 0x13) == SNX_CTR_SVC_RETURN && !r[0] && r[1]);
+        mutex = r[1];
+        assert(p->objects[snx_ctr_handle_object(p, mutex)].data.mutex.depth == 1);
+        close_handle(p, mutex, 0);
         r[0] = 0x30;
         r[1] = 0x100004;
         r[2] = 0;
@@ -425,8 +433,11 @@ int main(void) {
         assert(snx_ctr_svc(p, 0x0b) == SNX_CTR_SVC_RETURN && r[1] == 0x28);
         r[0] = worker;
         r[1] = 0x80;
-        assert(snx_ctr_svc(p, 0x0c) == SNX_CTR_SVC_RETURN && r[0] == INVALID_ENUM);
-        p->objects[snx_ctr_handle_object(p, worker)].data.thread.dead = 1; /* this test never runs it */
+        assert(snx_ctr_svc(p, 0x0c) == SNX_CTR_SVC_RETURN && r[0] == 0xe0e01bfdu); /* out of range */
+        r[0] = worker;
+        r[1] = 0x10;
+        assert(snx_ctr_svc(p, 0x0c) == SNX_CTR_SVC_RETURN && r[0] == 0xd9001beau); /* better than the limit */
+        p->objects[snx_ctr_handle_object(p, worker)].data.thread.dead = 1;         /* this test never runs it */
         close_handle(p, worker, 0);
         /* semaphores: consume, timed-out empty wait, release, bounded counts */
         r[1] = 1;
@@ -446,10 +457,10 @@ int main(void) {
         assert(snx_ctr_svc(p, 0x16) == SNX_CTR_SVC_RETURN && !r[0] && r[1] == 0);
         r[1] = sem;
         r[2] = 1;
-        assert(snx_ctr_svc(p, 0x16) == SNX_CTR_SVC_RETURN && r[0] == INVALID_ENUM && r[1] == 0); /* would exceed max */
+        assert(snx_ctr_svc(p, 0x16) == SNX_CTR_SVC_RETURN && r[0] == 0xd8e007fdu && r[1] == 0); /* past the maximum */
         r[1] = sem;
         r[2] = 0;
-        assert(snx_ctr_svc(p, 0x16) == SNX_CTR_SVC_RETURN && r[0] == INVALID_ENUM);
+        assert(snx_ctr_svc(p, 0x16) == SNX_CTR_SVC_RETURN && !r[0] && r[1] == 2); /* releasing none changes nothing */
         close_handle(p, sem, 0);
         /* SleepThread: zero yields, a delay blocks the thread until its deadline (the only thread here, so the
            scheduler sleeps the host for it), -1 sleeps forever: nothing is left to wake for */
